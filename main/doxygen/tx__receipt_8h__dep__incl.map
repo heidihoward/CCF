@@ -1,0 +1,15 @@
+<map id="src/node/tx_receipt.h" name="src/node/tx_receipt.h">
+<area shape="rect" id="node1" title=" " alt="" coords="348,5,507,32"/>
+<area shape="rect" id="node2" href="$src_2apps_2js__v8_2tmpl_2receipt_8h.html" title=" " alt="" coords="183,80,331,121"/>
+<area shape="rect" id="node5" href="$historical__queries_8h.html" title=" " alt="" coords="298,259,439,300"/>
+<area shape="rect" id="node9" href="$historical__queries__adapter_8cpp.html" title=" " alt="" coords="406,80,566,121"/>
+<area shape="rect" id="node10" href="$snapshot__serdes_8h.html" title=" " alt="" coords="590,87,793,114"/>
+<area shape="rect" id="node3" href="$historical__state_8cpp.html" title=" " alt="" coords="5,169,159,211"/>
+<area shape="rect" id="node4" href="$receipt_8cpp.html" title=" " alt="" coords="183,169,331,211"/>
+<area shape="rect" id="node6" href="$enclave_2enclave_8h.html" title=" " alt="" coords="442,437,605,464"/>
+<area shape="rect" id="node8" href="$historical__transaction__fetcher_8h.html" title=" " alt="" coords="380,348,547,389"/>
+<area shape="rect" id="node7" href="$enclave_2main_8cpp.html" title=" " alt="" coords="443,512,603,539"/>
+<area shape="rect" id="node11" href="$snapshotter_8h.html" title=" " alt="" coords="607,177,776,203"/>
+<area shape="rect" id="node12" href="$node__state_8h.html" title=" " alt="" coords="609,266,774,293"/>
+<area shape="rect" id="node13" href="$gov__effects_8h.html" title=" " alt="" coords="622,355,814,382"/>
+</map>
