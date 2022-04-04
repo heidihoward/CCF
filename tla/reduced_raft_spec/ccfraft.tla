@@ -159,8 +159,10 @@ MaxCommittableIndex(xlog) ==
             \/ xlog[y].contentType = TypeEntry
     ELSE 0
 ----
+
 \* Define initial values for all variables
 
+\* Note that all servers start as followers in term 1 so the first real term is term 2
 InitServerVars == /\ currentTerm = [i \in Server |-> 1]
                   /\ state       = [i \in Server |-> Follower]
                   /\ votedFor    = [i \in Server |-> Nil]
@@ -684,38 +686,53 @@ LeaderCompletenessInv ==
         \A j \in Server :
             IsPrefix(CommittedTermPrefix(j, currentTerm[i]),log[i])
 
-
 \* In CCF, only signature messages should ever be committed 
 SignatureInv == 
     \A i \in Server :
         \/ commitIndex[i] = 0
         \/ log[i][commitIndex[i]].contentType = TypeSignature
 
+\* Checking that log entry terms are monotonically increasing
+MonoLogs == 
+    \A i \in Server: IF Len(log[i]) > 1 THEN
+                        \A k \in 1..Len(log[i])-1: log[i][k].term <= log[i][k+1].term
+                    ELSE TRUE
+
+\* Committed logs never diverge
+ConistentCommittedLogs ==
+    \A i,j \in Server:
+        IF commitIndex[i] >= 0 /\ commitIndex[j] >= 0 THEN
+            \A k \in 1..commitIndex[i]: \/ commitIndex[j] < k
+                                        \/ log[i][k] = log[j][k]
+        ELSE TRUE
+
 \* Checking the type safety of log entries
-LogEntriesTypeOK(logentries) == IF Len(logentries) > 0 THEN
-                            \A k \in 1..Len(logentries): /\ logentries[k].term \in Nat
-                                                         /\ logentries[k].value \in Nat
-                                                         /\ \/ logentries[k].contentType = TypeEntry
-                                                            \/ logentries[k].contentType = TypeSignature
-                                ELSE TRUE
+LogTypeOK(entries) == 
+    IF Len(entries) > 0 THEN
+        \A k \in 1..Len(entries): /\ entries[k].term \in Nat
+                                  /\ entries[k].value \in Nat
+                                  /\ \/ entries[k].contentType = TypeEntry
+                                     \/ entries[k].contentType = TypeSignature
+    ELSE TRUE
 
 \* Checking the type safety of messages
-MessageTypeOK(msg) == /\ msg.msource \in Server
-                      /\ msg.mdest \in Server
-                      /\ msg.mterm \in Nat
-                      /\ \/ /\ msg.mtype = AppendEntriesRequest
-                            /\ msg.mprevLogIndex \in Nat
-                            /\ msg.mprevLogTerm \in Nat
-                            /\ LogEntriesTypeOK(msg.mentries)
-                            /\ msg.mcommitIndex \in Nat
-                         \/ /\ msg.mtype = AppendEntriesResponse
-                            /\ msg.msuccess \in BOOLEAN
-                            /\ msg.mmatchIndex \in Nat
-                         \/ /\ msg.mtype = RequestVoteRequest
-                            /\ msg.mlastLogTerm \in Nat
-                            /\ msg.mlastLogIndex \in Nat
-                         \/ /\ msg.mtype = RequestVoteResponse
-                            /\ msg.mvoteGranted \in BOOLEAN
+MessageTypeOK(msg) == 
+    /\ msg.msource \in Server
+    /\ msg.mdest \in Server
+    /\ msg.mterm \in Nat
+    /\ \/ /\ msg.mtype = AppendEntriesRequest
+          /\ msg.mprevLogIndex \in Nat
+          /\ msg.mprevLogTerm \in Nat
+          /\ LogTypeOK(msg.mentries)
+          /\ msg.mcommitIndex \in Nat
+       \/ /\ msg.mtype = AppendEntriesResponse
+          /\ msg.msuccess \in BOOLEAN
+          /\ msg.mmatchIndex \in Nat
+       \/ /\ msg.mtype = RequestVoteRequest
+          /\ msg.mlastLogTerm \in Nat
+          /\ msg.mlastLogIndex \in Nat
+       \/ /\ msg.mtype = RequestVoteResponse
+          /\ msg.mvoteGranted \in BOOLEAN
 
 \* Invaraiant to check the type safety of all variables
 TypeOK ==
@@ -731,11 +748,47 @@ TypeOK ==
                         /\ \A j \in Server: /\ votesRequested[i][j] \in Nat
                                             /\ nextIndex[i][j] \in Nat
                                             /\ matchIndex[i][j] \in Nat
-                        /\ LogEntriesTypeOK(log[i])
+                        /\ LogTypeOK(log[i])
                         /\ commitIndex[i] \in Nat
     /\ clientRequests \in Nat
-    /\ LogEntriesTypeOK(committedLog)
+    /\ LogTypeOK(committedLog)
     /\ committedLogDecrease \in BOOLEAN
+
+\* Counter invariants
+\* The following invariants are designed to fail. 
+\* Check the spec by ensuring that the model checker finds counter examples for the following invariants
+
+\* All servers always have term one
+TermOne ==
+    \A i \in Server: currentTerm[i] = 1
+
+\* A log entry with term two is never committed
+TermTwoCommitted ==
+    IF Len(committedLog) > 0 THEN
+        \A k \in 1..Len(committedLog): committedLog[k].term # 2
+    ELSE TRUE
+
+\* A log entry with term two is never appended to any log
+TermTwoAppended ==
+    \A i \in Server:
+        IF Len(log[i]) > 0 THEN
+            \A k \in 1..Len(log[i]): log[i][k].term # 2
+        ELSE TRUE
+
+\* There is never more than one leader
+ExactlyOneLeader ==
+    IF \E i \in Server: state[i] = Leader THEN
+        \E i \in Server: /\ state[i] = Leader
+                         /\ \A j \in Server \ {i}: state[j] # Leader
+    ELSE TRUE
+
+\* Logs never diverge
+LogsDiverge ==
+    \A i,j \in Server:
+       IF Len(log[i]) >= 0 /\ Len(log[j]) >= 0 THEN
+        \A k \in 1..Len(log[i]): \/ Len(log[j]) < k
+                                 \/ log[i][k] = log[j][k]
+        ELSE TRUE
 
 ===============================================================================
 

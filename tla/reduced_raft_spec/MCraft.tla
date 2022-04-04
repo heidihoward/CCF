@@ -10,7 +10,7 @@ Server_mc == {NodeOne, NodeTwo, NodeThree}
 TermLimit == 2
 
 \* Limit number of requests (new entires) that can be made
-RequestLimit == 1
+RequestLimit == 2
 
 \* Limit on number of request votes that can be sent to each other node
 RequestVoteLimit_mc == 1
