@@ -706,6 +706,22 @@ SignatureInv ==
         \/ commitIndex[i] = 0
         \/ log[i][commitIndex[i]].contentType = TypeSignature
 
+\* Checking that log entry terms are monotonically increasing
+MonoLogsInv ==
+    \A i \in Server :
+        IF Len(log[i]) > 1 THEN
+            \A k \in 1..Len(log[i])-1 : log[i][k].term <= log[i][k+1].term
+        ELSE TRUE
+
+\* Committed logs never diverge
+ConsistentCommittedLogsInv ==
+    \A i,j \in Server :
+        IF commitIndex[i] >= 0 /\ commitIndex[j] >= 0 THEN
+            \A k \in 1..commitIndex[i] :
+                \/ commitIndex[j] < k
+                \/ log[i][k] = log[j][k]
+        ELSE TRUE
+
 \* The set of natural numbers without zero
 NatOne == Nat \ {0}
 
@@ -739,7 +755,7 @@ MessageTypeOK(msg) ==
           /\ msg.mvoteGranted \in BOOLEAN
 
 \* Invariant to check the type safety of all variables
-TypeOK ==
+TypeInv ==
     /\ \A msg \in messages: MessageTypeOK(msg)
     /\ \A i,j \in Server:
         IF Len(messagesSent[i][j]) > 0 THEN
