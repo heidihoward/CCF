@@ -342,6 +342,12 @@ AdvanceCommitIndex(i) ==
                 /\ committedLog' = newCommittedLog
     /\ UNCHANGED <<messages, messagesSent, serverVars, candidateVars, leaderVars, log, clientRequests>>
 
+\* CCF supports checkQuorum which enables a leader to choose to abdicate leadership.
+CheckQuorum(i) ==
+    /\ state[i] = Leader
+    /\ state' = [state EXCEPT ![i] = Follower]
+    /\ UNCHANGED <<messages, messagesSent, currentTerm, votedFor, candidateVars, leaderVars, logVars>>
+
 ----
 \* Message handlers
 \* i = recipient, j = sender, m = message
@@ -539,6 +545,7 @@ Next == \/ \E i \in Server : Timeout(i)
         \/ \E i \in Server : SignCommittableMessages(i)
         \/ \E i \in Server : AdvanceCommitIndex(i)
         \/ \E i,j \in Server : AppendEntries(i, j)
+        \/ \E i \in Server : CheckQuorum(i)
         \/ \E m \in messages : Receive(m)
         \* \/ \E m \in messages : DropMessage(m)
 
