@@ -112,9 +112,6 @@ vars == <<messages, messagesSent, serverVars, candidateVars, leaderVars, logVars
 \* important property is that every quorum overlaps with every other.
 Quorum == {i \in SUBSET(Server) : Cardinality(i) * 2 > Cardinality(Server)}
 
-\* The term of the last entry in a log, or 0 if the log is empty.
-LastTerm(xlog) == IF Len(xlog) = 0 THEN 0 ELSE xlog[Len(xlog)].term
-
 \* Helper for Send and Reply. Given a message m and set of messages, return a
 \* new set of messages with one more m in it.
 WithMessage(m, msgs) == msgs \union {m}
@@ -158,6 +155,12 @@ MaxCommittableIndex(xlog) ==
             \* Or that is only succeeeded by a postfix of unsigned commits
             \/ xlog[y].contentType = TypeEntry
     ELSE 0
+
+\* CCF: Returns the term associated with the MaxCommittableIndex(xlog)
+MaxCommittableTerm(xlog) ==
+    LET iMax == MaxCommittableIndex(xlog)
+    IN IF iMax = 0 THEN 0 ELSE xlog[iMax].term
+
 ----
 \* Define initial values for all variables
 
@@ -205,8 +208,8 @@ RequestVote(i,j) ==
     LET 
         msg == [mtype         |-> RequestVoteRequest,
                 mterm         |-> currentTerm[i],
-                mlastLogTerm  |-> LastTerm(log[i]),
                 \*  CCF extension: Use last signature message and not last log index in elections
+                mlastLogTerm  |-> MaxCommittableTerm(log[i]),
                 mlastLogIndex |-> MaxCommittableIndex(log[i]),
                 msource       |-> i,
                 mdest         |-> j]
@@ -355,10 +358,9 @@ CheckQuorum(i) ==
 \* Server i receives a RequestVote request from server j with
 \* m.mterm <= currentTerm[i].
 HandleRequestVoteRequest(i, j, m) ==
-    LET logOk == \/ m.mlastLogTerm > LastTerm(log[i])
-                 \/ /\ m.mlastLogTerm = LastTerm(log[i])
-                    \* CCF change: Log is only okay up to signatures, 
-                    \*  not any message in the log
+    \* CCF change: Log is only okay up to signatures, not any message in the log
+    LET logOk == \/ m.mlastLogTerm > MaxCommittableTerm(log[i])
+                 \/ /\ m.mlastLogTerm = MaxCommittableTerm(log[i])
                     /\ m.mlastLogIndex >= MaxCommittableIndex(log[i]) 
         grant == /\ m.mterm = currentTerm[i]
                  /\ logOk
@@ -679,13 +681,13 @@ QuorumLogInv ==
         
 \* The "up-to-date" check performed by servers
 \* before issuing a vote implies that i receives
-\* a vote from j only if i has all of j's committed
-\* entries
+\* a vote from j only if i has all of j's committed entries.
+\* CCF: Modified to use last committable log entry instead of last log entry
 MoreUpToDateCorrectInv ==
     \A i, j \in Server :
-       (\/ LastTerm(log[i]) > LastTerm(log[j])
-        \/ /\ LastTerm(log[i]) = LastTerm(log[j])
-           /\ Len(log[i]) >= Len(log[j])) =>
+       (\/ MaxCommittableTerm(log[i]) > MaxCommittableTerm(log[j])
+        \/ /\ MaxCommittableTerm(log[i]) = MaxCommittableTerm(log[j])
+           /\ MaxCommittableIndex(log[i]) >= MaxCommittableIndex(log[j])) =>
        IsPrefix(Committed(j), log[i])
 
 \* The committed entries in every log are a prefix of the
