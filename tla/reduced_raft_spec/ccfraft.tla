@@ -706,6 +706,61 @@ SignatureInv ==
         \/ commitIndex[i] = 0
         \/ log[i][commitIndex[i]].contentType = TypeSignature
 
+\* The set of natural numbers without zero
+NatOne == Nat \ {0}
+
+\* Helper function for checking the type safety of log entries
+LogTypeOK(xlog) ==
+    IF Len(xlog) > 0 THEN
+        \A k \in 1..Len(xlog):
+            /\ xlog[k].term \in NatOne
+            /\ xlog[k].value \in NatOne
+            /\ \/ xlog[k].contentType = TypeEntry
+               \/ xlog[k].contentType = TypeSignature
+    ELSE TRUE
+
+\* Helper function for checking the type safety of messages
+MessageTypeOK(msg) ==
+    /\ msg.msource \in Server
+    /\ msg.mdest \in Server
+    /\ msg.mterm \in NatOne
+    /\ \/ /\ msg.mtype = AppendEntriesRequest
+          /\ msg.mprevLogIndex \in Nat
+          /\ msg.mprevLogTerm \in Nat
+          /\ LogTypeOK(msg.mentries)
+          /\ msg.mcommitIndex \in Nat
+       \/ /\ msg.mtype = AppendEntriesResponse
+          /\ msg.msuccess \in BOOLEAN
+          /\ msg.mmatchIndex \in Nat
+       \/ /\ msg.mtype = RequestVoteRequest
+          /\ msg.mlastLogTerm \in Nat
+          /\ msg.mlastLogIndex \in Nat
+       \/ /\ msg.mtype = RequestVoteResponse
+          /\ msg.mvoteGranted \in BOOLEAN
+
+\* Invariant to check the type safety of all variables
+TypeOK ==
+    /\ \A msg \in messages: MessageTypeOK(msg)
+    /\ \A i,j \in Server:
+        IF Len(messagesSent[i][j]) > 0 THEN
+            \A k \in 1..Len(messagesSent[i][j]): messagesSent[i][j][k] \in Nat
+        ELSE TRUE
+    /\ \A i \in Server:
+        /\ currentTerm[i] \in NatOne
+        /\ state[i] \in {Follower, Candidate, Leader}
+        /\ votedFor[i] \in {Nil} \cup Server
+        /\ votesSent[i] \in BOOLEAN
+        /\ votesGranted[i] \subseteq Server
+        /\ \A j \in Server:
+            /\ votesRequested[i][j] \in Nat
+            /\ nextIndex[i][j] \in NatOne
+            /\ matchIndex[i][j] \in Nat
+        /\ LogTypeOK(log[i])
+        /\ commitIndex[i] \in Nat
+    /\ clientRequests \in NatOne
+    /\ LogTypeOK(committedLog)
+    /\ committedLogConflict \in BOOLEAN
+
 ===============================================================================
 
 \* Changelog:
