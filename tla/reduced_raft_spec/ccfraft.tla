@@ -167,7 +167,7 @@ MaxCommittableIndex(xlog) ==
         \* And that is either the largest index in log of i
         /\ \A y \in 1..Len(xlog) : 
             \/ x >= y 
-            \* Or that is only succeeeded by a postfix of unsigned commits
+            \* Or that is only followed by a postfix of unsigned commits
             \/ xlog[y].contentType = TypeEntry
     ELSE 0
 
