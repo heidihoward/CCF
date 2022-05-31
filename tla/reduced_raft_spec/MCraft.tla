@@ -1,4 +1,3 @@
-
 ---------- MODULE MCraft ----------
 EXTENDS ccfraft, TLC
 

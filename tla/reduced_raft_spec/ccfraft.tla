@@ -42,26 +42,31 @@ CONSTANTS RequestVoteLimit
 CONSTANTS MessagesLimit
 
 CONSTANTS NodeOne, NodeTwo, NodeThree
-
 ----
+
 \* Global variables
 
 \* A set representing requests and responses sent from one server
 \* to another. With CCF, we have message integrity and can ensure unique messages.
 VARIABLE messages
+
 \* CCF: Keep track of each message sent from each server to each other server
 \* and cap it to a maximum
 VARIABLE messagesSent
 ----
+
 \* The following variables are all per server (functions with domain Server).
 
 \* The server's term number.
 VARIABLE currentTerm
+
 \* The server's state (Follower, Candidate, or Leader).
 VARIABLE state
+
 \* The candidate the server voted for in its current term, or
 \* Nil if it hasn't voted for any.
 VARIABLE votedFor
+
 serverVars == <<currentTerm, state, votedFor>>
 
 \* The set of requests that can go into the log
@@ -71,32 +76,41 @@ VARIABLE clientRequests
 \* log entry. Unfortunately, the Sequence module defines Head(s) as the entry
 \* with index 1, so be careful not to use that!
 VARIABLE log
+
 \* The index of the latest entry in the log the state machine may apply.
 VARIABLE commitIndex
+
 \* The index that gets committed
 VARIABLE committedLog
+
 \* Have conflicting log entries ever been committed?
 VARIABLE committedLogConflict
+
 logVars == <<log, commitIndex, clientRequests, committedLog, committedLogConflict>>
 
 \* The following variables are used only on candidates:
 \* The set of servers from which the candidate has received a RequestVote
 \* response in its currentTerm.
 VARIABLE votesSent
+
 \* The set of servers from which the candidate has received a vote in its
 \* currentTerm.
 VARIABLE votesGranted
+
 \* State space limitation: Restrict each node to send a limited amount 
 \* of requests to other nodes
 VARIABLE votesRequested
+
 candidateVars == <<votesSent, votesGranted, votesRequested>>
 
 \* The following variables are used only on leaders:
 \* The next entry to send to each follower.
 VARIABLE nextIndex
+
 \* The latest entry that each follower has acknowledged is the same as the
 \* leader's. This is used to calculate commitIndex on the leader.
 VARIABLE matchIndex
+
 leaderVars == <<nextIndex, matchIndex>>
 
 \* End of per server variables.
@@ -135,6 +149,7 @@ Reply(response, request) ==
 
 \* Return the minimum value from a set, or undefined if the set is empty.
 Min(s) == CHOOSE x \in s : \A y \in s : x <= y
+
 \* Return the maximum value from a set, or undefined if the set is empty.
 Max(s)         == CHOOSE x \in s          : \A y \in s : x >= y
 MaxWithZero(s) == CHOOSE x \in s \cup {0} : \A y \in s : x >= y
@@ -164,44 +179,54 @@ MaxCommittableTerm(xlog) ==
 ----
 \* Define initial values for all variables
 
-InitServerVars == /\ currentTerm = [i \in Server |-> 1]
-                  /\ state       = [i \in Server |-> Follower]
-                  /\ votedFor    = [i \in Server |-> Nil]
-InitCandidateVars == /\ votesSent = [i \in Server |-> FALSE ]
-                     /\ votesGranted   = [i \in Server |-> {}]
-                     /\ votesRequested = [i \in Server |-> [j \in Server |-> 0]]
+InitServerVars ==
+    /\ currentTerm = [i \in Server |-> 1]
+    /\ state       = [i \in Server |-> Follower]
+    /\ votedFor    = [i \in Server |-> Nil]
+
+InitCandidateVars ==
+    /\ votesSent = [i \in Server |-> FALSE ]
+    /\ votesGranted   = [i \in Server |-> {}]
+    /\ votesRequested = [i \in Server |-> [j \in Server |-> 0]]
+
 \* The values nextIndex[i][i] and matchIndex[i][i] are never read, since the
 \* leader does not send itself messages. It's still easier to include these
 \* in the functions.
-InitLeaderVars == /\ nextIndex  = [i \in Server |-> [j \in Server |-> 1]]
-                  /\ matchIndex = [i \in Server |-> [j \in Server |-> 0]]
-InitLogVars == /\ log          = [i \in Server |-> << >>]
-               /\ commitIndex  = [i \in Server |-> 0]
-               /\ clientRequests = 1
-               /\ committedLog = << >>
-               /\ committedLogConflict = FALSE
-Init == /\ messages = {}
-        /\ messagesSent = [i \in Server |-> [j \in Server |-> << >>] ]
-        /\ InitServerVars
-        /\ InitCandidateVars
-        /\ InitLeaderVars
-        /\ InitLogVars
+InitLeaderVars ==
+    /\ nextIndex  = [i \in Server |-> [j \in Server |-> 1]]
+    /\ matchIndex = [i \in Server |-> [j \in Server |-> 0]]
+
+InitLogVars ==
+    /\ log          = [i \in Server |-> << >>]
+    /\ commitIndex  = [i \in Server |-> 0]
+    /\ clientRequests = 1
+    /\ committedLog = << >>
+    /\ committedLogConflict = FALSE
+
+Init ==
+    /\ messages = {}
+    /\ messagesSent = [i \in Server |-> [j \in Server |-> << >>] ]
+    /\ InitServerVars
+    /\ InitCandidateVars
+    /\ InitLeaderVars
+    /\ InitLogVars
 
 ----
 \* Define state transitions
 
 \* Server i times out and starts a new election.
-Timeout(i) == /\ state[i] \in {Follower, Candidate}
-              /\ state' = [state EXCEPT ![i] = Candidate]
-              /\ currentTerm' = [currentTerm EXCEPT ![i] = currentTerm[i] + 1]
-              \* Most implementations would probably just set the local vote
-              \* atomically, but messaging localhost for it is weaker.
-              \*   CCF change: We do this atomically to reduce state space
-              /\ votedFor' = [votedFor EXCEPT ![i] = i]
-              /\ votesRequested' = [votesRequested EXCEPT ![i] = [j \in Server |-> 0]]
-              /\ votesSent' = [votesSent EXCEPT ![i] = TRUE ]
-              /\ votesGranted'   = [votesGranted EXCEPT ![i] = {i}]
-              /\ UNCHANGED <<messages, messagesSent, leaderVars, logVars>>
+Timeout(i) ==
+    /\ state[i] \in {Follower, Candidate}
+    /\ state' = [state EXCEPT ![i] = Candidate]
+    /\ currentTerm' = [currentTerm EXCEPT ![i] = currentTerm[i] + 1]
+    \* Most implementations would probably just set the local vote
+    \* atomically, but messaging localhost for it is weaker.
+    \*   CCF change: We do this atomically to reduce state space
+    /\ votedFor' = [votedFor EXCEPT ![i] = i]
+    /\ votesRequested' = [votesRequested EXCEPT ![i] = [j \in Server |-> 0]]
+    /\ votesSent' = [votesSent EXCEPT ![i] = TRUE ]
+    /\ votesGranted'   = [votesGranted EXCEPT ![i] = {i}]
+    /\ UNCHANGED <<messages, messagesSent, leaderVars, logVars>>
 
 \* Candidate i sends j a RequestVote request.
 RequestVote(i,j) ==
@@ -531,6 +556,7 @@ Receive(m) ==
 
 \* End of message handlers.
 ----
+
 \* Network state transitions
 
 \* The network drops a message
@@ -539,17 +565,19 @@ DropMessage(m) ==
     /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars>>
 
 ----
+
 \* Defines how the variables may transition.
-Next == \/ \E i \in Server : Timeout(i)
-        \/ \E i, j \in Server : RequestVote(i, j)
-        \/ \E i \in Server : BecomeLeader(i)
-        \/ \E i \in Server : ClientRequest(i)
-        \/ \E i \in Server : SignCommittableMessages(i)
-        \/ \E i \in Server : AdvanceCommitIndex(i)
-        \/ \E i,j \in Server : AppendEntries(i, j)
-        \/ \E i \in Server : CheckQuorum(i)
-        \/ \E m \in messages : Receive(m)
-        \* \/ \E m \in messages : DropMessage(m)
+Next ==
+    \/ \E i \in Server : Timeout(i)
+    \/ \E i, j \in Server : RequestVote(i, j)
+    \/ \E i \in Server : BecomeLeader(i)
+    \/ \E i \in Server : ClientRequest(i)
+    \/ \E i \in Server : SignCommittableMessages(i)
+    \/ \E i \in Server : AdvanceCommitIndex(i)
+    \/ \E i,j \in Server : AppendEntries(i, j)
+    \/ \E i \in Server : CheckQuorum(i)
+    \/ \E m \in messages : Receive(m)
+    \* \/ \E m \in messages : DropMessage(m)
 
 \* The specification must start with the initial state and transition according
 \* to Next.
