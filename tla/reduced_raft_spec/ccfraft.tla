@@ -41,7 +41,7 @@ CONSTANTS RequestVoteLimit
 \* CCF: Limit how many messages each node can send to another
 CONSTANTS MessagesLimit
 
-CONSTANTS NodeOne, NodeTwo, NodeThree
+CONSTANTS NodeOne, NodeTwo, NodeThree, NodeFour, NodeFive
 ----
 
 \* Global variables

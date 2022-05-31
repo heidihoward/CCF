@@ -1,7 +1,10 @@
 ---------- MODULE MCraft ----------
 EXTENDS ccfraft, TLC
 
+\* We check a 3 server configuration.
 Server_mc == {NodeOne, NodeTwo, NodeThree}
+\* Alternatively, this could be changed to 5 servers using the following:
+\* Server_mc == {NodeOne, NodeTwo, NodeThree, NodeFour, NodeFive}
 
 \* Limit the terms that can be reached. Needs to be set to at least 3 to
 \* evaluate all relevant states. If set to only 2, the candidate_quorum
