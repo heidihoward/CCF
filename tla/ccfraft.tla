@@ -110,16 +110,16 @@ ReconfigurationCountTypeInv ==
 \* This includes the current configuration plus any pending configurations.
 \* The current configuration is the initial configuration or the last committed reconfiguration.
 \* The pending configurations are reconfiguration transactions that are not yet committed.
-\* Each server's configurations is indexed by the reconfiguration transaction index,
-\* except for the initial configuration which has index 0 (note that the log in 1-indexed).
+\* Each server's configurations is indexed by the reconfiguration transaction index
 \* Refer to LogConfigurationConsistentInv for more on configurations
 VARIABLE configurations
 
 ConfigurationsTypeInv ==
-    \A i \in Servers : 
-        /\ \A c \in DOMAIN configurations[i] :
-            configurations[i][c] \subseteq Servers
-        /\ DOMAIN configurations[i] # {}
+    \A i \in Servers :
+        DOMAIN configurations[i] # {} =>
+            \A c \in DOMAIN configurations[i] :
+                /\ configurations[i][c] \subseteq Servers
+                /\ configurations[i][c]  # {}
 
 \* The set of servers that have been removed from configurations.  The implementation
 \* assumes that a server refrains from rejoining a configuration if it has been removed
@@ -154,7 +154,7 @@ VARIABLE messages
 
 \* Helper function for checking the type safety of log entries
 EntryTypeOK(entry) ==
-    /\ entry.term \in Nat \ {0}
+    /\ entry.term \in Nat
     /\ \/ /\ entry.contentType = TypeEntry
           /\ entry.request \in Nat \ {0}
        \/ entry.contentType = TypeSignature
@@ -537,10 +537,9 @@ InitReconfigurationVars ==
     \* Note that CCF has a bootstrapping procedure to start a new network and to join new nodes to the network (see 
     \* https://microsoft.github.io/CCF/main/operations/start_network.html). In both cases, a node has the current (see 
     \* https://microsoft.github.io/CCF/main/operations/ledger_snapshot.html#join-or-recover-from-snapshot) or some stale configuration
-    \* such as the initial configuration. A node's configuration is *never* "empty", i.e., the equivalent of configuration[node] = {} here. 
-    \* For simplicity, the set of servers/nodes all have the same initial configuration at startup.
+    \* such as the initial configuration. 
     /\ \E c \in SUBSET Servers \ {{}}:
-        configurations = [i \in Servers |-> [ j \in {0} |-> c ] ]
+        configurations = [i \in Servers |-> IF i \in c THEN 1 :> c ELSE << >> ]
 
 InitMessagesVars ==
     /\ messages = {}
@@ -549,7 +548,10 @@ InitMessagesVars ==
 
 InitServerVars ==
     /\ currentTerm = [i \in Servers |-> 0]
-    /\ state       = [i \in Servers |-> IF i \in configurations[i][0] THEN Follower ELSE Pending]
+    /\ state       = [i \in Servers |-> 
+        IF DOMAIN configurations[i] # {}
+        THEN Follower 
+        ELSE Pending]
     /\ votedFor    = [i \in Servers |-> Nil]
 
 InitCandidateVars ==
@@ -564,8 +566,17 @@ InitLeaderVars ==
     /\ matchIndex = [i \in Servers |-> [j \in Servers |-> 0]]
 
 InitLogVars ==
-    /\ log          = [i \in Servers |-> << >>]
-    /\ commitIndex  = [i \in Servers |-> 0]
+    /\ log = [i \in Servers |-> 
+        IF DOMAIN configurations[i] # {}
+        THEN 1 :> [ 
+            contentType |-> TypeReconfiguration, 
+            term |-> 0, 
+            configuration |-> configurations[i][1] 
+            ]
+        ELSE << >>]
+    /\ commitIndex  = [i \in Servers |-> 
+        IF DOMAIN configurations[i] # {} 
+        THEN 1 ELSE 0]
     /\ clientRequests = 1
     /\ committedLog = [ node |-> NodeOne, index |-> 0]
 
@@ -1198,9 +1209,10 @@ LogMatchingInv ==
 \* of at least one server in every quorum
 QuorumLogInv ==
     \A i \in Servers :
-        \A S \in Quorums[CurrentConfiguration(i)] :
-            \E j \in S :
-                IsPrefix(Committed(i), log[j])
+        DOMAIN configurations[i] # {} =>
+            \A S \in Quorums[CurrentConfiguration(i)] :
+                \E j \in S :
+                    IsPrefix(Committed(i), log[j])
 
 \* The "up-to-date" check performed by servers
 \* before issuing a vote implies that i receives
@@ -1225,7 +1237,7 @@ LeaderCompletenessInv ==
 \* In CCF, only signature messages should ever be committed
 SignatureInv ==
     \A i \in Servers :
-        \/ commitIndex[i] = 0
+        \/ commitIndex[i] \in {0,1}
         \/ log[i][commitIndex[i]].contentType = TypeSignature
 
 \* Each server's term should be equal to or greater than the terms of messages it has sent
@@ -1246,11 +1258,9 @@ MonoLogInv ==
 
 \* Each server's active configurations should be consistent with its own log and commit index
 LogConfigurationConsistentInv ==
-    \A i \in Servers :
-        \* Configurations should have associated reconfiguration txs in the log
-        \* The only exception is the initial configuration (which has index 0)
+    \A i \in { i \in Servers: DOMAIN configurations[i] # {}} :
+        \* All configurations should have associated reconfiguration txs in the log
         /\ \A idx \in DOMAIN (configurations[i]) :
-            idx # 0 => 
             /\ log[i][idx].contentType = TypeReconfiguration            
             /\ log[i][idx].configuration = configurations[i][idx]
         \* Current configuration should be committed
@@ -1355,5 +1365,6 @@ DebugInvAllMessagesProcessable ==
 \* It should be reachable if a leader is removed.
 DebugInvRetirementReachable ==
     \A i \in Servers : state[i] /= RetiredLeader
+
 
 ===============================================================================
