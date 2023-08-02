@@ -3,20 +3,37 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
+import json
 
 throughputs = {}
 rw_mixes = [0, 0.2, 0.4, 0.6, 0.8, 1]
 timenow = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+client_throughputs = {}
 
 for rw_mix in rw_mixes:
     throughputs[rw_mix] = {}
+    client_throughputs[rw_mix] = {}
     for nodes in [1,3,5]:
         throughputs[rw_mix][nodes] = []
+        client_throughputs[rw_mix][nodes] = {}
         for i in range(1):
-            basicperf_cmd = ["python3", "/home/azureuser/heidi/CCF/tests/infra/basicperf.py", "-b", ".", "-c", "./submit", "--host-log-level", "info", "--enclave-log-level", "info", "--worker-threads", "10", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/actions.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/validate.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/resolve.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/apply.js", "--write-tx-times", "--label", "pi_basic_mt_sgx_cft^", "--snapshot-tx-interval", "20000", "--package", "samples/apps/basic/libbasic", "--repetitions", "100000", "--num-localhost-clients", "10", "-e", "release", "-t", "sgx", "--workspace", f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-w{rw_mix}-n{nodes}-i{i}", "--rw-mix", f"{rw_mix}"] + ["-n", "ssh://172.23.0.13", "-n", "ssh://172.23.0.9","-n", "ssh://172.23.0.10", "-n", "ssh://172.23.0.11", "-n", "ssh://172.23.0.12"][:nodes*2]
+            clients = 10*nodes
+            if rw_mix == 1:
+                client_def = ["--client-def", f"{clients},write,100000,primary"]
+            elif rw_mix == 0:
+                client_def = ["--client-def", f"{clients},read,100000,any"]
+            elif nodes == 1:
+                client_def = ["--client-def", f"{int(rw_mix*clients)},write,10000,primary","--client-def", f"{int((1-rw_mix)*clients)},read,100000,primary"]
+            else:
+                client_def = ["--client-def", f"{int(rw_mix*clients)},write,10000,primary","--client-def", f"{int((1-rw_mix)*clients)},read,100000,backup"]
+            print(nodes, client_def)
+
+            basicperf_cmd = ["python3", "/home/azureuser/heidi/CCF/tests/infra/basicperf.py", "-b", ".", "-c", "./submit", "--host-log-level", "info", "--enclave-log-level", "info", "--worker-threads", "10", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/actions.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/validate.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/resolve.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/apply.js", "--label", "pi_basic_mt_sgx_cft^", "--snapshot-tx-interval", "20000", "--package", "samples/apps/basic/libbasic", "-e", "release", "-t", "sgx", "--workspace", f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-w{rw_mix}-n{nodes}-i{i}"] + ["-n", "ssh://172.23.0.13", "-n", "ssh://172.23.0.9","-n", "ssh://172.23.0.10", "-n", "ssh://172.23.0.11", "-n", "ssh://172.23.0.12"][:nodes*2] + client_def
             
             subprocess.run(basicperf_cmd)
-            agg = pl.read_parquet(f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-w{rw_mix}-n{nodes}-i{i}/pi_basic_mt_sgx_cft^_common/aggregated_basicperf_output.parquet").filter(pl.col("messageID").cast(int) >= 1000)
+            # timenow = "2023-08-02_14-10-32"
+            # print(timenow)
+            agg = pl.read_parquet(f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-w{rw_mix}-n{nodes}-i{i}/pi_basic_mt_sgx_cft^_common/aggregated_basicperf_output.parquet")
             pl.Config.set_tbl_cols(10)
             pl.Config.set_tbl_rows(20)
             print(agg.select(pl.col("*"), pl.col("request").cast(str).alias("requestStr"), pl.col("rawResponse").cast(str).alias("responseStr")))
@@ -24,8 +41,17 @@ for rw_mix in rw_mixes:
             end_recv = agg["receiveTime"].sort()[-1]
             throughputs[rw_mix][nodes].append(round(len(agg) / (end_recv - start_send).total_seconds()))
             print(throughputs[rw_mix][nodes])
+            client_throughputs[rw_mix][nodes][i] = []
+            for client in agg["client"].unique():
+                client_agg = agg.filter(pl.col("client") == client)
+                start_send = client_agg["sendTime"].sort()[0]
+                end_recv = client_agg["receiveTime"].sort()[-1]
+                client_throughputs[rw_mix][nodes][i].append((client,round(len(client_agg) / (end_recv - start_send).total_seconds())))
 
-print(throughputs)
+print("overall throughputs", throughputs)
+print("client throughputs")
+for nodes in [1,3,5]:
+    print(f"nodes={nodes}",client_throughputs[0][nodes])
 
 fontsize = 9
 params = {
