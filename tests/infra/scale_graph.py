@@ -16,8 +16,8 @@ for rw_mix in rw_mixes:
     for nodes in [1,3,5]:
         throughputs[rw_mix][nodes] = []
         client_throughputs[rw_mix][nodes] = {}
-        for i in range(1):
-            clients = 10*nodes
+        for i in range(5):
+            clients = 6*nodes
             if rw_mix == 1:
                 client_def = ["--client-def", f"{clients},write,100000,primary"]
             elif rw_mix == 0:
@@ -111,6 +111,7 @@ plt.ylabel("Throughput (1000 tx/s)")
 plt.xlabel("Read ratio")
 plt.xticks(label_locations,  ["0", "0.2", "0.4", "0.6", "0.8", "1"])
 plt.xlim([-0.6, 5.6])
+plt.yscale('log')
 plt.legend(title="# of Nodes")
 plt.savefig("throughput_comparison_sets.pdf")
 plt.close()
