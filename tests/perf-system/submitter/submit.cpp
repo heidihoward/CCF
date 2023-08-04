@@ -18,7 +18,8 @@
 #include <arrow/table.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
-#include <sys/time.h>
+#include <sys/sysinfo.h>
+#include <time.h>
 
 using namespace std;
 using namespace client;
@@ -215,22 +216,38 @@ void store_parquet_results(ArgumentParser args, ParquetData data_handler)
     PARQUET_THROW_NOT_OK(
       receive_time_builder.AppendValues(data_handler.response_time));
 
-    arrow::BinaryBuilder raw_response_builder;
-    for (auto& raw_response : data_handler.raw_response)
+    arrow::NumericBuilder<arrow::UInt64Type> response_status_builder;
+    for (const auto& response_status : data_handler.response_status_code)
     {
-      PARQUET_THROW_NOT_OK(
-        raw_response_builder.Append(raw_response.data(), raw_response.size()));
+      PARQUET_THROW_NOT_OK(response_status_builder.Append(response_status));
+    }
+
+    arrow::StringBuilder response_headers_builder;
+    for (const auto& response_headers : data_handler.response_headers)
+    {
+      PARQUET_THROW_NOT_OK(response_headers_builder.Append(response_headers));
+    }
+
+    arrow::BinaryBuilder response_body_builder;
+    for (auto& response_body : data_handler.response_body)
+    {
+      PARQUET_THROW_NOT_OK(response_body_builder.Append(
+        response_body.data(), response_body.size()));
     }
 
     auto table = arrow::Table::Make(
       arrow::schema({
         arrow::field("messageID", arrow::utf8()),
         arrow::field("receiveTime", us_timestamp_type),
+        arrow::field("responseStatus", arrow::uint64()),
+        arrow::field("responseHeaders", arrow::utf8()),
         arrow::field("rawResponse", arrow::binary()),
       }),
       {message_id_builder.Finish().ValueOrDie(),
        receive_time_builder.Finish().ValueOrDie(),
-       raw_response_builder.Finish().ValueOrDie()});
+       response_status_builder.Finish().ValueOrDie(),
+       response_headers_builder.Finish().ValueOrDie(),
+       response_body_builder.Finish().ValueOrDie()});
 
     std::shared_ptr<arrow::io::FileOutputStream> outfile;
     PARQUET_ASSIGN_OR_THROW(
@@ -245,34 +262,36 @@ void store_parquet_results(ArgumentParser args, ParquetData data_handler)
 int main(int argc, char** argv)
 {
   logger::config::default_init();
+  logger::config::level() = LoggerLevel::INFO;
   CLI::App cli_app{"Perf Tool"};
   ArgumentParser args("Perf Tool", cli_app);
   CLI11_PARSE(cli_app, argc, argv);
+
+  std::vector<std::string> args_str(argv, argv + argc);
+  LOG_INFO_FMT("Running {}", fmt::join(args_str, " "));
 
   ParquetData data_handler;
   std::vector<string> certificates = {args.cert, args.key, args.rootCa};
 
   read_parquet_file(args.generator_filepath, data_handler);
   std::string server_address = args.server_address;
+  std::string failover_server_address = args.failover_server_address;
+  if (failover_server_address.empty())
+  {
+    failover_server_address = server_address;
+  }
 
   // Write PID to disk
   files::dump(fmt::format("{}", ::getpid()), args.pid_file_path);
 
-  // Keep only the host and port removing any https:// characters
-  std::string separator = "//";
-  auto exists_index = server_address.find(separator);
-  if (exists_index != std::string::npos)
-  {
-    server_address = server_address.substr(exists_index + separator.length());
-  }
-
   auto requests_size = data_handler.ids.size();
 
-  std::vector<timeval> start(requests_size);
-  std::vector<timeval> end(requests_size);
+  std::vector<timespec> start(requests_size);
+  std::vector<timespec> end(requests_size);
 
   // Store responses until they are processed to be written in parquet
-  std::vector<std::vector<uint8_t>> resp_text(data_handler.ids.size());
+  std::vector<client::HttpRpcTlsClient::Response> responses(
+    data_handler.ids.size());
 
   LOG_INFO_FMT("Start Request Submission");
 
@@ -280,6 +299,7 @@ int main(int argc, char** argv)
   size_t retry_count = 0;
   size_t read_reqs = 0;
 
+  LOG_INFO_FMT("Connecting to {}", server_address);
   auto connection = create_connection(certificates, server_address);
   connection->set_tcp_nodelay(true);
 
@@ -289,15 +309,15 @@ int main(int argc, char** argv)
     {
       for (size_t ridx = read_reqs; ridx < requests_size; ridx++)
       {
-        gettimeofday(&start[ridx], NULL);
+        clock_gettime(CLOCK_MONOTONIC, &start[ridx]);
         auto request = data_handler.request[ridx];
         connection->write({request.data(), request.size()});
         if (
           connection->bytes_available() or
           ridx - read_reqs >= args.max_inflight_requests)
         {
-          resp_text[read_reqs] = connection->read_raw_response();
-          gettimeofday(&end[read_reqs], NULL);
+          responses[read_reqs] = connection->read_response();
+          clock_gettime(CLOCK_MONOTONIC, &end[read_reqs]);
           read_reqs++;
         }
         if (ridx % 20000 == 0)
@@ -308,8 +328,8 @@ int main(int argc, char** argv)
       // Read remaining responses
       while (read_reqs < requests_size)
       {
-        resp_text[read_reqs] = connection->read_raw_response();
-        gettimeofday(&end[read_reqs], NULL);
+        responses[read_reqs] = connection->read_response();
+        clock_gettime(CLOCK_MONOTONIC, &end[read_reqs]);
         read_reqs++;
       }
       connection.reset();
@@ -318,8 +338,10 @@ int main(int argc, char** argv)
     catch (std::logic_error& e)
     {
       LOG_FAIL_FMT(
-        "Sending interrupted: {}, attempting reconnection", e.what());
-      connection = create_connection(certificates, server_address);
+        "Sending interrupted: {}, attempting reconnection to {}",
+        e.what(),
+        failover_server_address);
+      connection = create_connection(certificates, failover_server_address);
       connection->set_tcp_nodelay(true);
       retry_count++;
     }
@@ -327,13 +349,34 @@ int main(int argc, char** argv)
 
   LOG_INFO_FMT("Finished Request Submission");
 
+  // Calculate boot time
+  struct sysinfo info;
+  sysinfo(&info);
+  const auto boot_time = time(NULL) - info.uptime;
+  const auto boot_time_us = boot_time * 1'000'000;
+
   for (size_t req = 0; req < requests_size; req++)
   {
-    data_handler.raw_response.push_back(resp_text[req]);
-    size_t send_time = start[req].tv_sec * 1'000'000 + start[req].tv_usec;
-    size_t response_time = end[req].tv_sec * 1'000'000 + end[req].tv_usec;
-    data_handler.send_time.push_back(send_time);
-    data_handler.response_time.push_back(response_time);
+    auto& response = responses[req];
+    data_handler.response_status_code.push_back(response.status);
+    std::string concat_headers;
+    for (const auto& [k, v] : response.headers)
+    {
+      if (!concat_headers.empty())
+      {
+        concat_headers += "\n";
+      }
+      concat_headers += fmt::format("{}: {}", k, v);
+    }
+    data_handler.response_headers.push_back(concat_headers);
+    data_handler.response_body.push_back(std::move(response.body));
+
+    size_t send_time_us =
+      boot_time_us + start[req].tv_sec * 1'000'000 + start[req].tv_nsec / 1000;
+    size_t response_time_us =
+      boot_time_us + end[req].tv_sec * 1'000'000 + end[req].tv_nsec / 1000;
+    data_handler.send_time.push_back(send_time_us);
+    data_handler.response_time.push_back(response_time_us);
   }
 
   store_parquet_results(args, data_handler);
