@@ -3,28 +3,25 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
+import json
 
 throughputs = {}
-sig_tx_intervals = [10,50,100,500,1000,5000,10000,20000]
+sig_tx_intervals = [2,10,50,100,500,1000,5000,10000,20000]
 timenow = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 for sig_tx_interval in sig_tx_intervals:
     throughputs[sig_tx_interval] = []
     for i in range(3):
-        basicperf_cmd = ["python3", "/home/azureuser/heidi/CCF/tests/infra/basicperf.py", "-b", ".", "-c", "./submit", "--host-log-level", "info", "--enclave-log-level", "info", "--worker-threads", "10", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/actions.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/validate.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/resolve.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/apply.js", "--write-tx-times", "--label", "pi_basic_mt_sgx_cft^", "--snapshot-tx-interval", "20000", "--package", "samples/apps/basic/libbasic", "--repetitions", "20000", "--num-localhost-clients", "30", "-e", "release", "-t", "sgx", "--workspace", f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-sig{sig_tx_interval}-i{i}", "--rw-mix", "1", "--sig-tx-interval", str(sig_tx_interval), "--sig-ms-interval", "1000" ,"--client-timeout-s", "200", "-n", "ssh://172.23.0.8"]
-        subprocess.run(basicperf_cmd)
+        basicperf_cmd = ["python3", "/home/azureuser/heidi/CCF/tests/infra/basicperf.py", "-b", ".", "-c", "./submit", "--host-log-level", "info", "--enclave-log-level", "info", "--worker-threads", "10", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/actions.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/validate.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/resolve.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/apply.js", "--label", "pi_basic_mt_sgx_cft^", "--snapshot-tx-interval", "20000", "--package", "samples/apps/basic/libbasic", "-e", "release", "-t", "sgx", "--workspace", f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-sig{sig_tx_interval}-i{i}", "--sig-tx-interval", str(sig_tx_interval), "--sig-ms-interval", "5000" ,"--client-timeout-s", "200", "--client-def", "10,write,100000,primary", "-n", "ssh://172.23.0.8","-n", "ssh://172.23.0.9","-n", "ssh://172.23.0.10"]
+        # subprocess.run(basicperf_cmd)
+        timenow = "2023-08-07_10-14-31"
 
-        agg = pl.read_parquet(f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-sig{sig_tx_interval}-i{i}/pi_basic_mt_sgx_cft^_common/aggregated_basicperf_output.parquet").filter(pl.col("messageID").cast(int) >= 1000)
-        pl.Config.set_tbl_cols(10)
-        pl.Config.set_tbl_rows(20)
-        print(agg.select(pl.col("*"), pl.col("request").cast(str).alias("requestStr"), pl.col("rawResponse").cast(str).alias("responseStr")))
-        start_send = agg["sendTime"].sort()[0]
-        end_recv = agg["receiveTime"].sort()[-1]
-        throughputs[sig_tx_interval].append(round(len(agg) / (end_recv - start_send)))
+        stats = json.load(open(f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-sig{sig_tx_interval}-i{i}/pi_basic_mt_sgx_cft^_common/statistics.json"))
+        throughputs[sig_tx_interval].append(stats["average_throughput_tx/s"])
 
 print(throughputs)
 
-fontsize = 9
+fontsize = 12
 params = {
     "axes.labelsize": fontsize,
     "font.size": fontsize,
@@ -41,7 +38,7 @@ params = {
     "ytick.minor.visible": True,
     "lines.linewidth": 2,
     "legend.frameon": False,
-    "axes.grid": True,
+    "axes.grid": False,
     "savefig.bbox": "tight",
 }
 plt.rcParams.update(params)
@@ -61,7 +58,7 @@ print(min_errs)
 
 plt.errorbar(sig_tx_intervals,heights,yerr=[min_errs,max_errs],capsize=3,color='black')
 
-plt.ylabel("Throughput (1000 tx/s)")
+plt.ylabel("Throughput (Ktx/s)")
 plt.xlabel("Signature interval (tx count)")
 plt.xscale("log")
 plt.savefig("throughput_sigs.pdf")
