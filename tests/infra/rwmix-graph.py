@@ -59,7 +59,7 @@ for rw_mix in rw_mixes:
 plt.figure(figsize=[1.7,2.5])
 # plt.errorbar(read_fraction,heights,yerr=[min_errs,max_errs], color="#E69F00")
 plt.plot(read_fraction,heights,'.',ls="-",color="#E69F00")
-plt.ylabel("Throughput (1000 tx/s)")
+plt.ylabel("Mixed throughput (Ktx/s)")
 plt.xlabel("Read ratio")
 plt.ylim([0,200])
 # plt.xlim([0,1])

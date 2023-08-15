@@ -63,11 +63,14 @@ def main(path, stats_path):
     
     events = [
         ("initial_primary_shutdown_time", "$A$", 0.3),
-        # ("new_node_join_start_time", "$B$"),
-        ("node_replacement_governance_start", "$B$", -0.3),
-        ("node_replacement_governance_committed", "$C$", 0.2),
-        ("old_node_removal_committed", "$D$", 0.3)
+        ("new_node_join_start_time", "$B$",-0.3),
+        ("node_replacement_governance_start", "$C$", -0.2),
+        ("node_replacement_governance_committed", "$D$", 0.2),
+        ("old_node_removal_committed", "$E$", 0.3)
     ]
+
+    # stats["new_node_join_start_time"] = "2023-08-10T16:56:53.960753"
+    stats["new_node_join_start_time"] = "2023-08-10T16:56:56.268432" # time of first postiive response
     offset = 0
     for event, marker, x_offset in events:
         x = (datetime.fromisoformat(stats[event]) - start_time).total_seconds() -5

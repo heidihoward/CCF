@@ -45,9 +45,9 @@ plt.rcParams.update(params)
 
 plt.figure(figsize=(1.1,2))
 
-plt.scatter(writes_x, writes_y,s=1,color="#009E73")
+plt.scatter(writes_x, writes_y,s=5,color="#009E73")
 plt.ylabel("Response time (ms)")
-plt.xlabel("Requests")
+plt.xlabel("Request index")
 plt.xlim(1000,1500)
 plt.ylim(0.9,2.5)
 plt.savefig("latency.pdf")
