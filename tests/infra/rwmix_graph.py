@@ -1,4 +1,3 @@
-import polars as pl
 import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,8 +19,6 @@ for rw_mix in rw_mixes:
         stats = json.load(open(f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-w{rw_mix}-i{i}/pi_basic_mt_sgx_cft^_common/statistics.json"))
         throughputs[rw_mix].append(stats["all_clients_active_average_throughput_tx/s"] / 1000)
         read_fraction.append(1 - stats["all_clients_active_write_fraction"])
-
-print("overall throughputs", throughputs)
 
 fontsize = 12
 params = {

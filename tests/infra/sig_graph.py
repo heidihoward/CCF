@@ -1,4 +1,3 @@
-import polars as pl
 import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,8 +16,6 @@ for sig_tx_interval in sig_tx_intervals:
 
         stats = json.load(open(f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-sig{sig_tx_interval}-i{i}/pi_basic_mt_sgx_cft^_common/statistics.json"))
         throughputs[sig_tx_interval].append(stats["all_clients_active_average_throughput_tx/s"])
-
-print(throughputs)
 
 fontsize = 12
 params = {
@@ -51,9 +48,6 @@ for sig_tx_interval in sig_tx_intervals:
     heights.append(medium)
     max_errs.append(np.max(throughputs[sig_tx_interval]) / 1000 - medium)
     min_errs.append(medium - np.min(throughputs[sig_tx_interval]) / 1000)
-print(heights)
-print(max_errs)
-print(min_errs)
 
 plt.errorbar(sig_tx_intervals,heights,yerr=[min_errs,max_errs],capsize=3,color='black')
 

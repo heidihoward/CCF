@@ -1,7 +1,6 @@
 import polars as pl
 import subprocess
 import matplotlib.pyplot as plt
-import sys
 import json
 from datetime import datetime
 

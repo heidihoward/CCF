@@ -1,4 +1,3 @@
-import polars as pl
 import subprocess
 import datetime
 import json

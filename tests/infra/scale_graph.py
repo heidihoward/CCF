@@ -1,4 +1,3 @@
-import polars as pl
 import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,6 +9,7 @@ rw_mixes = [0, 1]
 timenow = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 client_throughputs = {}
 count_of_nodes = [1,3,5]
+
 for rw_mix in rw_mixes:
     throughputs[rw_mix] = {}
     client_throughputs[rw_mix] = {}

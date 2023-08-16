@@ -4,11 +4,12 @@ import matplotlib.pyplot as plt
 import datetime
 
 timenow = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+workspace_path = f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-lat"
 
-basicperf_cmd = ["python3", "/home/azureuser/heidi/CCF/tests/infra/basicperf.py", "-b", ".", "-c", "./submit", "--host-log-level", "info", "--enclave-log-level", "info", "--worker-threads", "0", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/actions.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/validate.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/resolve.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/apply.js", "--label", "pi_basic_mt_sgx_cft^", "--snapshot-tx-interval", "20000", "--package", "samples/apps/basic/libbasic", "-e", "release", "-t", "sgx", "--workspace", f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-lat", "--max-writes-ahead", "0","--sig-tx-interval", "100","--client-def", "1,write,10000,primary","--sig-ms-interval", "1000" , "-n", "ssh://172.23.0.8"]
+basicperf_cmd = ["python3", "/home/azureuser/heidi/CCF/tests/infra/basicperf.py", "-b", ".", "-c", "./submit", "--host-log-level", "info", "--enclave-log-level", "info", "--worker-threads", "0", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/actions.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/validate.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/resolve.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/apply.js", "--label", "pi_basic_mt_sgx_cft^", "--snapshot-tx-interval", "20000", "--package", "samples/apps/basic/libbasic", "-e", "release", "-t", "sgx", "--workspace", workspace_path, "--max-writes-ahead", "0","--sig-tx-interval", "100","--client-def", "1,write,10000,primary","--sig-ms-interval", "1000" , "-n", "ssh://172.23.0.8"]
 subprocess.run(basicperf_cmd)
 
-agg = pl.read_parquet(f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-lat/pi_basic_mt_sgx_cft^_common/aggregated_basicperf_output.parquet")
+agg = pl.read_parquet(f"{workspace_path}/pi_basic_mt_sgx_cft^_common/aggregated_basicperf_output.parquet")
 
 writes_x = []
 writes_y = []
