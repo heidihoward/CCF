@@ -7,15 +7,12 @@ import json
 throughputs = {}
 rw_mixes = [0, 1]
 timenow = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-client_throughputs = {}
 count_of_nodes = [1,3,5]
 
 for rw_mix in rw_mixes:
     throughputs[rw_mix] = {}
-    client_throughputs[rw_mix] = {}
     for nodes in count_of_nodes:
         throughputs[rw_mix][nodes] = []
-        client_throughputs[rw_mix][nodes] = {}
         for i in range(5):
             clients = 6*nodes
             if rw_mix == 1:
@@ -61,15 +58,15 @@ for rw_mix in rw_mixes:
         medium = np.percentile(throughputs[rw_mix][nodes],50)
         heights.append(medium)
         max_errs.append(np.max(throughputs[rw_mix][nodes])  - medium)
-        min_errs.append(medium - np.min(throughputs[rw_mix][nodes]) )
+        min_errs.append(medium - np.min(throughputs[rw_mix][nodes]))
     plt.bar(
-        ["1","3","5"],
+        [str(i) for i in count_of_nodes],
         heights,
         edgecolor="black",
-        color=["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2","#D55E00", "#CC79A7", "#000000"],
+        color=["#E69F00", "#56B4E9", "#009E73"],
     )
 
-    plt.errorbar(["1","3","5"],heights,yerr=[min_errs,max_errs],capsize=3,fmt=".", color="black")
+    plt.errorbar([str(i) for i in count_of_nodes],heights,yerr=[min_errs,max_errs],capsize=3,fmt=".", color="black")
     if rw_mix==1:
         plt.ylabel("Write throughput (Ktx/s)")
     else:

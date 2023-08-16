@@ -65,8 +65,8 @@ def main(path, stats_path):
         ("node_replacement_governance_committed", "$D$", 0.2),
         ("old_node_removal_committed", "$E$", 0.3)
     ]
-
-    stats["new_node_join_start_time"] = "2023-08-10T16:56:56.268432" # actual time of first postiive response
+    # HARDCODED - actual time of first postiive response from log
+    stats["new_node_join_start_time"] = "2023-08-10T16:56:56.268432" 
     offset = 0
     for event, marker, x_offset in events:
         x = (datetime.fromisoformat(stats[event]) - start_time).total_seconds() -5
