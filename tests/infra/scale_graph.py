@@ -14,7 +14,7 @@ for rw_mix in rw_mixes:
     for nodes in count_of_nodes:
         throughputs[rw_mix][nodes] = []
         for i in range(5):
-            clients = 6*nodes
+
             if rw_mix == 1:
                 client_def = ["--client-def", f"{6},write,100000,primary"]
             else:
