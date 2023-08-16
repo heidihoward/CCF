@@ -4,7 +4,6 @@ import datetime
 import json
 
 timenow = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
 throughputs = []
 apps = [["--package", "samples/apps/basic/libbasic","--client-def","6,write,1000000,primary"],
        ["--package", "samples/apps/basic/libbasic","--client-def","30,read,1000000,any"],

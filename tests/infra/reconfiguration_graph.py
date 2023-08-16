@@ -6,13 +6,11 @@ import json
 from datetime import datetime
 
 timenow = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-timenow = "2023-08-10_16-56-25"
 workspace_path = f"/home/azureuser/heidi/CCF/build-sgx/ws-{timenow}-reconfig"
 
 basicperf_cmd = ["python3", "/home/azureuser/heidi/CCF/tests/infra/basicperf.py", "-b", ".", "-c", "./submit", "--host-log-level", "info", "--enclave-log-level", "info", "--worker-threads", "10", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/actions.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/validate.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/resolve.js", "--constitution", "/home/azureuser/heidi/CCF/samples/constitutions/default/apply.js", "--label", "pi_basic_mt_sgx_cft^", "--snapshot-tx-interval", "20000", "--package", "samples/apps/basic/libbasic", "-e", "release", "-t", "sgx", "--workspace", workspace_path, "--client-def", "1,write,500000,primary","--client-def", "1,read,600000,backup", "--stop-primary-after-s", "6", "--add-new-node-after-primary-stops", "ssh://172.23.0.11", "--sig-ms-interval", "1000" , "-n", "ssh://172.23.0.8", "-n", "ssh://172.23.0.9", "-n", "ssh://172.23.0.10","--client-timeout-s", "300"]
 
-# subprocess.run(basicperf_cmd)
-
+subprocess.run(basicperf_cmd)
 
 fontsize = 12
 params = {
@@ -69,8 +67,7 @@ def main(path, stats_path):
         ("old_node_removal_committed", "$E$", 0.3)
     ]
 
-    # stats["new_node_join_start_time"] = "2023-08-10T16:56:53.960753"
-    stats["new_node_join_start_time"] = "2023-08-10T16:56:56.268432" # time of first postiive response
+    stats["new_node_join_start_time"] = "2023-08-10T16:56:56.268432" # actual time of first postiive response
     offset = 0
     for event, marker, x_offset in events:
         x = (datetime.fromisoformat(stats[event]) - start_time).total_seconds() -5
@@ -81,7 +78,6 @@ def main(path, stats_path):
 
     plt.xlim(0,15)
     plt.ylim(0,40)
-    # plt.xticks([0,5,10,15])
     plt.xlabel("Time (seconds)")
     plt.legend(handletextpad=0.1,loc="lower right")
     plt.ylabel("Throughput (kreq/s)")
