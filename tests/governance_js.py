@@ -1,22 +1,23 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import dataclasses
+import json
+import os
+import tempfile
+import uuid
+from contextlib import contextmanager
+
+import ccf.ledger
+import infra.clients
+import infra.e2e_args
+import infra.member
+import infra.net
 import infra.network
 import infra.path
 import infra.proc
-import infra.net
-import infra.e2e_args
 import infra.proposal
-import infra.member
 import suite.test_requirements as reqs
-import os
 from loguru import logger as LOG
-from contextlib import contextmanager
-import dataclasses
-import tempfile
-import uuid
-import infra.clients
-import json
-import ccf.ledger
 
 
 def action(name, **args):
@@ -28,7 +29,7 @@ def proposal(*actions):
 
 
 def merge(*proposals):
-    return {"actions": sum((prop["actions"] for prop in proposals), [])}
+    return {"actions": [action for prop in proposals for action in prop["actions"]]}
 
 
 def vote(body):
@@ -261,6 +262,7 @@ def test_proposal_storage(network, args):
                 "proposalState": "Open",
                 "proposalId": proposal_id,
                 "ballotCount": 0,
+                "ballotSubmitters": [],
             }
             assert r.body.json() == expected, r.body.json()
 
@@ -306,6 +308,7 @@ def test_proposal_withdrawal(network, args):
                 "proposalState": "Open",
                 "proposalId": proposal_id,
                 "ballotCount": 0,
+                "ballotSubmitters": [],
             }
             assert r.body.json() == expected, r.body.json()
 
@@ -316,6 +319,7 @@ def test_proposal_withdrawal(network, args):
                 "proposalState": "Withdrawn",
                 "proposalId": proposal_id,
                 "ballotCount": 0,
+                "ballotSubmitters": [],
             }
             assert r.body.json() == expected, r.body.json()
 
@@ -405,6 +409,8 @@ def test_pure_proposals(network, args):
             r = c.post("/gov/members/proposals:create", prop)
             assert r.status_code == 200, r.body.text()
             assert r.body.json()["proposalState"] == state, r.body.json()
+            assert "finalVotes" in r.body.json(), r.body.json()
+            assert r.body.json()["finalVotes"] == {}, r.body.json()
             proposal_id = r.body.json()["proposalId"]
 
             ballot = ballot_yes
@@ -450,7 +456,7 @@ def test_proposal_replay_protection(network, args):
         # Re-submitting the last proposal is detected as a replay
         last_index = window_size - 1
         c.set_created_at_override((now + last_index).moment())
-        r = c.post("/gov/members/proposals:create", submitted[last_index])
+        r = c.repeat_last_request()
         assert (
             r.status_code == 400 and r.body.json()["error"]["code"] == "ProposalReplay"
         ), r.body.text()
@@ -568,6 +574,10 @@ def test_proposals_with_votes(network, args):
             )
             assert r.status_code == 200, r.body.text()
             assert r.body.json()["proposalState"] == state, r.body.json()
+            assert "finalVotes" in r.body.json(), r.body.json()
+            assert r.body.json()["finalVotes"] == {
+                member_id: direction == "true"
+            }, r.body.json()
 
             infra.clients.get_clock().advance()
 
@@ -585,6 +595,10 @@ def test_proposals_with_votes(network, args):
             )
             assert r.status_code == 200, r.body.text()
             assert r.body.json()["proposalState"] == state, r.body.json()
+            assert "finalVotes" in r.body.json(), r.body.json()
+            assert r.body.json()["finalVotes"] == {
+                member_id: direction == "true"
+            }, r.body.json()
 
         for prop, state, ballot in [
             (always_accept_with_two_votes, "Accepted", ballot_yes),
@@ -593,6 +607,7 @@ def test_proposals_with_votes(network, args):
             r = c.post("/gov/members/proposals:create", prop)
             assert r.status_code == 200, r.body.text()
             assert r.body.json()["proposalState"] == "Open", r.body.json()
+            assert r.body.json()["ballotSubmitters"] == [], r.body.json()
             proposal_id = r.body.json()["proposalId"]
 
             r = c.post(
@@ -601,6 +616,7 @@ def test_proposals_with_votes(network, args):
             )
             assert r.status_code == 200, r.body.text()
             assert r.body.json()["proposalState"] == "Open", r.body.json()
+            assert r.body.json()["ballotSubmitters"] == [member_id], r.body.json()
 
             with node.api_versioned_client(
                 None, None, "member1", api_version=args.gov_api_version
@@ -614,6 +630,16 @@ def test_proposals_with_votes(network, args):
                 )
                 assert r.status_code == 200, r.body.text()
                 assert r.body.json()["proposalState"] == state, r.body.json()
+                assert set(r.body.json()["ballotSubmitters"]) == {
+                    member_id,
+                    other_member_id,
+                }, r.body.json()
+                assert "finalVotes" in r.body.json(), r.body.json()
+                expected_vote = state == "Accepted"
+                assert r.body.json()["finalVotes"] == {
+                    member_id: expected_vote,
+                    other_member_id: expected_vote,
+                }, r.body.json()
 
     return network
 
@@ -640,34 +666,38 @@ def test_vote_failure_reporting(network, args):
     with node.api_versioned_client(
         None, None, "member0", api_version=args.gov_api_version
     ) as c:
-        member_id = network.consortium.get_member_by_local_id("member0").service_id
+        member0_id = network.consortium.get_member_by_local_id("member0").service_id
         r = c.post("/gov/members/proposals:create", always_accept_with_one_vote)
         assert r.status_code == 200, r.body.text()
         assert r.body.json()["proposalState"] == "Open", r.body.json()
+        assert r.body.json()["ballotSubmitters"] == [], r.body.json()
         proposal_id = r.body.json()["proposalId"]
 
         ballot = vote(f'throw new Error("{error_body}")')
         r = c.post(
-            f"/gov/members/proposals/{proposal_id}/ballots/{member_id}:submit", ballot
+            f"/gov/members/proposals/{proposal_id}/ballots/{member0_id}:submit", ballot
         )
         assert r.status_code == 200, r.body.text()
         assert r.body.json()["proposalState"] == "Open", r.body.json()
+        assert r.body.json()["ballotSubmitters"] == [member0_id], r.body.json()
 
     with node.api_versioned_client(
         None, None, "member1", api_version=args.gov_api_version
     ) as c:
         ballot = ballot_yes
-        member_id = network.consortium.get_member_by_local_id("member1").service_id
+        member1_id = network.consortium.get_member_by_local_id("member1").service_id
         r = c.post(
-            f"/gov/members/proposals/{proposal_id}/ballots/{member_id}:submit", ballot
+            f"/gov/members/proposals/{proposal_id}/ballots/{member1_id}:submit", ballot
         )
         assert r.status_code == 200, r.body.text()
         rj = r.body.json()
         LOG.warning(rj)
         assert rj["proposalState"] == "Accepted", r.body.json()
+        assert set(rj["ballotSubmitters"]) == {member0_id, member1_id}, rj
+        assert "finalVotes" in rj, rj
+        assert rj["finalVotes"] == {member1_id: True}, rj
         assert len(rj["voteFailures"]) == 1, rj["voteFailures"]
-        member_id = network.consortium.get_member_by_local_id("member0").service_id
-        assert rj["voteFailures"][member_id]["reason"] == f"Error: {error_body}", rj[
+        assert rj["voteFailures"][member0_id]["reason"] == f"Error: {error_body}", rj[
             "voteFailures"
         ]
 
@@ -692,6 +722,7 @@ def test_operator_proposals_and_votes(network, args):
         )
         assert r.status_code == 200, r.body.text()
         assert r.body.json()["proposalState"] == "Accepted", r.body.json()
+        assert r.body.json()["finalVotes"] == {member_id: True}, r.body.json()
 
         r = c.post(
             "/gov/members/proposals:create", always_accept_if_proposed_by_operator
@@ -725,22 +756,21 @@ def test_operator_provisioner_proposals_and_votes(network, args):
     # Propose the creation of an operator signed by the operator provisioner
     operator = infra.member.Member(
         "operator",
-        args.participants_curve,
         network.consortium.common_dir,
         network.consortium.share_script,
-        is_recovery_member=False,
+        recovery_role=infra.member.RecoveryRole.NonParticipant,
         key_generator=network.consortium.key_generator,
+        curve=args.participants_curve,
         authenticate_session=network.consortium.authenticate_session,
         gov_api_impl=network.consortium.gov_api_impl,
     )
 
     cert_file = os.path.join(node.common_dir, operator.member_info["certificate_file"])
+    with open(cert_file, encoding="utf-8") as cert:
+        cert_contents = cert.read()
     set_operator, _ = network.consortium.make_proposal(
         "set_member",
-        cert=open(
-            cert_file,
-            encoding="utf-8",
-        ).read(),
+        cert=cert_contents,
         member_data={"is_operator": True},
     )
 
@@ -748,7 +778,7 @@ def test_operator_provisioner_proposals_and_votes(network, args):
         signer_id=operator_provisioner.local_id,
         proposal=set_operator,
     )
-    network.consortium.members.append(operator)
+    network.consortium.add_member(operator)
     operator.ack(node)
 
     # Propose the removal of the operator signed by the operator provisioner
@@ -855,7 +885,9 @@ def test_actions(network, args):
     try:
         network.consortium.set_recovery_threshold(
             node,
-            recovery_threshold=len(network.consortium.get_active_recovery_members())
+            recovery_threshold=len(
+                network.consortium.get_active_recovery_participants()
+            )
             + 1,
         )
         assert (
@@ -1050,6 +1082,102 @@ def test_set_constitution(network, args):
     return network
 
 
+@reqs.description("Test validation in set_constitution")
+def test_set_constitution_validation(network, args):
+    node = choose_node(network)
+
+    # NB: This tests the behaviour of the current default sample constitution,
+    # and the validation it applies. In particular, it explicitly checks that
+    # the proposed constitution is a string, before calling the CCF-provided
+    # validateConstitution API (resulting in the specific errors below).
+    # Other constitutions may choose to do more or less validation.
+    for constitution, error_snippet in (
+        ("", "is empty"),
+        (1, "must be of type string"),
+        (["a", "b", "c"], "must be of type string"),
+        (None, "must be of type string"),
+        ("Not syntactically valid JS", "Failed to compile"),
+        (
+            """
+            export function resolve(proposal, proposerId, votes) {}
+            export function apply(proposal, proposerId) {}
+            """,
+            "Failed to find export 'validate'",
+        ),
+        (
+            """
+            export function validate(input) {}
+            export function apply(proposal, proposerId) {}
+            """,
+            "Failed to find export 'resolve'",
+        ),
+        (
+            """
+            export function validate(input) {}
+            export function resolve(proposal, proposerId, votes) {}
+            """,
+            "Failed to find export 'apply'",
+        ),
+        (
+            """
+            export function validate(input) {}
+            export function resolve(notEnoughArgs) {}
+            export function apply(proposal, proposerId) {}
+            """,
+            "exports function resolve with 1 arg, expected between 3 and 4 args",
+        ),
+        (
+            """
+            export function validate(too, many, args) {}
+            export function resolve(proposal, proposerId, votes) {}
+            export function apply(proposal, proposerId) {}
+            """,
+            "exports function validate with 3 args, expected 1 arg",
+        ),
+    ):
+        try:
+            network.consortium.set_constitution_raw(node, constitution)
+        except infra.proposal.ProposalNotCreated as e:
+            r = e.response
+            assert r.status_code == 400, r
+            message = r.body.json()["error"]["message"]
+            assert (
+                error_snippet in message
+            ), f"Expected content ({error_snippet}) not found in response:\n{r.body.text()}"
+        else:
+            assert (
+                False
+            ), f"Expected error from validateConstitution for: '{constitution}'"
+
+    # Minimal valid constitutions
+    apply_body = """
+        const proposed_actions = JSON.parse(proposal)["actions"];
+        if (proposed_actions.length !== 1 || proposed_actions[0].name !== "set_constitution")
+        {
+            throw new Error("This minimal constitution only allows other set_constitution proposals");
+        }
+        ccf.kv["public:ccf.gov.constitution"].set(
+            new ArrayBuffer(8),
+            ccf.jsonCompatibleToBuf(proposed_actions[0].args.constitution));
+        """
+    for constitution in (
+        """
+        export function validate(input) { return {valid: true} }
+        export function resolve(proposal, proposerId, votes) { return "Accepted" }
+        export function apply(proposal, proposerId) { """ + apply_body + "}",
+        """
+        export function validate(input) { return {valid: true} }
+        export function resolve(proposal, proposerId, votes, proposalId) { return "Accepted" }
+        export function apply(proposal, proposerId) { """ + apply_body + "}",
+    ):
+        network.consortium.set_constitution_raw(node, constitution)
+
+    # Reset original constitution
+    network.consortium.set_constitution(node, args.constitution)
+
+    return network
+
+
 @contextmanager
 def temporary_constitution(network, args, js_constitution_suffix):
     primary, _ = network.find_primary()
@@ -1143,12 +1271,12 @@ def test_read_write_restrictions(network, args):
         ),
         # Application tables
         TestSpec(
-            description="Public application tables are read-only",
+            description="Public application tables cannot even be read, apart from during apply where they can be written",
             table_name="public:my.app.my_custom_table",
             readable_in_validate=False,
             writable_in_validate=False,
             readable_in_apply=False,
-            writable_in_apply=False,
+            writable_in_apply=True,
         ),
         TestSpec(
             description="Private application tables cannot even be read",
@@ -1294,10 +1422,20 @@ def test_final_proposal_visibility(network, args):
         LOG.info("Confirm that finalVotes is present in submit-ballot response")
         body = response.body.json()
         assert "finalVotes" in body, body
+        assert set(body["ballotSubmitters"]) == {
+            booster.service_id,
+            turncoat.service_id,
+            fairweather.service_id,
+        }, body
 
         LOG.info("Confirm that finalVotes is present in get-proposal response")
         body = consortium.get_proposal_raw(primary, third.proposal_id)
         assert "finalVotes" in body, body
+        assert set(body["ballotSubmitters"]) == {
+            booster.service_id,
+            turncoat.service_id,
+            fairweather.service_id,
+        }, body
 
     LOG.info("Confirm that expected values were actually written to the KV")
     # To avoid creating an extra endpoint in the app, we smuggle a read into a new
@@ -1346,7 +1484,7 @@ def test_ledger_governance_invariants(network, args):
     node = network.nodes[0]
     ledger_dirs = node.remote.ledger_paths()
 
-    ledger = ccf.ledger.Ledger(ledger_dirs)
+    ledger = ccf.ledger.Ledger(ledger_dirs, contiguous_suffix=True)
 
     LOG.info("Completed proposals contain final_vote for each submitted ballot")
     table_name = "public:ccf.gov.proposals_info"
@@ -1356,7 +1494,7 @@ def test_ledger_governance_invariants(network, args):
         if table_name not in public_tables:
             continue
 
-        for _, raw_proposal in public_tables[table_name].items():
+        for raw_proposal in public_tables[table_name].values():
             if raw_proposal is None:
                 # This is a deletion
                 continue

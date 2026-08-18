@@ -3,7 +3,7 @@
 
 #include "ccf/tx.h"
 
-#include "ccf/ccf_assert.h"
+#include "ds/ccf_assert.h"
 #include "kv/compacted_version_conflict.h"
 #include "kv/kv_types.h"
 #include "kv/tx_pimpl.h"
@@ -49,19 +49,21 @@ namespace ccf::kv
   MapChanges BaseTx::get_map_and_change_set_by_name(
     const std::string& map_name, bool track_deletes_on_missing_keys)
   {
-    if (!pimpl->read_txid.has_value())
+    auto& read_txid = pimpl->read_txid;
+
+    if (!read_txid.has_value())
     {
       // Grab opacity version that all Maps should be queried at.
       // Note: It is by design that we delay acquiring a read version to now
       // rather than earlier, at Tx construction. This is to minimise the
       // window during which concurrent transactions can write to the same map
       // and cause this transaction to conflict on commit.
-      std::tie(pimpl->read_txid, pimpl->commit_view) =
-        pimpl->store->current_txid_and_commit_term();
+      auto p = pimpl->store->current_txid_and_commit_term();
+      read_txid = p.first;
+      pimpl->commit_view = p.second;
     }
 
-    auto abstract_map =
-      pimpl->store->get_map(pimpl->read_txid->version, map_name);
+    auto abstract_map = pimpl->store->get_map(read_txid->seqno, map_name);
     if (abstract_map == nullptr)
     {
       // Store doesn't know this map yet - create it dynamically
@@ -93,7 +95,7 @@ namespace ccf::kv
     return {
       abstract_map,
       untyped_map->create_change_set(
-        pimpl->read_txid->version, track_deletes_on_missing_keys)};
+        read_txid->seqno, track_deletes_on_missing_keys)};
   }
 
   std::list<AbstractHandle*> BaseTx::get_possible_handles(
@@ -113,12 +115,16 @@ namespace ccf::kv
 
   void BaseTx::compacted_version_conflict(const std::string& map_name)
   {
-    CCF_ASSERT_FMT(
-      pimpl->read_txid.has_value(), "read_txid should have already been set");
+    auto& read_txid = pimpl->read_txid;
+    if (!read_txid.has_value())
+    {
+      throw std::logic_error(
+        fmt::format("read_txid should have already been set"));
+    }
     throw CompactedVersionConflict(fmt::format(
       "Unable to retrieve state over map {} at {}",
       map_name,
-      pimpl->read_txid->version));
+      read_txid->seqno));
   }
 
   BaseTx::BaseTx(AbstractStore* store_)

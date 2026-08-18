@@ -3,7 +3,7 @@
 
 #include "openssl/base64.h"
 
-#include "ccf/ds/logger.h"
+#include "ds/internal_logger.h"
 
 namespace ccf::crypto
 {
@@ -17,16 +17,18 @@ namespace ccf::crypto
   std::vector<uint8_t> raw_from_b64url(const std::string_view& b64url_string)
   {
     std::string b64_string = std::string(b64url_string);
-    for (size_t i = 0; i < b64_string.size(); i++)
+    for (char& c : b64_string)
     {
-      switch (b64_string[i])
+      switch (c)
       {
         case '-':
-          b64_string[i] = '+';
+          c = '+';
           break;
         case '_':
-          b64_string[i] = '/';
+          c = '/';
           break;
+        default:
+          continue;
       }
     }
     auto padding = b64_string.size() % 4 == 2 ? 2 :
@@ -41,7 +43,7 @@ namespace ccf::crypto
     return Base64Impl::b64_from_raw(data, size);
   }
 
-  std::string b64_from_raw(const std::vector<uint8_t>& data)
+  std::string b64_from_raw(std::span<const uint8_t> data)
   {
     return b64_from_raw(data.data(), data.size());
   }
@@ -51,16 +53,18 @@ namespace ccf::crypto
   {
     auto r = Base64Impl::b64_from_raw(data, size);
 
-    for (size_t i = 0; i < r.size(); i++)
+    for (char& c : r)
     {
-      switch (r[i])
+      switch (c)
       {
         case '+':
-          r[i] = '-';
+          c = '-';
           break;
         case '/':
-          r[i] = '_';
+          c = '_';
           break;
+        default:
+          continue;
       }
     }
 

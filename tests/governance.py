@@ -1,38 +1,41 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import os
 import http
-import subprocess
+import json
+import os
+import random
+import tempfile
+from datetime import datetime, timezone
+from hashlib import sha256
+
+import governance_api
+import governance_history
+import governance_js
+import infra.crypto
+import infra.e2e_args
+import infra.interfaces
+import infra.log_capture
+import infra.logging_app as app
+import infra.member
+import infra.net
 import infra.network
 import infra.path
 import infra.proc
-import infra.net
-import infra.e2e_args
 import infra.proposal
-import suite.test_requirements as reqs
-import infra.logging_app as app
-import json
 import jinja2
-import infra.crypto
-from datetime import datetime, timezone
-import governance_js
+import memberclient
+import membership
+import suite.test_requirements as reqs
+from infra.node import CCFVersion
 from infra.runner import ConcurrentRunner
-import governance_history
-import tempfile
-import infra.interfaces
-import infra.log_capture
-import governance_api
-from hashlib import md5
-import random
-
 from loguru import logger as LOG
 
 
 @reqs.description("Test create endpoint is not available")
 def test_create_endpoint(network, args):
     primary, _ = network.find_nodes()
-    with primary.client() as c:
-        r = c.post("/node/create")
+    with primary.client("user0") as c:
+        r = c.post("/node/create", validate_openapi=False)
         assert r.status_code == http.HTTPStatus.FORBIDDEN.value
         assert r.body.json()["error"]["message"] == "Node is not in initial state."
     return network
@@ -45,66 +48,6 @@ def test_consensus_status(network, args):
         r = c.get("/node/consensus")
         assert r.status_code == http.HTTPStatus.OK.value
         assert r.body.json()["details"]["leadership_state"] == "Leader"
-    return network
-
-
-@reqs.description("Test quotes")
-@reqs.supports_methods("/node/quotes/self", "/node/quotes")
-def test_quote(network, args):
-    if args.enclave_platform != "sgx":
-        LOG.warning("Quote test can only run in real enclaves, skipping")
-        return network
-
-    primary, _ = network.find_nodes()
-    with primary.client() as c:
-        oed = subprocess.run(
-            [
-                os.path.join(args.oe_binary, "oesign"),
-                "dump",
-                "-e",
-                infra.path.build_lib_path(
-                    args.package, args.enclave_type, args.enclave_platform
-                ),
-            ],
-            capture_output=True,
-            check=True,
-        )
-        lines = [
-            line
-            for line in oed.stdout.decode().split(os.linesep)
-            if line.startswith("mrenclave=")
-        ]
-        expected_mrenclave = lines[0].strip().split("=")[1]
-
-        r = c.get("/node/quotes/self")
-        primary_quote_info = r.body.json()
-        assert primary_quote_info["node_id"] == primary.node_id
-        primary_mrenclave = primary_quote_info["mrenclave"]
-        assert primary_mrenclave == expected_mrenclave, (
-            primary_mrenclave,
-            expected_mrenclave,
-        )
-
-        r = c.get("/node/quotes")
-        quotes = r.body.json()["quotes"]
-        assert len(quotes) == len(network.get_joined_nodes())
-
-        for quote in quotes:
-            mrenclave = quote["mrenclave"]
-            assert mrenclave == expected_mrenclave, (mrenclave, expected_mrenclave)
-
-            cafile = os.path.join(network.common_dir, "service_cert.pem")
-            assert (
-                infra.proc.ccall(
-                    "verify_quote.sh",
-                    f"https://{primary.get_public_rpc_host()}:{primary.get_public_rpc_port()}",
-                    "--cacert",
-                    f"{cafile}",
-                    log_output=True,
-                ).returncode
-                == 0
-            ), f"Quote verification for node {quote['node_id']} failed"
-
     return network
 
 
@@ -189,14 +132,15 @@ def test_no_quote(network, args):
             }
         )
     )
-    network.join_node(untrusted_node, args.package, args)
+    network.join_node(untrusted_node, args.package, args, from_snapshot=False)
     with untrusted_node.client(
         ca=os.path.join(
             untrusted_node.common_dir, f"{untrusted_node.local_node_id}.pem"
         )
     ) as uc:
         r = uc.get("/node/quotes/self")
-        assert r.status_code == http.HTTPStatus.NOT_FOUND
+        assert r.status_code == http.HTTPStatus.SERVICE_UNAVAILABLE, r
+        assert r.body.json()["error"]["code"] == "FrontendNotOpen"
     return network
 
 
@@ -231,7 +175,7 @@ def test_node_data(network, args):
             )
 
             # NB: This new node joins but is never trusted
-            network.join_node(untrusted_node, args.package, args)
+            network.join_node(untrusted_node, args.package, args, from_snapshot=False)
 
             nodes = get_nodes()
             assert untrusted_node.node_id in nodes, nodes
@@ -316,14 +260,23 @@ def test_all_members(network, args):
             assert response_data == member.member_data
 
             response_pub_enc_key = response_member.get("publicEncryptionKey")
-            if member.is_recovery_member:
+            if member.recovery_role != infra.member.RecoveryRole.NonParticipant:
                 enc_pub_key_file = os.path.join(
                     primary.common_dir, member.member_info["encryption_public_key_file"]
                 )
-                recovery_enc_key = open(enc_pub_key_file, encoding="utf-8").read()
+                with open(enc_pub_key_file, encoding="utf-8") as enc_pub_key:
+                    recovery_enc_key = enc_pub_key.read()
                 assert response_pub_enc_key == recovery_enc_key
             else:
                 assert response_pub_enc_key is None
+
+            response_recovery_role = response_member.get("recoveryRole")
+            if member.recovery_role == infra.member.RecoveryRole.Owner:
+                assert response_recovery_role == "Owner"
+            elif member.recovery_role == infra.member.RecoveryRole.Participant:
+                assert response_recovery_role == "Participant"
+            else:
+                assert response_recovery_role == "NonParticipant"
 
     # Test on current network
     run_test_all_members(network)
@@ -339,7 +292,6 @@ def test_all_members(network, args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         existing_network=network,
     )
     recovered_network.start_in_recovery(
@@ -356,7 +308,18 @@ def test_all_members(network, args):
 @reqs.description("Test ack state digest updates")
 def test_ack_state_digest_update(network, args):
     for node in network.get_joined_nodes():
-        network.consortium.get_any_active_member().update_ack_state_digest(node)
+        member = network.consortium.get_any_active_member()
+        updated = member.update_ack_state_digest(node)
+        updated_digest = updated.body.json()
+        assert updated_digest["memberId"] == member.service_id
+        assert len(bytes.fromhex(updated_digest["stateDigest"])) == 32
+
+        with node.client() as c:
+            c.wait_for_commit(updated)
+        with node.api_versioned_client(api_version=args.gov_api_version) as c:
+            r = c.get(f"/gov/members/state-digests/{member.service_id}")
+            assert r.status_code == http.HTTPStatus.OK, r
+            assert r.body.json() == updated_digest
     return network
 
 
@@ -418,7 +381,7 @@ def test_each_node_cert_renewal(network, args):
                         )
                     except Exception as e:
                         if expected_exception is None:
-                            raise e
+                            raise
                         assert isinstance(e, expected_exception)
                         continue
                     else:
@@ -512,6 +475,22 @@ def test_service_cert_renewal_extended(network, args):
         else:
             assert expected_exception is None, "Proposal should have not succeeded"
 
+    # Confirm that we can renew the service certificate multiple times
+    # without issue
+    for _ in range(5):
+        new_duration = random.randint(1, 100)
+        LOG.info(f"Renewing service certificate for {new_duration} days")
+        renew_service_certificate(network, args, now, new_duration)
+        # Old cert still valid
+        primary, _ = network.find_primary()
+        with primary.client() as c:
+            c.get("/node/network/nodes")
+        # Update service identity used by clients to connect to the network
+        network.refresh_service_identity_file(args)
+        # Using new cert also works
+        with primary.client() as c:
+            c.get("/node/network/nodes")
+
     return network
 
 
@@ -542,7 +521,7 @@ def test_all_nodes_cert_renewal(network, args, valid_from=None):
     self_signed_node_certs_before = {}
     for node in network.get_joined_nodes():
         # Note: GET /node/self_signed_certificate endpoint was added after 2.0.0-r6
-        if node.version_after("ccf-2.0.0-rc6"):
+        if CCFVersion(node.version) > CCFVersion("ccf-2.0.0-rc6"):
             self_signed_node_certs_before[node.local_node_id] = (
                 node.retrieve_self_signed_cert()
             )
@@ -558,7 +537,7 @@ def test_all_nodes_cert_renewal(network, args, valid_from=None):
 
     for node in network.get_joined_nodes():
         node.set_certificate_validity_period(valid_from, validity_period_days)
-        if node.version_after("ccf-2.0.0-rc6"):
+        if CCFVersion(node.version) > CCFVersion("ccf-2.0.0-rc6"):
             assert (
                 self_signed_node_certs_before[node.local_node_id]
                 != node.retrieve_self_signed_cert()
@@ -581,20 +560,19 @@ def gov(args):
         node.rpc_interfaces.update(infra.interfaces.make_secondary_interface())
 
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network.consortium.set_authenticate_session(args.authenticate_session)
         test_create_endpoint(network, args)
         test_consensus_status(network, args)
         test_member_data(network, args)
+        test_ack_state_digest_update(network, args)
         network = test_all_members(network, args)
-        test_quote(network, args)
         test_user(network, args)
         test_jinja_templates(network, args)
         test_no_quote(network, args)
         test_node_data(network, args)
-        test_ack_state_digest_update(network, args)
         test_each_node_cert_renewal(network, args)
         test_binding_proposal_to_service_identity(network, args)
         test_all_nodes_cert_renewal(network, args)
@@ -606,7 +584,7 @@ def gov(args):
 # requirements, so are run in a standalone network
 def single_node(args):
     def test_desc(s):
-        LOG.opt(colors=True).info(f"<magenta>Test: {s}</>")
+        LOG.info(f"Test: {s}")
 
     test_desc("Node data on start node")
     with tempfile.NamedTemporaryFile(mode="w+") as ntf:
@@ -618,7 +596,6 @@ def single_node(args):
             args.nodes,
             args.binary_dir,
             args.debug_nodes,
-            args.perf_nodes,
             pdb=args.pdb,
             node_data_json_file=ntf.name,
         ) as network:
@@ -635,7 +612,7 @@ def single_node(args):
             consortium = network.consortium
 
             def rand_hex():
-                return md5(random.getrandbits(32).to_bytes(4, "big")).hexdigest()
+                return sha256(random.getrandbits(32).to_bytes(4, "big")).hexdigest()
 
             validate_info = f"Logged at info during validate: {rand_hex()}"
             validate_warn = f"Logged at warn during validate: {rand_hex()}"
@@ -714,14 +691,15 @@ def single_node(args):
     }
     warn_counts = {k: 0 for k in {validate_warn, apply_warn}}
     out_path, _ = primary.get_logs()
-    for line in open(out_path, "r", encoding="utf-8").readlines():
-        for k in info_counts.keys():
-            if k in line and "[info ]" in line:
-                info_counts[k] += 1
+    with open(out_path, "r", encoding="utf-8") as output:
+        for line in output:
+            for k in info_counts:
+                if k in line and "[info ]" in line:
+                    info_counts[k] += 1
 
-        for k in warn_counts.keys():
-            if k in line and "[fail ]" in line:
-                warn_counts[k] += 1
+            for k in warn_counts:
+                if k in line and "[fail ]" in line:
+                    warn_counts[k] += 1
 
     LOG.debug("Found following info line occurrences in node output:")
     for k, v in info_counts.items():
@@ -731,10 +709,10 @@ def single_node(args):
     for k, v in warn_counts.items():
         LOG.debug(f"  '{k}': {v}")
 
-    assert info_counts[validate_info] == 1
-    assert warn_counts[validate_warn] == 1
-    assert info_counts[apply_info] == 1
-    assert warn_counts[apply_warn] == 1
+    assert info_counts[validate_info] == 1, info_counts
+    assert warn_counts[validate_warn] == 1, info_counts
+    assert info_counts[apply_info] == 1, info_counts
+    assert warn_counts[apply_warn] == 1, info_counts
 
     # We eval a lot!
     # Each proposal results in 5 separate evaluations for strict sandboxing:
@@ -742,7 +720,7 @@ def single_node(args):
     # - 3 separate ballot submissions (1 per member)
     # - Proposal application
     # And we approve 2 proposals while this proposal is active ("just_log", and "set_constitution" to the original)
-    assert info_counts[eval_info] == 10
+    assert info_counts[eval_info] == 10, info_counts
 
     assert info_counts[validate_error] == 1, info_counts
     assert info_counts[apply_error] == 1, info_counts
@@ -750,7 +728,7 @@ def single_node(args):
 
 def js_gov(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network.consortium.set_authenticate_session(args.authenticate_session)
@@ -761,6 +739,7 @@ def js_gov(args):
         governance_js.test_ballot_storage(network, args)
         governance_js.test_pure_proposals(network, args)
         governance_js.test_set_constitution(network, args)
+        governance_js.test_set_constitution_validation(network, args)
         governance_js.test_proposals_with_votes(network, args)
         governance_js.test_check_proposal_id_is_set_correctly(network, args)
         governance_js.test_vote_failure_reporting(network, args)
@@ -777,7 +756,7 @@ def js_gov(args):
 
 def gov_replay(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network.consortium.set_authenticate_session(args.authenticate_session)
@@ -799,7 +778,7 @@ if __name__ == "__main__":
     cr.add(
         "single_node",
         single_node,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.min_nodes(cr.args, f=0),
         authenticate_session="COSE",
     )
@@ -807,7 +786,7 @@ if __name__ == "__main__":
     cr.add(
         "session_coseauth",
         gov,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         initial_user_count=3,
         authenticate_session="COSE",
@@ -816,7 +795,7 @@ if __name__ == "__main__":
     cr.add(
         "js",
         js_gov,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         initial_user_count=3,
         authenticate_session="COSE",
@@ -825,7 +804,7 @@ if __name__ == "__main__":
     cr.add(
         "replay",
         gov_replay,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         initial_user_count=3,
         authenticate_session="COSE",
@@ -834,7 +813,7 @@ if __name__ == "__main__":
     cr.add(
         "history",
         governance_history.run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         authenticate_session="COSE",
     )
@@ -842,8 +821,23 @@ if __name__ == "__main__":
     cr.add(
         "gov_api",
         governance_api.run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
     )
 
-    cr.run(2)
+    cr.add(
+        "membership",
+        membership.run,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.max_nodes(cr.args, f=0),
+        initial_user_count=0,
+    )
+
+    cr.add(
+        "member_client",
+        memberclient.run,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.max_nodes(cr.args, f=1),
+    )
+
+    cr.run()

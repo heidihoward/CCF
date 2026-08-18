@@ -1,20 +1,20 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import e2e_logging
-import memberclient
-import reconfiguration
-import recovery
-import election
+from inspect import Parameter, signature
+
 import code_update
-import membership
+import e2e_common_endpoints
+import e2e_logging
+import e2e_operations
+import governance
 import governance_history
 import jwt_test
-import governance
-import e2e_operations
-import e2e_common_endpoints
-
-from inspect import signature, Parameter
+import memberclient
+import membership
+import nodes
+import reconfiguration
+import recovery
 
 suites = {}
 
@@ -51,6 +51,7 @@ suite_membership_recovery = [
     recovery.test_recover_service,
     membership.test_update_recovery_shares,
     recovery.test_recover_service,
+    recovery.test_recovery_member_changes_rejected_during_recovery,
 ]
 suites["membership_recovery"] = suite_membership_recovery
 
@@ -61,14 +62,15 @@ suite_reconfiguration = [
     reconfiguration.test_retire_primary,
     e2e_logging.test_rekey,
     reconfiguration.test_add_node,
-    election.test_kill_primary,
-    election.test_commit_view_history,
+    reconfiguration.test_add_node_with_corrupted_ledger,
+    nodes.test_kill_primary,
+    nodes.test_commit_view_history,
     reconfiguration.test_add_node,
     reconfiguration.test_add_node_from_snapshot,
     reconfiguration.test_retire_backup,
     reconfiguration.test_add_node,
-    election.test_kill_primary,
-    election.test_commit_view_history,
+    nodes.test_kill_primary,
+    nodes.test_commit_view_history,
     e2e_logging.test_view_history,
     reconfiguration.test_ledger_invariants,
 ]
@@ -114,10 +116,10 @@ all_tests_suite = [
     e2e_logging.test_rekey,
     # election:
     reconfiguration.test_add_node,
-    election.test_kill_primary,
+    nodes.test_kill_primary,
     # code update:
     code_update.test_verify_quotes,
-    code_update.test_add_node_with_bad_code,
+    code_update.test_add_node_with_different_package,
     # curve migration:
     reconfiguration.test_change_curve,
     recovery.test_recover_service,

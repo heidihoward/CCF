@@ -386,7 +386,8 @@ export interface CCFCrypto {
   /**
    * Generate an ECDSA key pair.
    *
-   * @param curve The name of the curve, one of "secp256r1", "secp256k1", "secp384r1".
+   * @param curve The name of the curve, one of "secp256r1", "secp384r1",
+   * "secp521r1".
    */
   generateEcdsaKeyPair(curve: string): CryptoKeyPair;
 
@@ -440,6 +441,12 @@ export interface CCFCrypto {
    * The chain and trusted certificates are PEM-encoded bundles of X.509 certificates.
    */
   isValidX509CertChain(chain: string, trusted: string): boolean;
+
+  /**
+   * Returns whether a single PEM-encoded X.509 certificate is a self-signed (root) CA.
+   * Returns false for intermediate CA certificates, non-CA certificates, and malformed PEM.
+   */
+  isValidX509RootCACert(pem: string): boolean;
 
   /**
    * Converts an elliptic curve public key as PEM to JSON Web Key (JWK) object.
@@ -724,13 +731,11 @@ export interface CCF {
   historical: CCFHistorical;
 
   /**
-   * Toggles implementation of Date global API between using untrusted host time
-   * (when enabled)and returning 0 (when disabled). By default this is disabled.
+   * @deprecated This function has no effect and will be removed in a future release.
    *
-   * Returns the previous value, allowing a global default to be maintained.
+   * Returns `enable` for compatibility.
    *
-   * @param enable If true, then subsequent calls to Date.now() will return untrusted
-   * host time
+   * @param enable The value returned by this function
    */
   enableUntrustedDateTime(enable: boolean): boolean;
 
@@ -789,6 +794,9 @@ export interface SnpAttestationResult {
     report_id: ArrayBuffer;
     report_id_ma: ArrayBuffer;
     reported_tcb: TcbVersion;
+    cpuid_fam_id: number;
+    cpuid_mod_id: number;
+    cpuid_step: number;
     chip_id: ArrayBuffer;
     committed_tcb: TcbVersion;
     current_minor: number;

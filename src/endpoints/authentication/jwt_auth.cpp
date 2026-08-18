@@ -3,18 +3,20 @@
 
 #include "ccf/endpoints/authentication/jwt_auth.h"
 
+#include "ccf/crypto/ec_public_key.h"
+#include "ccf/crypto/ecdsa.h"
+#include "ccf/crypto/rsa_public_key.h"
 #include "ccf/ds/nonstd.h"
 #include "ccf/pal/locking.h"
 #include "ccf/rpc_context.h"
 #include "ccf/service/tables/jwt.h"
 #include "ds/lru.h"
-#include "enclave/enclave_time.h"
 #include "http/http_jwt.h"
 
 namespace
 {
-  static const std::string multitenancy_indicator{"{tenantid}"};
-  static const std::string microsoft_entra_domain{"login.microsoftonline.com"};
+  const std::string multitenancy_indicator{"{tenantid}"};
+  const std::string microsoft_entra_domain{"login.microsoftonline.com"};
 
   std::optional<std::string_view> first_non_empty_chunk(
     const std::vector<std::string_view>& chunks)
@@ -82,34 +84,77 @@ namespace ccf
     return tenant_id && tid && *tid == *tenant_id;
   }
 
-  struct VerifiersCache
+  struct PublicKeysCache
   {
-    static constexpr size_t DEFAULT_MAX_VERIFIERS = 10;
+    static constexpr size_t DEFAULT_MAX_KEYS = 10;
 
     using DER = std::vector<uint8_t>;
-    ccf::pal::Mutex verifiers_lock;
-    LRU<DER, ccf::crypto::VerifierPtr> verifiers;
+    ccf::pal::Mutex keys_lock;
 
-    VerifiersCache(size_t max_verifiers = DEFAULT_MAX_VERIFIERS) :
-      verifiers(max_verifiers)
-    {}
+    using PublicKey =
+      std::variant<ccf::crypto::RSAPublicKeyPtr, ccf::crypto::ECPublicKeyPtr>;
+    LRU<DER, PublicKey> keys;
 
-    ccf::crypto::VerifierPtr get_verifier(const DER& der)
+    PublicKeysCache(size_t max_keys = DEFAULT_MAX_KEYS) : keys(max_keys) {}
+
+    bool verify(
+      const uint8_t* contents,
+      size_t contents_size,
+      const uint8_t* signature,
+      size_t signature_size,
+      const DER& der)
     {
-      std::lock_guard<ccf::pal::Mutex> guard(verifiers_lock);
+      std::lock_guard<ccf::pal::Mutex> guard(keys_lock);
 
-      auto it = verifiers.find(der);
-      if (it == verifiers.end())
+      auto it = keys.find(der);
+      if (it == keys.end())
       {
-        it = verifiers.insert(der, ccf::crypto::make_unique_verifier(der));
+        try
+        {
+          it = keys.insert(der, ccf::crypto::make_rsa_public_key(der));
+        }
+        catch (const std::exception&)
+        {
+          it = keys.insert(der, ccf::crypto::make_ec_public_key(der));
+        }
       }
 
-      return it->second;
+      const auto& key = it->second;
+      if (std::holds_alternative<ccf::crypto::RSAPublicKeyPtr>(key))
+      {
+        LOG_DEBUG_FMT("Verify der: {} as RSA key", der);
+        // Obsolete PKCS1 padding is chosen for JWT, as explained in details in
+        // https://github.com/microsoft/CCF/issues/6601#issuecomment-2512059875.
+        return std::get<ccf::crypto::RSAPublicKeyPtr>(key)->verify(
+          contents,
+          contents_size,
+          signature,
+          signature_size,
+          ccf::crypto::MDType::SHA256,
+          ccf::crypto::RSAPadding::PKCS1v15);
+      }
+
+      if (std::holds_alternative<ccf::crypto::ECPublicKeyPtr>(key))
+      {
+        LOG_DEBUG_FMT("Verify der: {} as EC key", der);
+
+        const auto sig_der =
+          ccf::crypto::ecdsa_sig_p1363_to_der({signature, signature_size});
+        return std::get<ccf::crypto::ECPublicKeyPtr>(key)->verify(
+          contents,
+          contents_size,
+          sig_der.data(),
+          sig_der.size(),
+          ccf::crypto::MDType::SHA256);
+      }
+
+      LOG_DEBUG_FMT("Key not found for der: {}", der);
+      return false;
     }
   };
 
   JwtAuthnPolicy::JwtAuthnPolicy() :
-    verifiers(std::make_unique<VerifiersCache>())
+    keys_cache(std::make_unique<PublicKeysCache>())
   {}
 
   JwtAuthnPolicy::~JwtAuthnPolicy() = default;
@@ -128,28 +173,11 @@ namespace ccf
       return nullptr;
     }
 
-    auto& token = token_opt.value();
-    auto keys = tx.ro<JwtPublicSigningKeys>(
+    const auto& token = token_opt.value();
+    auto* keys = tx.ro<JwtPublicSigningKeysMetadata>(
       ccf::Tables::JWT_PUBLIC_SIGNING_KEYS_METADATA);
     const auto key_id = token.header_typed.kid;
     auto token_keys = keys->get(key_id);
-
-    if (!token_keys)
-    {
-      auto fallback_keys = tx.ro<Tables::Legacy::JwtPublicSigningKeys>(
-        ccf::Tables::Legacy::JWT_PUBLIC_SIGNING_KEYS);
-      auto fallback_issuers = tx.ro<Tables::Legacy::JwtPublicSigningKeyIssuer>(
-        ccf::Tables::Legacy::JWT_PUBLIC_SIGNING_KEY_ISSUER);
-
-      auto fallback_key = fallback_keys->get(key_id);
-      if (fallback_key)
-      {
-        token_keys = std::vector<OpenIDJWKMetadata>{OpenIDJWKMetadata{
-          .cert = *fallback_key,
-          .issuer = *fallback_issuers->get(key_id),
-          .constraint = std::nullopt}};
-      }
-    }
 
     if (!token_keys || token_keys->empty())
     {
@@ -160,32 +188,42 @@ namespace ccf
 
     for (const auto& metadata : *token_keys)
     {
-      auto verifier = verifiers->get_verifier(metadata.cert);
-      if (!::http::JwtVerifier::validate_token_signature(token, verifier))
+      if (!keys_cache->verify(
+            reinterpret_cast<const uint8_t*>(token.signed_content.data()),
+            token.signed_content.size(),
+            token.signature.data(),
+            token.signature.size(),
+            metadata.public_key))
       {
         error_reason = "Signature verification failed";
         continue;
       }
 
       // Check that the Not Before and Expiration Time claims are valid
-      const size_t time_now = std::chrono::duration_cast<std::chrono::seconds>(
-                                ccf::get_enclave_time())
-                                .count();
-      if (time_now < token.payload_typed.nbf)
+      const size_t time_now =
+        std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+      if (token.payload_typed.nbf && time_now < *token.payload_typed.nbf)
       {
         error_reason = fmt::format(
           "Current time {} is before token's Not Before (nbf) claim {}",
           time_now,
           token.payload_typed.nbf);
+        continue;
       }
-      else if (time_now > token.payload_typed.exp)
+
+      if (time_now > token.payload_typed.exp)
       {
         error_reason = fmt::format(
           "Current time {} is after token's Expiration Time (exp) claim {}",
           time_now,
           token.payload_typed.exp);
+        continue;
       }
-      else if (
+
+      // Check that the constraint is met
+      if (
         metadata.constraint &&
         !validate_issuer(
           token.payload_typed.iss,
@@ -196,15 +234,16 @@ namespace ccf
           "Kid {} failed issuer constraint validation {}",
           key_id,
           *metadata.constraint);
+        continue;
       }
-      else
-      {
-        auto identity = std::make_unique<JwtAuthnIdentity>();
-        identity->key_issuer = metadata.issuer;
-        identity->header = std::move(token.header);
-        identity->payload = std::move(token.payload);
-        return identity;
-      }
+
+      // Else all checks have passed; return this identity
+      auto identity = std::make_unique<JwtAuthnIdentity>();
+      identity->key_issuer = metadata.issuer;
+      identity->header = token.header;
+      identity->payload = token.payload;
+      error_reason.clear();
+      return identity;
     }
 
     return nullptr;
@@ -219,7 +258,7 @@ namespace ccf
       std::move(error_reason));
     ctx->set_response_header(
       http::headers::WWW_AUTHENTICATE,
-      "Bearer realm=\"JWT bearer token access\", error=\"invalid_token\"");
+      R"(Bearer realm="JWT bearer token access", error="invalid_token")");
   }
 
   const OpenAPISecuritySchema JwtAuthnPolicy::security_schema = std::make_pair(

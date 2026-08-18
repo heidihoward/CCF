@@ -5,6 +5,7 @@
 #include "ccf/js/core/context.h"
 #include "ccf/js/extensions/ccf/converters.h"
 #include "ccf/js/extensions/ccf/crypto.h"
+#include "ccf/js/extensions/ccf/gov.h"
 #include "ccf/js/extensions/ccf/kv.h"
 #include "ccf/js/extensions/console.h"
 #include "ccf/js/extensions/math/random.h"
@@ -41,6 +42,10 @@ namespace ccf::js
       // add snp_attestation.*
       Base::add_extension(
         std::make_shared<ccf::js::extensions::SnpAttestationExtension>());
+
+      // add ccf.gov.*
+      Base::add_extension(
+        std::make_shared<ccf::js::extensions::GovExtension>());
     }
   };
 
@@ -53,6 +58,21 @@ namespace ccf::js
       // add ccf.kv.*
       Base::add_extension(
         std::make_shared<ccf::js::extensions::KvExtension>(tx));
+    }
+
+    ccf::js::core::JSWrappedValue inner_call(
+      const ccf::js::core::JSWrappedValue& f,
+      const std::vector<ccf::js::core::JSWrappedValue>& argv) override
+    {
+      auto ret = Base::inner_call(f, argv);
+      auto* extension =
+        Base::template get_extension<ccf::js::extensions::KvExtension>();
+      if (extension != nullptr)
+      {
+        extension->rethrow_trapped_exceptions();
+      }
+
+      return ret;
     }
   };
 

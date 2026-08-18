@@ -15,6 +15,7 @@ namespace ccf::js::extensions
    * - ccf.bufToJsonCompatible
    *
    * - ccf.pemToId
+   * - ccf.tcbHexToPolicy
    *
    * - ccf.enableUntrustedDateTime
    * - ccf.enableMetricsLogging
@@ -23,7 +24,7 @@ namespace ccf::js::extensions
   class ConvertersExtension : public ExtensionInterface
   {
   public:
-    ConvertersExtension() {}
+    ConvertersExtension() = default;
 
     void install(js::core::Context& ctx) override;
   };

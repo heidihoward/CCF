@@ -8,7 +8,7 @@
  * @module
  */
 
-import { JsonCompatible, ccf } from "./global.js";
+import { type JsonCompatible, ccf } from "./global.js";
 
 /**
  * The body of a request.
@@ -117,7 +117,18 @@ export interface EmptyAuthnIdentity extends AuthnIdentityCommon {
   policy: "no_auth";
 }
 
-interface UserMemberAuthnIdentityCommon extends AuthnIdentityCommon {
+interface CertAuthnIdentityCommon extends AuthnIdentityCommon {
+  /**
+   * PEM-encoded certificate.
+   */
+  cert: string;
+}
+
+export interface AnyCertAuthnIdentity extends CertAuthnIdentityCommon {
+  policy: "any_cert";
+}
+
+interface UserMemberAuthnIdentityCommon extends CertAuthnIdentityCommon {
   /**
    * User/member ID.
    */
@@ -127,11 +138,6 @@ interface UserMemberAuthnIdentityCommon extends AuthnIdentityCommon {
    * User/member data object.
    */
   data: any;
-
-  /**
-   * PEM-encoded user/member certificate.
-   */
-  cert: string;
 }
 
 export interface UserCertAuthnIdentity extends UserMemberAuthnIdentityCommon {
@@ -152,14 +158,12 @@ interface UserMemberCOSEAuthIdentityCommon {
 }
 
 export interface MemberCOSESign1AuthnIdentity
-  extends UserMemberAuthnIdentityCommon,
-    UserMemberCOSEAuthIdentityCommon {
+  extends UserMemberAuthnIdentityCommon, UserMemberCOSEAuthIdentityCommon {
   policy: "member_cose_sign1";
 }
 
 export interface UserCOSESign1AuthnIdentity
-  extends UserMemberAuthnIdentityCommon,
-    UserMemberCOSEAuthIdentityCommon {
+  extends UserMemberAuthnIdentityCommon, UserMemberCOSEAuthIdentityCommon {
   policy: "user_cose_sign1";
 }
 
@@ -193,6 +197,7 @@ export interface AllOfAuthnIdentity extends AuthnIdentityCommon {
 
   user_cert?: UserCertAuthnIdentity;
   member_cert?: MemberCertAuthnIdentity;
+  any_cert?: AnyCertAuthnIdentity;
   user_cose_sign1?: UserCOSESign1AuthnIdentity;
   member_cose_sign1?: MemberCOSESign1AuthnIdentity;
   jwt?: JwtAuthnIdentity;
@@ -207,6 +212,7 @@ export type AuthnIdentity =
   | EmptyAuthnIdentity
   | UserCertAuthnIdentity
   | MemberCertAuthnIdentity
+  | AnyCertAuthnIdentity
   | JwtAuthnIdentity
   | MemberCOSESign1AuthnIdentity
   | UserCOSESign1AuthnIdentity

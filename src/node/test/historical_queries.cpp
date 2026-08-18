@@ -10,6 +10,7 @@
 #include "ccf/crypto/rsa_key_pair.h"
 #include "ccf/pal/locking.h"
 #include "ccf/receipt.h"
+#include "crypto/cbor.h"
 #include "crypto/openssl/hash.h"
 #include "ds/messaging.h"
 #include "ds/test/stub_writer.h"
@@ -23,15 +24,12 @@
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
-std::unique_ptr<threading::ThreadMessaging>
-  threading::ThreadMessaging::singleton = nullptr;
-
 using NumToString = ccf::kv::Map<size_t, std::string>;
 
 constexpr size_t certificate_validity_period_days = 365;
 using namespace std::literals;
 auto valid_from =
-  ::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
+  ccf::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
 
 auto valid_to = ccf::crypto::compute_cert_valid_to_string(
   valid_from, certificate_validity_period_days);
@@ -40,8 +38,8 @@ struct TestState
 {
   std::shared_ptr<ccf::kv::Store> kv_store = nullptr;
   std::shared_ptr<ccf::LedgerSecrets> ledger_secrets = nullptr;
-  ccf::crypto::KeyPairPtr node_kp = nullptr;
-  std::shared_ptr<ccf::crypto::KeyPair_OpenSSL> service_kp = nullptr;
+  ccf::crypto::ECKeyPairPtr node_kp = nullptr;
+  std::shared_ptr<ccf::crypto::ECKeyPair_OpenSSL> service_kp = nullptr;
 };
 
 TestState create_and_init_state(bool initialise_ledger_rekey = true)
@@ -53,16 +51,16 @@ TestState create_and_init_state(bool initialise_ledger_rekey = true)
   auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
   ts.kv_store->set_encryptor(encryptor);
 
-  ts.node_kp = ccf::crypto::make_key_pair();
-  ts.service_kp = std::dynamic_pointer_cast<ccf::crypto::KeyPair_OpenSSL>(
-    ccf::crypto::make_key_pair());
+  ts.node_kp = ccf::crypto::make_ec_key_pair();
+  ts.service_kp = std::dynamic_pointer_cast<ccf::crypto::ECKeyPair_OpenSSL>(
+    ccf::crypto::make_ec_key_pair());
 
   // Make history to produce signatures
   const ccf::NodeId node_id = std::string("node_id");
   auto h =
     std::make_shared<ccf::MerkleTxHistory>(*ts.kv_store, node_id, *ts.node_kp);
   h->set_endorsed_certificate({});
-  h->set_service_kp(ts.service_kp);
+  h->set_service_signing_identity(ts.service_kp, ccf::COSESignaturesConfig{});
   ts.kv_store->set_history(h);
   ts.kv_store->initialise_term(2);
 
@@ -73,6 +71,7 @@ TestState create_and_init_state(bool initialise_ledger_rekey = true)
     ccf::NodeInfo ni;
     ni.cert = ts.node_kp->self_sign("CN=Test node", valid_from, valid_to);
     ni.status = ccf::NodeStatus::TRUSTED;
+    ni.encryption_pub_key = ts.node_kp->public_key_pem();
     nodes->put(node_id, ni);
     REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
   }
@@ -99,7 +98,7 @@ TestState create_and_init_state(bool initialise_ledger_rekey = true)
     auto member_public_encryption_keys = tx.rw<ccf::MemberPublicEncryptionKeys>(
       ccf::Tables::MEMBER_ENCRYPTION_PUBLIC_KEYS);
 
-    auto kp = ccf::crypto::make_key_pair();
+    auto kp = ccf::crypto::make_ec_key_pair();
     auto cert = kp->self_sign("CN=member", valid_from, valid_to);
     auto member_id =
       ccf::crypto::Sha256Hash(ccf::crypto::cert_pem_to_der(cert)).hex_str();
@@ -209,7 +208,7 @@ void validate_business_transaction(
   REQUIRE(state->receipt != nullptr);
 
   const auto state_txid = state->transaction_id;
-  const auto store_txid = state->store->get_txid();
+  const auto store_txid = state->store->current_txid();
   REQUIRE(state_txid.view == store_txid.view);
   REQUIRE(state_txid.seqno == store_txid.seqno);
 }
@@ -245,101 +244,59 @@ std::map<ccf::SeqNo, std::vector<uint8_t>> construct_host_ledger(
 size_t get_cache_limit_for_entries(
   const std::vector<std::vector<uint8_t>>& entries)
 {
-  return ccf::historical::soft_to_raw_ratio *
-    std::accumulate(
-           entries.begin(),
-           entries.end(),
-           0ll,
-           [&](size_t prev, const std::vector<uint8_t>& entry) {
-             return prev + entry.size();
-           });
+  return std::accumulate(
+    entries.begin(),
+    entries.end(),
+    0ll,
+    [&](size_t prev, const std::vector<uint8_t>& entry) {
+      return prev + entry.size();
+    });
 }
 
 struct MerkleProofData
 {
+  using PathItem =
+    std::pair</* left/right */ bool, /* digest */ std::vector<uint8_t>>;
+
   std::vector<uint8_t> write_set_digest;
   std::string commit_evidence;
   std::vector<uint8_t> claims_digest;
-  std::vector<std::pair<int64_t, std::vector<uint8_t>>> path;
+  std::vector<PathItem> path;
 };
-
-std::vector<uint8_t> bstring_to_bytes(QCBORItem& item)
-{
-  return {
-    static_cast<const uint8_t*>(item.val.string.ptr),
-    static_cast<const uint8_t*>(item.val.string.ptr) + item.val.string.len};
-}
-
-std::string tstring_to_string(QCBORItem& item)
-{
-  return {
-    static_cast<const char*>(item.val.string.ptr),
-    static_cast<const char*>(item.val.string.ptr) + item.val.string.len};
-}
 
 MerkleProofData decode_merkle_proof(const std::vector<uint8_t>& encoded)
 {
-  q_useful_buf_c buf{encoded.data(), encoded.size()};
-  QCBORDecodeContext ctx;
-  QCBORDecode_Init(&ctx, buf, QCBOR_DECODE_MODE_NORMAL);
-  struct q_useful_buf_c params;
-  QCBORDecode_EnterMap(&ctx, NULL);
-  QCBORDecode_EnterArrayFromMapN(
-    &ctx, ccf::MerkleProofLabel::MERKLE_PROOF_LEAF_LABEL);
-  QCBORItem item;
   MerkleProofData data;
 
-  QCBORDecode_GetNext(&ctx, &item);
-  REQUIRE(item.uDataType == QCBOR_TYPE_BYTE_STRING);
-  data.write_set_digest = bstring_to_bytes(item);
+  auto decoded = ccf::cbor::parse(encoded);
 
-  QCBORDecode_GetNext(&ctx, &item);
-  REQUIRE(item.uDataType == QCBOR_TYPE_TEXT_STRING);
-  data.commit_evidence = tstring_to_string(item);
+  const auto& leaf = decoded->map_at(
+    ccf::cbor::make_signed(ccf::MerkleProofLabel::MERKLE_PROOF_LEAF_LABEL));
 
-  QCBORDecode_GetNext(&ctx, &item);
-  REQUIRE(item.uDataType == QCBOR_TYPE_BYTE_STRING);
-  data.claims_digest = bstring_to_bytes(item);
+  REQUIRE_EQ(leaf->size(), 3);
 
-  QCBORDecode_ExitArray(&ctx);
-  QCBORDecode_EnterArrayFromMapN(
-    &ctx, ccf::MerkleProofLabel::MERKLE_PROOF_PATH_LABEL);
+  const auto& wsd = leaf->array_at(0)->as_bytes();
+  data.write_set_digest.assign(wsd.begin(), wsd.end());
 
-  for (;;)
+  data.commit_evidence = leaf->array_at(1)->as_string();
+
+  const auto& cd = leaf->array_at(2)->as_bytes();
+  data.claims_digest.assign(cd.begin(), cd.end());
+
+  const auto& path = decoded->map_at(
+    ccf::cbor::make_signed(ccf::MerkleProofLabel::MERKLE_PROOF_PATH_LABEL));
+
+  for (size_t i = 0; i < path->size(); i++)
   {
-    QCBORDecode_EnterArray(&ctx, &item);
-    if (QCBORDecode_GetError(&ctx) != QCBOR_SUCCESS)
-      break;
+    const auto& node = path->array_at(i);
+    const auto& dir = node->array_at(0)->as_simple();
+    const auto& hash = node->array_at(1)->as_bytes();
 
-    std::pair<int64_t, std::vector<uint8_t>> path_item;
-
-    REQUIRE(QCBORDecode_GetNext(&ctx, &item) == QCBOR_SUCCESS);
-    if (item.uDataType == CBOR_SIMPLEV_TRUE)
-    {
-      path_item.first = true;
-    }
-    else if (item.uDataType == CBOR_SIMPLEV_FALSE)
-    {
-      path_item.first = false;
-    }
-    else
-    {
-      // Not a valid CBOR boolean
-      REQUIRE(false);
-    }
-
-    REQUIRE(QCBORDecode_GetNext(&ctx, &item) == QCBOR_SUCCESS);
-    REQUIRE(item.uDataType == QCBOR_TYPE_BYTE_STRING);
-    path_item.second = bstring_to_bytes(item);
-
-    data.path.push_back(path_item);
-    QCBORDecode_ExitArray(&ctx);
+    MerkleProofData::PathItem item;
+    item.first = ccf::cbor::simple_to_boolean(dir);
+    item.second.assign(hash.begin(), hash.end());
+    data.path.push_back(item);
   }
-
-  QCBORDecode_ExitArray(&ctx);
-  QCBORDecode_ExitMap(&ctx);
-
-  REQUIRE(QCBORDecode_Finish(&ctx) == QCBOR_ERR_NO_MORE_ITEMS);
 
   return data;
 }
@@ -374,7 +331,6 @@ TEST_CASE("StateCache point queries")
   static const ccf::historical::RequestHandle default_handle = 0;
   static const ccf::historical::RequestHandle low_handle = 1;
   static const ccf::historical::RequestHandle high_handle = 2;
-  static const ccf::historical::RequestHandle retry_handle = 3;
 
   {
     INFO(
@@ -556,9 +512,9 @@ TEST_CASE("StateCache point queries")
     {
       INFO("Dropping a handle deletes it, and it can no longer be retrieved");
       cache.drop_cached_states(default_handle);
-      const auto state =
+      const auto dropped_state =
         cache.get_state_at(default_handle, high_signature_transaction);
-      REQUIRE(state == nullptr);
+      REQUIRE(dropped_state == nullptr);
       cache.drop_cached_states(default_handle);
     }
 
@@ -766,10 +722,10 @@ TEST_CASE("StateCache get store vs get state")
       REQUIRE(provide_ledger_entry_range(seqno_b + 1, signature_transaction));
       auto states = cache.get_state_range(default_handle, seqno_a, seqno_b);
       REQUIRE_FALSE(states.empty());
-      for (auto& state : states)
+      for (auto& range_state : states)
       {
-        REQUIRE(state != nullptr);
-        REQUIRE(state->receipt != nullptr);
+        REQUIRE(range_state != nullptr);
+        REQUIRE(range_state->receipt != nullptr);
       }
       cache.drop_cached_states(default_handle);
     }
@@ -779,10 +735,10 @@ TEST_CASE("StateCache get store vs get state")
       REQUIRE(provide_ledger_entry_range(seqno_a, signature_transaction));
       auto states = cache.get_state_range(default_handle, seqno_a, seqno_b);
       REQUIRE_FALSE(states.empty());
-      for (auto& state : states)
+      for (auto& range_state : states)
       {
-        REQUIRE(state != nullptr);
-        REQUIRE(state->receipt != nullptr);
+        REQUIRE(range_state != nullptr);
+        REQUIRE(range_state->receipt != nullptr);
       }
 
       REQUIRE_FALSE(
@@ -790,10 +746,10 @@ TEST_CASE("StateCache get store vs get state")
 
       states = cache.get_state_range(default_handle, seqno_a, seqno_b);
       REQUIRE_FALSE(states.empty());
-      for (auto& state : states)
+      for (auto& range_state : states)
       {
-        REQUIRE(state != nullptr);
-        REQUIRE(state->receipt != nullptr);
+        REQUIRE(range_state != nullptr);
+        REQUIRE(range_state->receipt != nullptr);
       }
       cache.drop_cached_states(default_handle);
     }
@@ -810,10 +766,10 @@ TEST_CASE("StateCache get store vs get state")
       auto states =
         cache.get_state_range(default_handle, seqno_a, signature_transaction);
       REQUIRE_FALSE(states.empty());
-      for (auto& state : states)
+      for (auto& range_state : states)
       {
-        REQUIRE(state != nullptr);
-        REQUIRE(state->receipt != nullptr);
+        REQUIRE(range_state != nullptr);
+        REQUIRE(range_state->receipt != nullptr);
       }
       cache.drop_cached_states(default_handle);
     }
@@ -857,21 +813,6 @@ TEST_CASE("StateCache range queries")
     return accepted;
   };
 
-  auto signing_version = [&signature_versions](ccf::kv::Version seqno) {
-    const auto begin = signature_versions.begin();
-    const auto end = signature_versions.end();
-
-    const auto exact_it = std::find(begin, end, seqno);
-    if (exact_it != end)
-    {
-      return seqno;
-    }
-
-    const auto next_sig_it = std::upper_bound(begin, end, seqno);
-    REQUIRE(next_sig_it != end);
-    return *next_sig_it;
-  };
-
   std::random_device rd;
   std::mt19937 g(rd());
   auto fetch_and_validate_range = [&](
@@ -906,7 +847,7 @@ TEST_CASE("StateCache range queries")
       for (auto& store : stores)
       {
         REQUIRE(store != nullptr);
-        const auto seqno = store->get_txid().seqno;
+        const auto seqno = store->current_txid().seqno;
 
         // Don't validate anything about signature transactions, just the
         // business transactions between them
@@ -1213,21 +1154,6 @@ TEST_CASE("StateCache sparse queries")
     return accepted;
   };
 
-  auto signing_version = [&signature_versions](ccf::kv::Version seqno) {
-    const auto begin = signature_versions.begin();
-    const auto end = signature_versions.end();
-
-    const auto exact_it = std::find(begin, end, seqno);
-    if (exact_it != end)
-    {
-      return seqno;
-    }
-
-    const auto next_sig_it = std::upper_bound(begin, end, seqno);
-    REQUIRE(next_sig_it != end);
-    return *next_sig_it;
-  };
-
   std::random_device rd;
   std::mt19937 g(rd());
   auto fetch_and_validate_sparse_set = [&](const ccf::SeqNoCollection& seqnos) {
@@ -1263,7 +1189,7 @@ TEST_CASE("StateCache sparse queries")
       for (auto& store : stores)
       {
         REQUIRE(store != nullptr);
-        const auto seqno = store->get_txid().seqno;
+        const auto seqno = store->current_txid().seqno;
 
         // Don't validate anything about signature transactions, just the
         // business transactions between them
@@ -1316,11 +1242,11 @@ TEST_CASE("StateCache sparse queries")
   }
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("StateCache concurrent access")
 {
   auto state = create_and_init_state();
   auto& kv_store = *state.kv_store;
-  const auto default_handle = 0;
 
   std::vector<ccf::kv::Version> signature_versions;
 
@@ -1346,7 +1272,6 @@ TEST_CASE("StateCache concurrent access")
 
   std::atomic<bool> finished = false;
   std::thread host_thread([&]() {
-    ccf::crypto::openssl_sha256_init();
     auto ledger = construct_host_ledger(state.kv_store->get_consensus());
 
     size_t last_handled_write = 0;
@@ -1397,7 +1322,6 @@ TEST_CASE("StateCache concurrent access")
       cache.tick(std::chrono::milliseconds(100));
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    ccf::crypto::openssl_sha256_shutdown();
   });
 
   constexpr auto per_thread_queries = 30;
@@ -1457,7 +1381,7 @@ TEST_CASE("StateCache concurrent access")
       for (auto& store : stores)
       {
         REQUIRE(store != nullptr);
-        const auto seqno = store->get_txid().seqno;
+        const auto seqno = store->current_txid().seqno;
         if (
           std::find(
             signature_versions.begin(), signature_versions.end(), seqno) ==
@@ -1473,7 +1397,7 @@ TEST_CASE("StateCache concurrent access")
       for (auto& state : states)
       {
         REQUIRE(state != nullptr);
-        const auto seqno = state->store->get_txid().seqno;
+        const auto seqno = state->store->current_txid().seqno;
         if (
           std::find(
             signature_versions.begin(), signature_versions.end(), seqno) ==
@@ -1494,18 +1418,6 @@ TEST_CASE("StateCache concurrent access")
       REQUIRE(fetch_until_timeout(fetch_result, check_result, error_printer));
       REQUIRE(store != nullptr);
       validate_all_stores({store});
-    };
-
-  auto query_random_point_state =
-    [&](ccf::SeqNo target_seqno, size_t handle, const auto& error_printer) {
-      ccf::historical::StatePtr state;
-      auto fetch_result = [&]() {
-        state = cache.get_state_at(handle, target_seqno);
-      };
-      auto check_result = [&]() { return state != nullptr; };
-      REQUIRE(fetch_until_timeout(fetch_result, check_result, error_printer));
-      REQUIRE(state != nullptr);
-      validate_all_states({state});
     };
 
   auto query_random_range_stores = [&](
@@ -1529,7 +1441,6 @@ TEST_CASE("StateCache concurrent access")
                                      size_t handle,
                                      const auto& error_printer) {
     std::vector<ccf::historical::StatePtr> states;
-    ccf::crypto::openssl_sha256_init();
     auto fetch_result = [&]() {
       states = cache.get_state_range(handle, range_start, range_end);
     };
@@ -1537,7 +1448,6 @@ TEST_CASE("StateCache concurrent access")
     REQUIRE(fetch_until_timeout(fetch_result, check_result, error_printer));
     REQUIRE(states.size() == range_end - range_start + 1);
     validate_all_states(states);
-    ccf::crypto::openssl_sha256_shutdown();
   };
 
   auto query_random_sparse_set_stores = [&](
@@ -1559,7 +1469,6 @@ TEST_CASE("StateCache concurrent access")
                                           size_t handle,
                                           const auto& error_printer) {
     std::vector<ccf::historical::StatePtr> states;
-    ccf::crypto::openssl_sha256_init();
     auto fetch_result = [&]() {
       states = cache.get_states_for(handle, seqnos);
     };
@@ -1567,7 +1476,6 @@ TEST_CASE("StateCache concurrent access")
     REQUIRE(fetch_until_timeout(fetch_result, check_result, error_printer));
     REQUIRE(states.size() == seqnos.size());
     validate_all_states(states);
-    ccf::crypto::openssl_sha256_shutdown();
   };
 
   auto run_n_queries = [&](size_t handle) {
@@ -1633,11 +1541,12 @@ TEST_CASE("StateCache concurrent access")
           }
           ccf::SeqNoCollection seqnos;
           seqnos.insert(range_start);
-          for (auto i = range_start; i != range_end; ++i)
+          for (auto range_seqno = range_start; range_seqno != range_end;
+               ++range_seqno)
           {
-            if (i % 3 != 0)
+            if (range_seqno % 3 != 0)
             {
-              seqnos.insert(i);
+              seqnos.insert(range_seqno);
             }
           }
           seqnos.insert(range_end);
@@ -1825,7 +1734,6 @@ TEST_CASE("StateCache concurrent access")
 
 TEST_CASE("Recover historical ledger secrets")
 {
-  ccf::crypto::openssl_sha256_init();
   auto state = create_and_init_state();
   auto& kv_store = *state.kv_store;
 
@@ -1942,12 +1850,10 @@ TEST_CASE("Recover historical ledger secrets")
 
     validate_business_transaction(historical_state, first_seqno);
   }
-  ccf::crypto::openssl_sha256_shutdown();
 }
 
 TEST_CASE("Valid merkle proof from receipts")
 {
-  ccf::crypto::openssl_sha256_init();
   auto state = create_and_init_state();
   auto& kv_store = *state.kv_store;
   auto sigseq = write_transactions_and_signature(kv_store, 10);
@@ -1978,7 +1884,7 @@ TEST_CASE("Valid merkle proof from receipts")
   REQUIRE_EQ(
     ccf::ds::to_hex(decoded.claims_digest),
     historical_state->receipt->claims_digest.value()
-      .hex_str()); // HEX as workaround emmpy claims (set flag).
+      .hex_str()); // HEX as workaround empty claims (set flag).
 
   auto it = decoded.path.begin();
   for (const auto& node : *historical_state->receipt->path)
@@ -2001,18 +1907,260 @@ TEST_CASE("Valid merkle proof from receipts")
   // We don't provide a merkle proof for the signature itself.
   proof = ccf::describe_merkle_proof_v1(*historical_state->receipt);
   REQUIRE_FALSE(proof.has_value());
+}
 
-  ccf::crypto::openssl_sha256_shutdown();
+TEST_CASE("Cache size estimation")
+{
+  auto state = create_and_init_state();
+  auto& kv_store = *state.kv_store;
+
+  write_transactions_and_signature(kv_store, 10);
+
+  auto ledger = construct_host_ledger(state.kv_store->get_consensus());
+
+  auto stub_writer = std::make_shared<StubWriter>();
+  ccf::historical::StateCacheImpl cache(
+    kv_store, state.ledger_secrets, stub_writer);
+
+  cache.set_soft_cache_limit(0);
+
+  ccf::historical::CompoundHandle handle = {
+    ccf::historical::RequestNamespace::Application, 1};
+
+  {
+    ccf::ds::ContiguousSet<ccf::SeqNo> seqnos;
+    seqnos.insert(10);
+    cache.get_stores_for(handle, seqnos, std::chrono::seconds(1));
+  }
+
+  REQUIRE(cache.get_estimated_store_cache_size() == 0);
+  cache.handle_ledger_entry(10, ledger.at(10));
+  REQUIRE(cache.get_estimated_store_cache_size() == ledger.at(10).size());
+
+  {
+    ccf::ds::ContiguousSet<ccf::SeqNo> seqnos;
+    seqnos.insert(5);
+    cache.get_stores_for(handle, seqnos, std::chrono::seconds(1));
+  }
+
+  cache.tick(std::chrono::milliseconds(1000));
+
+  REQUIRE(cache.get_estimated_store_cache_size() == 0);
+}
+
+TEST_CASE("Cache size with populate_receipts")
+{
+  // Verifies that when a non-signature transaction is requested with receipts,
+  // the supporting stores created by populate_receipts (to find the next
+  // signature) are properly eliminated from the cache.
+
+  auto state = create_and_init_state();
+  auto& kv_store = *state.kv_store;
+
+  // Write 3 data transactions followed by a signature
+  // After create_and_init_state, current version is 2
+  // write_transactions(3) creates seqnos 3, 4, 5
+  // emit_signature creates seqno 6
+  const auto sig_seqno = write_transactions_and_signature(kv_store, 3);
+  REQUIRE(sig_seqno == 6);
+
+  auto ledger = construct_host_ledger(state.kv_store->get_consensus());
+  REQUIRE(ledger.size() == sig_seqno);
+
+  auto stub_writer = std::make_shared<StubWriter>();
+  ccf::historical::StateCacheImpl cache(
+    kv_store, state.ledger_secrets, stub_writer);
+
+  constexpr ccf::SeqNo target_seqno = 3;
+
+  ccf::historical::CompoundHandle handle = {
+    ccf::historical::RequestNamespace::Application, 1};
+
+  {
+    INFO("Request a non-signature transaction with receipts");
+    ccf::ds::ContiguousSet<ccf::SeqNo> seqnos;
+    seqnos.insert(target_seqno);
+    auto states =
+      cache.get_states_for(handle, seqnos, std::chrono::seconds(30));
+    REQUIRE(states.empty());
+  }
+
+  size_t expected_cache_size = 0;
+  REQUIRE(cache.get_estimated_store_cache_size() == expected_cache_size);
+
+  // Tick to trigger fetch of seqno 3
+  cache.tick(std::chrono::milliseconds(100));
+
+  {
+    INFO(
+      "Feed entries one at a time. Each non-signature entry triggers "
+      "populate_receipts which discovers the next gap and creates a "
+      "supporting store for it.");
+
+    // Feed seqno 3 - populate_receipts(3) adds supporting store for seqno 4
+    cache.handle_ledger_entry(target_seqno, ledger.at(target_seqno));
+    expected_cache_size += ledger.at(target_seqno).size();
+    REQUIRE(cache.get_estimated_store_cache_size() == expected_cache_size);
+
+    // Tick to fetch the supporting store at seqno 4
+    cache.tick(std::chrono::milliseconds(100));
+
+    // Feed seqno 4 - populate_receipts(4) adds supporting store for seqno 5
+    cache.handle_ledger_entry(4, ledger.at(4));
+    expected_cache_size += ledger.at(4).size();
+    REQUIRE(cache.get_estimated_store_cache_size() == expected_cache_size);
+
+    cache.tick(std::chrono::milliseconds(100));
+
+    // Feed seqno 5 - populate_receipts(5) adds supporting store for seqno 6
+    cache.handle_ledger_entry(5, ledger.at(5));
+    expected_cache_size += ledger.at(5).size();
+    REQUIRE(cache.get_estimated_store_cache_size() == expected_cache_size);
+
+    cache.tick(std::chrono::milliseconds(100));
+
+    // Feed seqno 6 (the signature) - receipt is produced for seqno 3
+    cache.handle_ledger_entry(sig_seqno, ledger.at(sig_seqno));
+    expected_cache_size += ledger.at(sig_seqno).size();
+    REQUIRE(cache.get_estimated_store_cache_size() == expected_cache_size);
+  }
+
+  // Clear all outgoing writes to the RB, to be able to detect any unexpected
+  // ones in the next steps
+  stub_writer->writes.clear();
+
+  for (size_t i = 0; i < 5; ++i)
+  {
+    INFO("Verify the state is now available with a receipt");
+    ccf::ds::ContiguousSet<ccf::SeqNo> seqnos;
+    seqnos.insert(target_seqno);
+    auto states =
+      cache.get_states_for(handle, seqnos, std::chrono::seconds(30));
+    REQUIRE(states.size() == 1);
+    REQUIRE(states[0]->receipt != nullptr);
+    // No more requests for additional entries, such as 4 (supporting
+    // signature!)
+    REQUIRE(stub_writer->writes.empty());
+
+    REQUIRE(cache.get_estimated_store_cache_size() <= expected_cache_size);
+    expected_cache_size = cache.get_estimated_store_cache_size();
+  }
+
+  // Cache still contains something
+  REQUIRE(cache.get_estimated_store_cache_size() > 0);
+
+  {
+    INFO("Drop the request and verify all store sizes are properly cleaned up");
+    cache.drop_cached_states(handle);
+    REQUIRE(cache.get_estimated_store_cache_size() == 0);
+  }
+}
+
+TEST_CASE("adjust_ranges")
+{
+  using SeqNoSet = std::set<ccf::SeqNo>;
+
+  struct AdjustRangesAccessor : public ccf::historical::StateCacheImpl
+  {
+    Request request;
+
+    AdjustRangesAccessor(
+      ccf::kv::Store& store,
+      const std::shared_ptr<ccf::LedgerSecrets>& secrets,
+      const ringbuffer::WriterPtr& host_writer) :
+      StateCacheImpl(store, secrets, host_writer),
+      request(all_stores)
+    {}
+
+    std::pair<SeqNoSet, SeqNoSet> adjust_ranges(const SeqNoSet& seqnos)
+    {
+      ccf::SeqNoCollection seqno_collection;
+      for (const auto& seqno : seqnos)
+      {
+        seqno_collection.insert(seqno);
+      }
+
+      auto [removed_v, added_v] =
+        request.adjust_ranges(seqno_collection, true, 0);
+      SeqNoSet removed(removed_v.begin(), removed_v.end());
+      SeqNoSet added(added_v.begin(), added_v.end());
+      return {removed, added};
+    }
+  };
+
+  auto state = create_and_init_state();
+  auto stub_writer = std::make_shared<StubWriter>();
+
+  {
+    DOCTEST_INFO("Minimal regression test");
+    AdjustRangesAccessor cache(
+      *state.kv_store, state.ledger_secrets, stub_writer);
+
+    auto [removed1, added1] = cache.adjust_ranges({100});
+    REQUIRE(added1.size() == 1);
+    REQUIRE(added1 == SeqNoSet{100});
+    REQUIRE(removed1.size() == 0);
+
+    auto [removed2, added2] = cache.adjust_ranges({42});
+    REQUIRE(added2.size() == 1);
+    REQUIRE(added2 == SeqNoSet{42});
+    REQUIRE(removed2.size() == 1);
+    REQUIRE(removed2 == SeqNoSet{100});
+  }
+
+  {
+    const auto seed = time(NULL);
+    DOCTEST_INFO("Random permutations, using seed: ", seed);
+    srand(seed);
+    for (size_t i = 0; i < 100; ++i)
+    {
+      DOCTEST_INFO("Iteration #", i);
+      AdjustRangesAccessor cache(
+        *state.kv_store, state.ledger_secrets, stub_writer);
+      SeqNoSet before;
+      for (auto j = 0; j < rand() % 6; ++j)
+      {
+        before.insert(rand() % 30);
+      }
+
+      auto [removed_init, added_init] = cache.adjust_ranges(before);
+      REQUIRE(added_init == before);
+      REQUIRE(removed_init.empty());
+
+      std::set<ccf::SeqNo> after;
+      for (auto j = 0; j < rand() % 6; ++j)
+      {
+        after.insert(rand() % 30);
+      }
+
+      auto [actual_removed, actual_added] = cache.adjust_ranges(after);
+
+      SeqNoSet expected_added;
+      std::set_difference(
+        after.begin(),
+        after.end(),
+        before.begin(),
+        before.end(),
+        std::inserter(expected_added, expected_added.begin()));
+      SeqNoSet expected_removed;
+      std::set_difference(
+        before.begin(),
+        before.end(),
+        after.begin(),
+        after.end(),
+        std::inserter(expected_removed, expected_removed.begin()));
+
+      REQUIRE(actual_added == expected_added);
+      REQUIRE(actual_removed == expected_removed);
+    }
+  }
 }
 
 int main(int argc, char** argv)
 {
-  threading::ThreadMessaging::init(1);
-  ccf::crypto::openssl_sha256_init();
   doctest::Context context;
   context.applyCommandLine(argc, argv);
   int res = context.run();
-  ccf::crypto::openssl_sha256_shutdown();
   if (context.shouldExit())
     return res;
   return res;

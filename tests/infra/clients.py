@@ -1,42 +1,41 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 import abc
+import base64
 import contextlib
-import json
-import time
-import sys
-import os
-import subprocess
-import tempfile
 import hashlib
+import json
+import os
 import random
-from datetime import datetime, timezone, timedelta
+import re
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPResponse
 from io import BytesIO
+from threading import local
+from typing import Any
+
+import ccf.cose
+import httpx
+from ccf.tx_id import TxID
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
-import struct
-import base64
-import re
-from typing import Union, Optional, List, Any
-from ccf.tx_id import TxID
-import ssl
-import socket
-import urllib.parse
-
-import httpx
-from threading import local
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from loguru import logger as LOG  # type: ignore
 
 import infra.commit
 from infra.log_capture import flush_info
-import ccf.cose
 
-API_VERSION_CLASSIC = "classic"
 API_VERSION_PREVIEW_01 = "2023-06-01-preview"
 API_VERSION_01 = "2024-07-01"
 
@@ -120,13 +119,6 @@ class HttpSig(httpx.Auth):
         yield request
 
 
-loguru_tag_regex = re.compile(r"\\?</?((?:[fb]g\s)?[^<>\s]*)>")
-
-
-def escape_loguru_tags(s):
-    return loguru_tag_regex.sub(lambda match: f"\\{match[0]}", s)
-
-
 def truncate(string: str, max_len: int = 256):
     if len(string) > max_len:
         return f"{string[: max_len]} + {len(string) - max_len} chars"
@@ -138,12 +130,12 @@ CCF_TX_ID_HEADER = "x-ms-ccf-transaction-id"
 
 DEFAULT_CONNECTION_TIMEOUT_SEC = 3
 DEFAULT_REQUEST_TIMEOUT_SEC = 10
-DEFAULT_COMMIT_TIMEOUT_SEC = 3
 
 CONTENT_TYPE_TEXT = "text/plain"
 CONTENT_TYPE_JSON = "application/json"
 CONTENT_TYPE_BINARY = "application/octet-stream"
 CONTENT_TYPE_COSE = "application/cose"
+BINARY_CONTENT_TYPES = (CONTENT_TYPE_BINARY, CONTENT_TYPE_COSE)
 
 
 @dataclass
@@ -151,18 +143,21 @@ class Request:
     #: Resource path (with optional query string)
     path: str
     #: Body of request
-    body: Optional[Union[dict, str, bytes]]
+    body: dict | str | bytes | None
     #: HTTP verb
     http_verb: str
     #: HTTP headers
     headers: dict
 
     def __str__(self):
-        string = f"<cyan>{self.http_verb}</> <green>{self.path}</>"
+        string = f"{self.http_verb} {self.path}"
         if self.headers:
-            string += f" <blue>{truncate(str(self.headers), max_len=25)}</>"
+            string += f" {truncate(str(self.headers), max_len=25)}"
         if self.body is not None:
-            string += escape_loguru_tags(f' {truncate(f"{self.body}")}')
+            if self.headers.get("content-type") in BINARY_CONTENT_TYPES:
+                string += f"<binary: {len(self.body)} bytes>"
+            else:
+                string += f" {truncate(str(self.body))}"
 
         return string
 
@@ -254,9 +249,9 @@ class Response:
     #: Response body
     body: ResponseBody
     #: CCF sequence number
-    seqno: Optional[int]
+    seqno: int | None
     #: CCF consensus view
-    view: Optional[int]
+    view: int | None
     #: Response HTTP headers
     headers: dict
 
@@ -264,23 +259,17 @@ class Response:
         versioned = (self.view, self.seqno) != (None, None)
         status_category = self.status_code // 100
         redirect = status_category == 3
-        status_color = (
-            "red" if status_category in (4, 5) else "yellow" if redirect else "green"
-        )
-        body_s = escape_loguru_tags(truncate(str(self.body)))
-        # Body can't end with a \, or it will escape the loguru closing tag
-        if len(body_s) > 0 and body_s[-1] == "\\":
-            body_s += " "
+
+        if self.headers.get("content-type") in BINARY_CONTENT_TYPES:
+            body_s = f"<binary: {len(self.body)} bytes>"
+        else:
+            body_s = truncate(str(self.body))
 
         return (
-            f"<{status_color}>{self.status_code}</> "
-            + (
-                f"<yellow>[Redirect to -> {self.headers.get('location')}]</> "
-                if redirect
-                else ""
-            )
-            + (f"@<magenta>{self.view}.{self.seqno}</> " if versioned else "")
-            + f"<yellow>{body_s}</>"
+            f"{self.status_code} "
+            + (f"[Redirect to -> {self.headers.get('location')}] " if redirect else "")
+            + (f"@{self.view}.{self.seqno} " if versioned else "")
+            + body_s
         )
 
     @staticmethod
@@ -364,7 +353,8 @@ class CCFIOException(Exception):
 
 def get_curve(ca_file):
     # Auto detect EC curve to use based on server CA
-    ca_bytes = open(ca_file, "rb").read()
+    with open(ca_file, "rb") as ca:
+        ca_bytes = ca.read()
     return (
         x509.load_pem_x509_certificate(ca_bytes, default_backend()).public_key().curve
     )
@@ -384,7 +374,7 @@ def cose_protected_headers_api_v1(request_path, created_at=None):
     phdr = {"ccf.gov.msg.created_at": created_at or get_clock().moment()}
 
     hex_id = "([a-f0-9]+)"
-    opt_query = "(\?.*)?"
+    opt_query = r"(\?.*)?"
 
     if match := re.match(
         f"^/gov/members/state-digests/{hex_id}:update{opt_query}$",
@@ -473,7 +463,10 @@ class CurlClient:
         assert signing_auth is None, signing_auth
         self.cose_signing_auth = cose_signing_auth
         self.common_headers = common_headers or {}
-        self.ca_curve = get_curve(self.ca)
+        if self.ca:
+            self.ca_curve = get_curve(self.ca)
+        else:
+            self.ca_curve = None
         self.protocol = kwargs.get("protocol") if "protocol" in kwargs else "https"
         self.extra_args = []
         if kwargs.get("http2"):
@@ -491,7 +484,7 @@ class CurlClient:
 
             url = f"{self.protocol}://{self.hostname}{request.path}"
 
-            cmd += [url, "-X", request.http_verb, "-i", f"-m {timeout}"]
+            cmd += [url, "-X", request.http_verb, "-i", "-m", str(timeout)]
 
             headers = {}
             if self.common_headers is not None:
@@ -549,7 +542,7 @@ class CurlClient:
 
             url = f"{self.protocol}://{self.hostname}{request.path}"
 
-            cmd += [url, "-X", request.http_verb, "-i", f"-m {timeout}"]
+            cmd += [url, "-X", request.http_verb, "-i", "-m", str(timeout)]
 
             if self.cose_signing_auth:
                 cmd.extend(["--data-binary", "@-"])
@@ -566,6 +559,8 @@ class CurlClient:
             if self.session_auth:
                 cmd.extend(["--key", self.session_auth.key])
                 cmd.extend(["--cert", self.session_auth.cert])
+            if not self.ca and not self.session_auth:
+                cmd.extend(["-k"])  # Allow insecure connections
 
             for arg in self.extra_args:
                 cmd.append(arg)
@@ -587,9 +582,15 @@ class CurlClient:
 
             if rc.returncode != 0:
                 if rc.returncode in [
+                    # COULDNT_CONNECT,
+                    7,
+                    # PEER_FAILED_VERIFICATION,
                     35,
+                    # SEND_ERROR,
+                    55,
+                    # SSL_CONNECT_ERROR
                     60,
-                ]:  # PEER_FAILED_VERIFICATION, SSL_CONNECT_ERROR
+                ]:
                     raise CCFConnectionException
                 if rc.returncode == 28:  # OPERATION_TIMEDOUT
                     raise TimeoutError
@@ -597,6 +598,9 @@ class CurlClient:
                 raise RuntimeError(f"Curl failed with return code {rc.returncode}")
 
             return Response.from_raw(rc.stdout)
+
+    def repeat_last_request(self):
+        raise NotImplementedError()
 
     def close(self):
         pass
@@ -627,15 +631,16 @@ class HttpxClient:
     _auth_provider = HttpSig
     created_at_override = None
     _corrupt_signature = False
+    _last_request = None
 
     def __init__(
         self,
         hostname: str,
         ca: str,
-        session_auth: Optional[Identity] = None,
-        signing_auth: Optional[Identity] = None,
-        cose_signing_auth: Optional[Identity] = None,
-        common_headers: Optional[dict] = None,
+        session_auth: Identity | None = None,
+        signing_auth: Identity | None = None,
+        cose_signing_auth: Identity | None = None,
+        common_headers: dict | None = None,
         **kwargs,
     ):
         self.hostname = hostname
@@ -665,6 +670,40 @@ class HttpxClient:
                 )
         self.cose_header_builder = cose_protected_headers_api_classic
 
+    def _request(
+        self,
+        request: Request,
+        request_body: bytes,
+        auth: Any,
+        extra_headers: dict | None,
+        timeout: int,
+    ):
+        self._last_request = (request, request_body, auth, extra_headers, timeout)
+        try:
+            response = self.session.request(
+                request.http_verb,
+                url=f"{self.protocol}://{self.hostname}{request.path}",
+                auth=auth,
+                headers=extra_headers,
+                timeout=timeout,
+                content=request_body,
+            )
+        except httpx.TimeoutException as exc:
+            raise TimeoutError from exc
+        except httpx.ConnectError as exc:
+            raise CCFConnectionException from exc
+        except (httpx.WriteError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+            raise CCFIOException from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"HttpxClient failed with unexpected error: {exc}"
+            ) from exc
+
+        return Response.from_requests_response(response)
+
+    def repeat_last_request(self):
+        return self._request(*self._last_request)
+
     def request(
         self,
         request: Request,
@@ -690,9 +729,8 @@ class HttpxClient:
                     )
                 else:
                     extra_headers["Content-Length"] = "0"
-            auth = self._auth_provider(
-                self.key_id, open(self.signing_auth.key, "rb").read()
-            )
+            with open(self.signing_auth.key, "rb") as signing_key:
+                auth = self._auth_provider(self.key_id, signing_key.read())
 
         request_body = None
         if request.body is not None:
@@ -718,8 +756,10 @@ class HttpxClient:
                 extra_headers["content-type"] = content_type
 
         if self.cose_signing_auth is not None and request.http_verb != "GET":
-            key = open(self.cose_signing_auth.key, encoding="utf-8").read()
-            cert = open(self.cose_signing_auth.cert, encoding="utf-8").read()
+            with open(self.cose_signing_auth.key, encoding="utf-8") as key_file:
+                key = key_file.read()
+            with open(self.cose_signing_auth.cert, encoding="utf-8") as cert_file:
+                cert = cert_file.read()
             phdr = self.cose_header_builder(request.path, self.created_at_override)
             phdr.update(cose_header_parameters_override or {})
             if "ccf.gov.msg.created_at" in phdr and not isinstance(
@@ -751,27 +791,13 @@ class HttpxClient:
 
             extra_headers["content-type"] = CONTENT_TYPE_COSE
 
-        try:
-            response = self.session.request(
-                request.http_verb,
-                url=f"{self.protocol}://{self.hostname}{request.path}",
-                auth=auth,
-                headers=extra_headers,
-                timeout=timeout,
-                content=request_body,
-            )
-        except httpx.TimeoutException as exc:
-            raise TimeoutError from exc
-        except httpx.ConnectError as exc:
-            raise CCFConnectionException from exc
-        except (httpx.WriteError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
-            raise CCFIOException from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"HttpxClient failed with unexpected error: {exc}"
-            ) from exc
-
-        return Response.from_requests_response(response)
+        return self._request(
+            request=request,
+            request_body=request_body,
+            auth=auth,
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
 
     def close(self):
         self.session.close()
@@ -806,10 +832,10 @@ class RawSocketClient:
         self,
         hostname: str,
         ca: str,
-        session_auth: Optional[Identity] = None,
-        signing_auth: Optional[Identity] = None,
-        cose_signing_auth: Optional[Identity] = None,
-        common_headers: Optional[dict] = None,
+        session_auth: Identity | None = None,
+        signing_auth: Identity | None = None,
+        cose_signing_auth: Identity | None = None,
+        common_headers: dict | None = None,
         **kwargs,
     ):
         self.ca = ca
@@ -825,11 +851,12 @@ class RawSocketClient:
                     .fingerprint(hashes.SHA256())
                     .hex()
                 )
-                private_key = load_pem_private_key(
-                    open(signing_auth.key, "rb").read(),
-                    password=None,
-                    backend=default_backend(),
-                )
+                with open(signing_auth.key, "rb") as signing_key:
+                    private_key = load_pem_private_key(
+                        signing_key.read(),
+                        password=None,
+                        backend=default_backend(),
+                    )
                 self.signing_details = (key_id, private_key)
         else:
             self.signing_details = None
@@ -855,11 +882,10 @@ class RawSocketClient:
                         keyfile=session_auth.key,
                     )
 
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock = socket.create_connection((hostname, port))
                 ssl_socket = context.wrap_socket(
                     sock, server_side=False, server_hostname=hostname
                 )
-                ssl_socket.connect((hostname, port))
                 return ssl_socket
             except (ssl.SSLEOFError, ConnectionResetError) as exc:
                 if time.time() > end_time:
@@ -975,6 +1001,7 @@ class CCFClient:
     :param Identity session_auth: Path to private key and certificate to be used as client authentication for the session (optional).
     :param Identity signing_auth: Path to private key and certificate to be used to sign requests for the session (optional).
     :param int connection_timeout: Maximum time to wait for successful connection establishment before giving up.
+    :param int election_timeout_ms: Election timeout (in milliseconds) of the network this client connects to. If set, used as the default timeout for :py:meth:`wait_for_commit`.
     :param str description: Message to print on each request emitted with this client.
     :param dict common_headers: Headers which should be added to every request.
     :param dict kwargs: Keyword args to be forwarded to the client implementation.
@@ -1002,16 +1029,19 @@ class CCFClient:
         host: str,
         port: int,
         ca: str,
-        session_auth: Optional[Identity] = None,
-        signing_auth: Optional[Identity] = None,
-        cose_signing_auth: Optional[Identity] = None,
+        session_auth: Identity | None = None,
+        signing_auth: Identity | None = None,
+        cose_signing_auth: Identity | None = None,
         connection_timeout: int = DEFAULT_CONNECTION_TIMEOUT_SEC,
-        description: Optional[str] = None,
-        impl_type: Union[CurlClient, HttpxClient, RawSocketClient] = default_impl_type,
-        common_headers: Optional[dict] = None,
+        election_timeout_ms: int | None = None,
+        description: str | None = None,
+        impl_type: CurlClient | HttpxClient | RawSocketClient = default_impl_type,
+        common_headers: dict | None = None,
+        openapi_validator=None,
         **kwargs,
     ):
         self.connection_timeout = connection_timeout
+        self.election_timeout_ms = election_timeout_ms
         self.hostname = infra.interfaces.make_address(host, port)
         self.name = f"[{self.hostname}]"
         self.description = description or self.name
@@ -1019,6 +1049,7 @@ class CCFClient:
         self.auth = bool(session_auth)
         self.sign = bool(signing_auth)
         self.cose = bool(cose_signing_auth)
+        self.openapi_validator = openapi_validator
 
         self.client_args = {
             "ca": ca,
@@ -1037,21 +1068,25 @@ class CCFClient:
     def _call(
         self,
         path: str,
-        body: Optional[Union[str, dict, bytes]] = None,
+        body: str | dict | bytes | None = None,
         http_verb: str = "POST",
-        headers: Optional[dict] = None,
+        headers: dict | None = None,
         timeout: int = DEFAULT_REQUEST_TIMEOUT_SEC,
-        log_capture: Optional[list] = None,
+        log_capture: list | None = None,
         allow_redirects: bool = True,
-        cose_header_parameters_override: Optional[dict] = None,
+        cose_header_parameters_override: dict | None = None,
+        validate_openapi: bool = True,
     ) -> Response:
         if headers is None:
             headers = {}
 
         r = Request(path, body, http_verb, headers)
+        request_client = self.client_impl
+        request_hostname = self.hostname
+        request_protocol = getattr(request_client, "protocol", "https")
         flush_info([f"{self.description} {r}"], log_capture, 3)
 
-        response = self.client_impl.request(r, timeout, cose_header_parameters_override)
+        response = request_client.request(r, timeout, cose_header_parameters_override)
         flush_info([str(response)], log_capture, 3)
 
         # NB: We follow redirects at this level, because we do not trust the underlying
@@ -1070,33 +1105,48 @@ class CCFClient:
 
             redirect_url = response.headers["location"]
             split = urllib.parse.urlsplit(redirect_url)
-            hostname = split.netloc or self.hostname
+            request_hostname = split.netloc or request_hostname
+            request_protocol = split.scheme or request_protocol
             redirect_path = urllib.parse.urlunsplit(("", "", *split[2:]))
 
             # Construct a temporary client to follow this redirect
-            temp_client = type(self.client_impl)(hostname=hostname, **self.client_args)
+            temp_client = type(self.client_impl)(
+                hostname=request_hostname, **self.client_args
+            )
 
             # Copy any test-specific decorators from the main client to the temporary client
             temp_client._corrupt_signature = self.client_impl._corrupt_signature
             temp_client.cose_header_builder = self.client_impl.cose_header_builder
 
             r = Request(redirect_path, body, http_verb, headers)
+            request_client = temp_client
 
-            response = temp_client.request(r, timeout, cose_header_parameters_override)
+            response = request_client.request(
+                r, timeout, cose_header_parameters_override
+            )
             flush_info([str(response)], log_capture, 3)
+
+        if self.openapi_validator is not None and validate_openapi:
+            self.openapi_validator.validate(
+                r,
+                response,
+                host_url=f"{request_protocol}://{request_hostname}",
+                cose=self.cose,
+            )
 
         return response
 
     def call(
         self,
         path: str,
-        body: Optional[Union[str, dict, bytes]] = None,
+        body: str | dict | bytes | None = None,
         http_verb: str = "POST",
-        headers: Optional[dict] = None,
+        headers: dict | None = None,
         timeout: int = DEFAULT_REQUEST_TIMEOUT_SEC,
-        log_capture: Optional[list] = None,
+        log_capture: list | None = None,
         allow_redirects: bool = True,
-        cose_header_parameters_override: Optional[dict] = None,
+        cose_header_parameters_override: dict | None = None,
+        validate_openapi: bool = True,
     ) -> Response:
         """
         Issues one request, synchronously, and returns the response.
@@ -1109,13 +1159,14 @@ class CCFClient:
         :param int timeout: Maximum time to wait for a response before giving up.
         :param list log_capture: Rather than emit to default handler, capture log lines to list (optional).
         :param bool allow_redirects: Select whether redirects are followed.
+        :param bool validate_openapi: Select whether the request and response are validated against the reported API schema.
 
         :return: :py:class:`infra.clients.Response`
         """
         if not path.startswith("/"):
             raise ValueError(f"URL path '{path}' is invalid, must start with /")
 
-        logs: List[str] = []
+        logs: list[str] = []
 
         if self.is_connected:
             r = self._call(
@@ -1127,6 +1178,7 @@ class CCFClient:
                 logs,
                 allow_redirects,
                 cose_header_parameters_override,
+                validate_openapi,
             )
             flush_info(logs, log_capture, 2)
             return r
@@ -1144,6 +1196,7 @@ class CCFClient:
                     logs,
                     allow_redirects,
                     cose_header_parameters_override,
+                    validate_openapi,
                 )
                 # Only the first request gets this timeout logic - future calls
                 # call _call
@@ -1251,9 +1304,7 @@ class CCFClient:
         kwargs["http_verb"] = "PATCH"
         return self.call(*args, **kwargs)
 
-    def wait_for_commit(
-        self, response: Response, timeout: int = DEFAULT_COMMIT_TIMEOUT_SEC
-    ):
+    def wait_for_commit(self, response: Response, timeout: int | None = None):
         """
         Given a :py:class:`infra.clients.Response`, this functions waits
         for the associated sequence number and view to be committed by the CCF network.
@@ -1262,13 +1313,19 @@ class CCFClient:
 
         :param infra.clients.Response response: Response returned by :py:meth:`infra.clients.CCFClient.call`
         :param int timeout: Maximum time (secs) to wait for commit before giving up.
+            Defaults to the election timeout configured for this client.
 
         A ``TimeoutError`` exception is raised if the transaction is not committed within ``timeout`` seconds.
         """
         if response.seqno is None or response.view is None:
             raise ValueError(f"Response seqno and view should not be None: {response}")
 
+        if timeout is None and self.election_timeout_ms is not None:
+            timeout = self.election_timeout_ms // 1000
         infra.commit.wait_for_commit(self, response.seqno, response.view, timeout)
+
+    def repeat_last_request(self):
+        return self.client_impl.repeat_last_request()
 
     def close(self):
         self.client_impl.close()
@@ -1283,7 +1340,7 @@ def client(*args, **kwargs):
 
 class APIVersionedCCFClient(CCFClient):
     def __init__(self, *args, api_version=None, **kwargs):
-        super(APIVersionedCCFClient, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.api_version = api_version
         if self.api_version in (
             API_VERSION_PREVIEW_01,
@@ -1305,7 +1362,7 @@ class APIVersionedCCFClient(CCFClient):
         modified_path = APIVersionedCCFClient.add_query_arg_to_path(
             path, "api-version", self.api_version
         )
-        return super(APIVersionedCCFClient, self).call(modified_path, *args, **kwargs)
+        return super().call(modified_path, *args, **kwargs)
 
 
 @contextlib.contextmanager

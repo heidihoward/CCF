@@ -5,7 +5,6 @@ A CCF application is composed of the following:
 
 - The :ref:`Application Entry Point <build_apps/api:Application Entry Point>` which creates the application in CCF.
 - A collection of :cpp:class:`endpoints <ccf::endpoints::Endpoint>` handling HTTP requests and grouped in a single :cpp:class:`registry <ccf::endpoints::EndpointRegistry>`. An :cpp:class:`endpoint <ccf::endpoints::Endpoint>` reads and writes to the key-value store via the :ref:`Key-Value Store API <build_apps/kv/api:Key-Value Store API>`.
-- An optional set of :ref:`JavaScript FFI Plugins <build_apps/api:JavaScript FFI Plugins>` that can be registered to extend the built-in JavaScript API surface.
 
 Application Entry Point
 -----------------------
@@ -63,6 +62,9 @@ Policies
 .. doxygenvariable:: ccf::member_cert_auth_policy
    :project: CCF
 
+.. doxygenvariable:: ccf::any_cert_auth_policy
+   :project: CCF
+
 .. doxygenvariable:: ccf::member_cose_sign1_auth_policy
    :project: CCF
 
@@ -83,6 +85,10 @@ Identities
    :members:
 
 .. doxygenstruct:: ccf::MemberCertAuthnIdentity
+   :project: CCF
+   :members:
+
+.. doxygenstruct:: ccf::AnyCertAuthnIdentity
    :project: CCF
    :members:
 
@@ -120,7 +126,10 @@ Supporting Types
 Historical Queries
 ------------------
 
-.. doxygenfunction:: ccf::historical::adapter_v3
+.. doxygenfunction:: ccf::historical::read_only_adapter_v4
+   :project: CCF
+
+.. doxygenfunction:: ccf::historical::read_write_adapter_v4
    :project: CCF
 
 .. doxygenclass:: ccf::historical::AbstractStateCache
@@ -146,15 +155,54 @@ Indexing
    :project: CCF
    :members:
 
-JavaScript FFI Plugins
-----------------------
-
-.. doxygenfunction:: ccf::get_js_plugins
-   :project: CCF
-
 HTTP Entity Tags Matching
 -------------------------
 
 .. doxygenclass:: ccf::http::Matcher
+   :project: CCF
+   :members:
+
+HTTP Accept Header Matching
+---------------------------
+
+.. doxygenstruct:: ccf::http::AcceptHeaderField
+   :project: CCF
+   :members:
+
+.. doxygenfunction:: ccf::http::parse_accept_header
+   :project: CCF
+
+COSE
+----
+
+.. doxygenstruct:: ccf::cose::edit::pos::InArray
+   :project: CCF
+
+.. doxygenstruct:: ccf::cose::edit::pos::AtKey
+   :project: CCF
+   :members:
+
+.. doxygentypedef:: ccf::cose::edit::pos::Type
+   :project: CCF
+
+.. doxygenfunction:: ccf::cose::edit::set_unprotected_header
+   :project: CCF
+
+Network Identity
+----------------
+
+.. doxygentypedef:: ccf::RawCoseEndorsement
+   :project: CCF
+
+.. doxygentypedef:: ccf::CoseEndorsementsChain
+   :project: CCF
+
+.. doxygenenum:: ccf::FetchStatus
+   :project: CCF
+
+.. doxygentypedef:: ccf::TrustedKeys
+   :project: CCF
+
+.. doxygenclass:: ccf::NetworkIdentitySubsystemInterface
    :project: CCF
    :members:

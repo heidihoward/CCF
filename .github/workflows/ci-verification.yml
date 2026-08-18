@@ -7,6 +7,7 @@ on:
     paths:
       - "tla/**"
       - "src/consensus/**"
+      - "tests/raft_scenarios/**"
       - ".github/workflows/ci-verification.yml"
   workflow_dispatch:
 
@@ -14,37 +15,43 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  actions: read
-  contents: read
-  security-events: write
+permissions: read-all
 
 jobs:
   model-checking-consistency:
     name: Model Checking - Consistency
-    runs-on: [self-hosted, 1ES.Pool=gha-virtual-ccf-sub]
+    runs-on:
+      [
+        self-hosted,
+        1ES.Pool=gha-vmss-d16av6-ci,
+        "JobId=civ_mc_consistency-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}",
+      ]
     container:
-      image: ghcr.io/microsoft/ccf/ci/default:build-08-10-2024
-    defaults:
-      run:
-        working-directory: tla
+      image: mcr.microsoft.com/azurelinux/base/core:3.0
+      options: --user root --publish-all --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE
 
     steps:
-      - uses: actions/checkout@v4
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf -y update
+          tdnf -y install ca-certificates git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install TLC dependencies
         run: |
-          sudo apt update
-          sudo apt install -y default-jre
-          python3 install_deps.py
+          tdnf install -y jre wget
+          python3 tla/install_deps.py
 
-      - run: ./tlc.py mc consistency/MCSingleNode.tla
-      - run: ./tlc.py mc consistency/MCSingleNodeReads.tla
-      - run: ./tlc.py mc consistency/MCMultiNode.tla
-      - run: ./tlc.py mc consistency/MCMultiNodeReads.tla
-      - run: ./tlc.py mc consistency/MCMultiNodeReadsAlt.tla
+      - run: cd tla && ./tlc.py mc consistency/MCSingleNode.tla
+      - run: cd tla && ./tlc.py mc consistency/MCSingleNodeReads.tla
+      - run: cd tla && ./tlc.py mc consistency/MCMultiNode.tla
+      - run: cd tla && ./tlc.py mc consistency/MCMultiNodeReads.tla
+      - run: cd tla && ./tlc.py mc consistency/MCMultiNodeReadsAlt.tla
 
       - name: Upload TLC traces
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ failure() }}
         with:
           name: tlc-model-checking-consistency
@@ -60,11 +67,11 @@ jobs:
         working-directory: tla
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install TLC dependencies
         run: |
           sudo apt update
-          sudo apt install -y default-jre
+          sudo apt install -y default-jre wget
           python3 install_deps.py
 
       - run: ./tlc_debug.sh --config consistency/MCSingleNodeCommitReachability.cfg mc consistency/MCSingleNodeReads.tla
@@ -80,17 +87,17 @@ jobs:
         working-directory: tla
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install TLC dependencies
         run: |
           sudo apt update
-          sudo apt install -y default-jre
+          sudo apt install -y default-jre wget
           python3 install_deps.py
 
       - run: ./tlc.py sim --num 500 --depth 50 consistency/MultiNodeReads.tla
 
       - name: Upload TLC traces
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ failure() }}
         with:
           name: tlc-simulation-consistency
@@ -100,27 +107,36 @@ jobs:
 
   model-checking-consensus:
     name: Model Checking - Consensus
-    runs-on: [self-hosted, 1ES.Pool=gha-virtual-ccf-sub]
+    runs-on:
+      [
+        self-hosted,
+        1ES.Pool=gha-vmss-d16av6-ci,
+        "JobId=civ_mc_consensus-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}",
+      ]
     container:
-      image: ghcr.io/microsoft/ccf/ci/default:build-08-10-2024
-    defaults:
-      run:
-        working-directory: tla
+      image: mcr.microsoft.com/azurelinux/base/core:3.0
+      options: --user root --publish-all --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE
 
     steps:
-      - uses: actions/checkout@v4
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf -y update
+          tdnf -y install ca-certificates git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install TLC dependencies
         run: |
-          sudo apt update
-          sudo apt install -y default-jre
-          python3 install_deps.py
+          tdnf install -y jre wget
+          python3 tla/install_deps.py
 
-      - run: ./tlc.py mc consensus/MCabs.tla
-      - run: ./tlc.py --trace-name 1C2N mc --term-count 2 --request-count 2 --raft-configs 1C2N consensus/MCccfraft.tla
-      - run: ./tlc.py --trace-name 1C3N mc --term-count 0 --request-count 3 --raft-configs 1C3N consensus/MCccfraft.tla
+      - run: cd tla && ./tlc.py mc consensus/MCabs.tla
+      - run: cd tla && ./tlc.py --trace-name 1C2N mc --term-count 2 --request-count 2 --raft-configs 1C2N consensus/MCccfraft.tla
+      - run: cd tla && ./tlc.py --trace-name 1C3N mc --term-count 0 --request-count 3 --raft-configs 1C3N consensus/MCccfraft.tla
 
       - name: Upload TLC traces
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ failure() }}
         with:
           name: tlc-model-checking-consensus
@@ -136,17 +152,17 @@ jobs:
         working-directory: tla
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install TLC dependencies
         run: |
           sudo apt update
-          sudo apt install -y default-jre
+          sudo apt install -y default-jre wget
           python3 install_deps.py
 
       - run: ./tlc.py sim consensus/SIMccfraft.tla
 
       - name: Upload TLC traces
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ failure() }}
         with:
           name: tlc-simulation-consensus
@@ -156,26 +172,46 @@ jobs:
 
   trace-validation-consensus:
     name: Trace Validation - Consensus
-    runs-on: [self-hosted, 1ES.Pool=gha-virtual-ccf-sub]
+    runs-on:
+      [
+        self-hosted,
+        1ES.Pool=gha-vmss-d16av6-ci,
+        "JobId=civ_tv_consensus-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}",
+      ]
     container:
-      image: ghcr.io/microsoft/ccf/ci/default:build-08-10-2024
+      image: mcr.microsoft.com/azurelinux/base/core:3.0
+      options: --user root --publish-all --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE
 
     steps:
-      - uses: actions/checkout@v4
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf -y update
+          tdnf -y install ca-certificates git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: "Install dependencies"
+        shell: bash
+        run: |
+          set -ex
+          ./scripts/setup-ci.sh
+
       - name: Install TLC dependencies
         run: |
-          sudo apt update
-          sudo apt install -y default-jre parallel
-          python3 ./tla/install_deps.py
+          tdnf install -y jre wget
+          python3 tla/install_deps.py --tdnf-extended
 
       - name: "Build"
         run: |
+          set -ex
           git config --global --add safe.directory /__w/CCF/CCF
           mkdir build
           cd build
-          cmake -L -GNinja .. -DCMAKE_BUILD_TYPE=Debug -DLVI_MITIGATIONS=OFF -DVERBOSE_LOGGING=ON -DCOMPILE_TARGET=virtual -DCCF_RAFT_TRACING=ON
+          cmake -L -GNinja .. -DCMAKE_BUILD_TYPE=Debug -DVERBOSE_LOGGING=ON -DCCF_RAFT_TRACING=ON
           ninja raft_driver
         shell: bash
 
@@ -198,9 +234,31 @@ jobs:
         shell: bash
 
       - name: Upload artifacts.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: tlc-trace-validation-consensus
           path: |
             tla/traces/*
+
+  model-checking-self-healing-open:
+    name: Model Checking - Self-Healing Open
+    runs-on: [self-hosted, 1ES.Pool=gha-vmss-d16av6-ci]
+    container:
+      image: mcr.microsoft.com/azurelinux/base/core:3.0
+      options: --user root --publish-all --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE
+
+    steps:
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf -y update
+          tdnf -y install ca-certificates git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Stateright dependencies
+        run: |
+          tdnf install -y cargo
+
+      - run: cd tla/disaster-recovery && cargo run check

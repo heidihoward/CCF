@@ -13,27 +13,33 @@
 
 namespace ccf
 {
-  static constexpr auto commit_secret_label_ = "Commit Secret Label";
-
+  // Unique label for deriving commit secrets from ledger secrets.
+  // See logic in get_commit_secret() below for derivation implementation.
+  // It is important that this label is _not_ re-used for other purposes,
+  // nor changed during the lifetime of a ledger, to preserve the semantics of
+  // commit evidence (i.e. their reveal implies an entry is committed).
+  static constexpr uint8_t commit_secret_label_[] = {
+    'C', 'o', 'm', 'm', 'i', 't', ' ', 'S'};
+  static std::span<const uint8_t> commit_secret_label{
+    commit_secret_label_, sizeof(commit_secret_label_)};
   struct LedgerSecret
   {
     std::vector<uint8_t> raw_key;
     std::shared_ptr<ccf::crypto::KeyAesGcm> key;
     std::optional<ccf::kv::Version> previous_secret_stored_version =
       std::nullopt;
-    std::optional<ccf::crypto::HashBytes> commit_secret = std::nullopt;
+    ccf::crypto::HashBytes commit_secret;
 
-    const ccf::crypto::HashBytes& get_commit_secret()
+    static ccf::crypto::HashBytes derive_commit_secret(
+      std::span<const uint8_t> raw_key)
     {
-      if (!commit_secret.has_value())
-      {
-        commit_secret = ccf::crypto::hmac(
-          ccf::crypto::MDType::SHA256,
-          raw_key,
-          {commit_secret_label_,
-           commit_secret_label_ + sizeof(commit_secret_label_)});
-      }
-      return commit_secret.value();
+      return ccf::crypto::hmac(
+        ccf::crypto::MDType::SHA256, raw_key, commit_secret_label);
+    }
+
+    [[nodiscard]] const ccf::crypto::HashBytes& get_commit_secret() const
+    {
+      return commit_secret;
     }
 
     bool operator==(const LedgerSecret& other) const
@@ -42,11 +48,12 @@ namespace ccf
         previous_secret_stored_version == other.previous_secret_stored_version;
     }
 
-    LedgerSecret() = default;
+    LedgerSecret() : commit_secret(derive_commit_secret(raw_key)) {}
 
     ~LedgerSecret()
     {
       OPENSSL_cleanse(raw_key.data(), raw_key.size());
+      OPENSSL_cleanse(commit_secret.data(), commit_secret.size());
     }
 
     // The copy constructor is used for serialising a LedgerSecret. However,
@@ -55,7 +62,8 @@ namespace ccf
     LedgerSecret(const LedgerSecret& other) :
       raw_key(other.raw_key),
       key(ccf::crypto::make_key_aes_gcm(other.raw_key)),
-      previous_secret_stored_version(other.previous_secret_stored_version)
+      previous_secret_stored_version(other.previous_secret_stored_version),
+      commit_secret(derive_commit_secret(raw_key))
     {}
 
     LedgerSecret(
@@ -64,13 +72,14 @@ namespace ccf
         std::nullopt) :
       raw_key(raw_key_),
       key(ccf::crypto::make_key_aes_gcm(std::move(raw_key_))),
-      previous_secret_stored_version(previous_secret_stored_version_)
+      previous_secret_stored_version(previous_secret_stored_version_),
+      commit_secret(derive_commit_secret(raw_key))
     {}
   };
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(LedgerSecret)
-  DECLARE_JSON_REQUIRED_FIELDS(LedgerSecret, raw_key)
-  DECLARE_JSON_OPTIONAL_FIELDS(LedgerSecret, previous_secret_stored_version)
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(LedgerSecret);
+  DECLARE_JSON_REQUIRED_FIELDS(LedgerSecret, raw_key);
+  DECLARE_JSON_OPTIONAL_FIELDS(LedgerSecret, previous_secret_stored_version);
 
   using LedgerSecretPtr = std::shared_ptr<LedgerSecret>;
 
@@ -109,7 +118,7 @@ namespace nlohmann
   {
     static void to_json(json& j, const ccf::LedgerSecretPtr& s)
     {
-      if (s.get())
+      if (s.get() != nullptr)
       {
         j = *s;
       }

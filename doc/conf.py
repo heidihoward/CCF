@@ -31,7 +31,7 @@ import generate_config_rst
 # -- Project information -----------------------------------------------------
 
 project = "CCF"
-copyright = "2024, Microsoft"
+copyright = "Microsoft"
 author = "Microsoft"
 
 # The short X.Y version
@@ -121,10 +121,7 @@ html_theme = "furo"
 # further.  For a list of options available for each theme, see the
 # documentation.
 #
-html_theme_options = {
-    "light_logo": "ccf.svg",
-    "dark_logo": "ccf.svg",
-}
+html_theme_options = {}
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -175,9 +172,7 @@ latex_elements = {
 # Grouping the document tree into LaTeX files. List of tuples
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
-latex_documents = [
-    (master_doc, "CCF.tex", "CCF Documentation", "Microsoft", "manual")
-]
+latex_documents = [(master_doc, "CCF.tex", "CCF Documentation", "Microsoft", "manual")]
 
 
 # -- Options for manual page output ------------------------------------------
@@ -199,7 +194,7 @@ texinfo_documents = [
         "CCF Documentation",
         author,
         "CCF",
-        "One line description of project.",
+        "Confidential Consortium Framework documentation.",
         "Miscellaneous",
     )
 ]
@@ -220,16 +215,23 @@ breathe_default_project = "CCF"
 
 # Set up multiversion extension
 
-smv_tag_whitelist = None
-smv_branch_whitelist = r"^(main)|(release\/([4-9]|\d\d\d*)\.x)$"
+smv_tag_whitelist = r'(?!.*)' # Match nothing, build no tags. Docs suggest using None, but this produces a Warning
+smv_branch_whitelist = r"^(main)|(release\/([7-9]|\d\d\d*)\.x)$"
 smv_remote_whitelist = None
 smv_outputdir_format = "{ref.name}"
 
 assert re.match(smv_branch_whitelist, "main")
-assert not re.match(smv_branch_whitelist, "release/1.x")
+assert not re.match(smv_branch_whitelist, "release/not-a-version")
 assert not re.match(smv_branch_whitelist, "release/2.x")
+assert re.match(smv_branch_whitelist, "release/7.x")
 assert re.match(smv_branch_whitelist, "release/100.x")
-assert not re.match(smv_branch_whitelist, "release/1.x_feature")
+assert not re.match(smv_branch_whitelist, "release/7.x_feature")
+
+# -- Warnings filter
+
+suppress_warnings = [
+    "autosectionlabel", # https://stackoverflow.com/a/77577337
+]
 
 # Intercept command line arguments passed by sphinx-multiversion to retrieve doc version.
 # This is a little hacky with sphinx-multiversion 0.2.4 and the `SPHINX_MULTIVERSION_NAME`
@@ -260,7 +262,6 @@ extlinks = {
 
 # Theme options
 
-html_logo = "_static/ccf.svg"
 html_favicon = "_static/favicon.ico"
 
 html_context = {
@@ -309,14 +310,14 @@ def typedoc_role(
 ):
     """
     Supported syntaxes:
-    :typedoc:package:`ccf-app`
-    :typedoc:module:`ccf-app/global`
-    :typedoc:function:`ccf-app/crypto#wrapKey`
-    :typedoc:interface:`ccf-app/endpoints/Body`
-    :typedoc:class:`ccf-app/kv/TypedKvMap`
-    :typedoc:classmethod:`ccf-app/kv/TypedKvMap#delete`
-    :typedoc:interfacemethod:`ccf-app/endpoints/Body#json`
-    :typedoc:interface:`Body <ccf-app/endpoints/Body>`
+    :typedoc-package:`ccf-app`
+    :typedoc-module:`ccf-app/global`
+    :typedoc-function:`ccf-app/crypto#wrapKey`
+    :typedoc-interface:`ccf-app/endpoints/Body`
+    :typedoc-class:`ccf-app/kv/TypedKvMap`
+    :typedoc-classmethod:`ccf-app/kv/TypedKvMap#delete`
+    :typedoc-interfacemethod:`ccf-app/endpoints/Body#json`
+    :typedoc-interface:`Body <ccf-app/endpoints/Body>`
     """
     # check for custom label
     if "<" in text:
@@ -331,7 +332,7 @@ def typedoc_role(
 
     # translate role kind into typedoc subfolder
     # and add '()' for functions/methods
-    kind_name = name.replace("typedoc:", "")
+    kind_name = name.replace("typedoc-", "")
     is_kind_package = False
     if kind_name == "package":
         is_kind_package = True
@@ -358,10 +359,12 @@ def typedoc_role(
         element_path = ".".join(element_path)
         typedoc_path += f"/{kind_name}/{element_path}.html{url_hash}"
 
-    # construct final url relative to current page
-    source = inliner.document.attributes["source"]
-    rel_source = source.split("/doc/", 1)[1]
-    levels = rel_source.count("/")
+    # construct final url relative to current page. Use the Sphinx docname
+    # (always relative to the source root) rather than the filesystem path, so
+    # this works under sphinx-multiversion where sources live in a temporary
+    # checkout that differs from the conf.py location.
+    docname = inliner.document.settings.env.docname
+    levels = docname.count("/")
     refuri = "../" * levels + typedoc_path
 
     # build docutils node
@@ -422,21 +425,6 @@ def config_inited(app, config):
             os.environ["SMV_METADATA_PATH"] = app.config.smv_metadata_path
             os.environ["SMV_CURRENT_VERSION"] = app.config.smv_current_version
         subprocess.run(
-            ["sed", "-i", "s/\^4.2.3/4.2.4/g", "package.json"],
-            cwd=js_pkg_dir,
-            check=True,
-        )
-        subprocess.run(
-            ["sed", "-i", 's/"\^14\.14\.35"/"14\.17\.27"/g', "package.json"],
-            cwd=js_pkg_dir,
-            check=True,
-        )
-        subprocess.run(
-            ["npm", "install", "--save-exact", "colors@1.4.0"],
-            cwd=js_pkg_dir,
-            check=True,
-        )
-        subprocess.run(
             ["npm", "install", "--no-package-lock", "--no-audit", "--no-fund"],
             cwd=js_pkg_dir,
             check=True,
@@ -456,7 +444,7 @@ def config_inited(app, config):
             "interfacemethod",
             "classmethod",
         ]:
-            app.add_role(f"typedoc:{kind}", typedoc_role)
+            app.add_role(f"typedoc-{kind}", typedoc_role)
 
 
 def setup(app):
@@ -484,7 +472,7 @@ def setup(app):
             )
 
     # configuration generator
-    input_file_path = doc_dir / "host_config_schema/cchost_config.json"
+    input_file_path = doc_dir / "host_config_schema/host_config.json"
     output_file_path = doc_dir / "operations/generated_config.rst"
 
     if os.path.exists(input_file_path):

@@ -3,12 +3,11 @@
 
 #include "crypto/openssl/rsa_key_pair.h"
 
+#include "ccf/crypto/openssl/openssl_wrappers.h"
 #include "crypto/openssl/hash.h"
-#include "openssl_wrappers.h"
 
-#if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
-#  include <openssl/core_names.h>
-#endif
+#include <climits>
+#include <openssl/core_names.h>
 
 namespace ccf::crypto
 {
@@ -21,28 +20,21 @@ namespace ccf::crypto
     Unique_BIGNUM big_exp;
     CHECK1(BN_set_word(big_exp, public_exponent));
 
-#if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
     Unique_EVP_PKEY_CTX pctx("RSA");
     CHECK1(EVP_PKEY_keygen_init(pctx));
     CHECKPOSITIVE(EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, public_key_size));
     CHECKPOSITIVE(EVP_PKEY_CTX_set1_rsa_keygen_pubexp(pctx, big_exp));
     CHECK1(EVP_PKEY_generate(pctx, &key));
-#else
-    Unique_RSA rsa;
-    CHECK1(RSA_generate_key_ex(rsa, public_key_size, big_exp, NULL));
-    CHECK1(EVP_PKEY_set1_RSA(key, rsa));
-#endif
   }
 
-  RSAKeyPair_OpenSSL::RSAKeyPair_OpenSSL(EVP_PKEY* k) :
-    RSAPublicKey_OpenSSL(std::move(k))
+  RSAKeyPair_OpenSSL::RSAKeyPair_OpenSSL(EVP_PKEY* k) : RSAPublicKey_OpenSSL(k)
   {}
 
   RSAKeyPair_OpenSSL::RSAKeyPair_OpenSSL(const Pem& pem)
   {
     Unique_BIO mem(pem);
-    key = PEM_read_bio_PrivateKey(mem, NULL, NULL, nullptr);
-    if (!key)
+    key = PEM_read_bio_PrivateKey(mem, nullptr, nullptr, nullptr);
+    if (key == nullptr)
     {
       throw std::runtime_error("could not parse PEM");
     }
@@ -52,7 +44,12 @@ namespace ccf::crypto
   {
     key = EVP_PKEY_new();
 
-    Unique_BIGNUM d, p, q, dp, dq, qi;
+    Unique_BIGNUM d;
+    Unique_BIGNUM p;
+    Unique_BIGNUM q;
+    Unique_BIGNUM dp;
+    Unique_BIGNUM dq;
+    Unique_BIGNUM qi;
     auto d_raw = raw_from_b64url(jwk.d);
     auto p_raw = raw_from_b64url(jwk.p);
     auto q_raw = raw_from_b64url(jwk.q);
@@ -67,7 +64,6 @@ namespace ccf::crypto
     CHECKNULL(BN_bin2bn(dq_raw.data(), dq_raw.size(), dq));
     CHECKNULL(BN_bin2bn(qi_raw.data(), qi_raw.size(), qi));
 
-#if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
     // Note: raw vectors are big endians while OSSL_PARAM_construct_BN expects
     // native endianness
     std::vector<uint8_t> d_raw_native(d_raw.size());
@@ -86,8 +82,9 @@ namespace ccf::crypto
     CHECKPOSITIVE(
       BN_bn2nativepad(qi, qi_raw_native.data(), qi_raw_native.size()));
 
-    auto [n_raw, e_raw] = RSAPublicKey_OpenSSL::rsa_public_raw_from_jwk(jwk);
+    auto [n_raw, e_raw] = rsa_public_raw_from_jwk(jwk);
 
+    // NOLINTBEGIN(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
     OSSL_PARAM params[9];
     params[0] = OSSL_PARAM_construct_BN(
       OSSL_PKEY_PARAM_RSA_N, n_raw.data(), n_raw.size());
@@ -112,38 +109,19 @@ namespace ccf::crypto
       qi_raw_native.data(),
       qi_raw_native.size());
     params[8] = OSSL_PARAM_construct_end();
+    // NOLINTEND(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
 
     Unique_EVP_PKEY_CTX pctx("RSA");
     CHECK1(EVP_PKEY_fromdata_init(pctx));
-    CHECK1(EVP_PKEY_fromdata(pctx, &key, EVP_PKEY_KEYPAIR, params));
-#else
-    auto rsa = RSAPublicKey_OpenSSL::rsa_public_from_jwk(jwk);
-    CHECK1(RSA_set0_key(rsa, nullptr, nullptr, d));
-    d.release();
-
-    CHECK1(RSA_set0_factors(rsa, p, q));
-    p.release();
-    q.release();
-
-    CHECK1(RSA_set0_crt_params(rsa, dp, dq, qi));
-    dp.release();
-    dq.release();
-    qi.release();
-
-    CHECK1(EVP_PKEY_set1_RSA(key, rsa));
-#endif
-  }
-
-  size_t RSAKeyPair_OpenSSL::key_size() const
-  {
-    return RSAPublicKey_OpenSSL::key_size();
+    CHECK1(EVP_PKEY_fromdata(
+      pctx, &key, EVP_PKEY_KEYPAIR, static_cast<OSSL_PARAM*>(params)));
   }
 
   std::vector<uint8_t> RSAKeyPair_OpenSSL::rsa_oaep_unwrap(
     const std::vector<uint8_t>& input,
     const std::optional<std::vector<std::uint8_t>>& label)
   {
-    const unsigned char* label_ = NULL;
+    const unsigned char* label_ = nullptr;
     size_t label_size = 0;
     if (label.has_value())
     {
@@ -157,23 +135,24 @@ namespace ccf::crypto
 
     Unique_EVP_PKEY_CTX ctx(key);
     CHECK1(EVP_PKEY_decrypt_init(ctx));
-    EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING);
-    EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256());
-    EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256());
+    CHECKPOSITIVE(EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING));
+    CHECKPOSITIVE(EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()));
+    CHECKPOSITIVE(EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()));
 
-    if (label_)
+    if (label_ != nullptr)
     {
-      unsigned char* openssl_label = (unsigned char*)OPENSSL_malloc(label_size);
+      auto* openssl_label =
+        static_cast<unsigned char*>(OPENSSL_malloc(label_size));
       std::copy(label_, label_ + label_size, openssl_label);
       EVP_PKEY_CTX_set0_rsa_oaep_label(ctx, openssl_label, label_size);
     }
     else
     {
-      EVP_PKEY_CTX_set0_rsa_oaep_label(ctx, NULL, 0);
+      EVP_PKEY_CTX_set0_rsa_oaep_label(ctx, nullptr, 0);
     }
 
-    size_t olen;
-    CHECK1(EVP_PKEY_decrypt(ctx, NULL, &olen, input.data(), input.size()));
+    size_t olen = 0;
+    CHECK1(EVP_PKEY_decrypt(ctx, nullptr, &olen, input.data(), input.size()));
 
     std::vector<uint8_t> output(olen);
     CHECK1(
@@ -187,87 +166,93 @@ namespace ccf::crypto
   {
     Unique_BIO buf;
 
-    CHECK1(PEM_write_bio_PrivateKey(buf, key, NULL, NULL, 0, NULL, NULL));
+    CHECK1(PEM_write_bio_PrivateKey(
+      buf, key, nullptr, nullptr, 0, nullptr, nullptr));
 
-    BUF_MEM* bptr;
+    BUF_MEM* bptr = nullptr;
     BIO_get_mem_ptr(buf, &bptr);
-    return Pem((uint8_t*)bptr->data, bptr->length);
+    return {reinterpret_cast<uint8_t*>(bptr->data), bptr->length};
   }
 
-  Pem RSAKeyPair_OpenSSL::public_key_pem() const
+  std::vector<uint8_t> RSAKeyPair_OpenSSL::private_key_der() const
   {
-    return PublicKey_OpenSSL::public_key_pem();
+    Unique_BIO buf;
+
+    OpenSSL::CHECK1(i2d_PrivateKey_bio(buf, key));
+
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(buf, &bptr);
+    return {bptr->data, bptr->data + bptr->length};
   }
 
-  std::vector<uint8_t> RSAKeyPair_OpenSSL::public_key_der() const
-  {
-    return PublicKey_OpenSSL::public_key_der();
-  }
-
-  std::vector<uint8_t> RSAKeyPair_OpenSSL::sign(
-    std::span<const uint8_t> d, MDType md_type, size_t salt_length) const
-  {
-    std::vector<uint8_t> r(2048);
-    auto hash = OpenSSLHashProvider().Hash(d.data(), d.size(), md_type);
-    Unique_EVP_PKEY_CTX pctx(key);
-    CHECK1(EVP_PKEY_sign_init(pctx));
-    CHECK1(EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING));
-    CHECK1(EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, salt_length));
-    CHECK1(EVP_PKEY_CTX_set_signature_md(pctx, get_md_type(md_type)));
-    size_t olen = r.size();
-    CHECK1(EVP_PKEY_sign(pctx, r.data(), &olen, hash.data(), hash.size()));
-    r.resize(olen);
-    return r;
-  }
-
-  bool RSAKeyPair_OpenSSL::verify(
-    const uint8_t* contents,
-    size_t contents_size,
-    const uint8_t* signature,
-    size_t signature_size,
-    MDType md_type,
-    size_t salt_length)
-  {
-    return RSAPublicKey_OpenSSL::verify(
-      contents, contents_size, signature, signature_size, md_type, salt_length);
-  }
-
-  JsonWebKeyRSAPrivate RSAKeyPair_OpenSSL::private_key_jwk_rsa(
+  JsonWebKeyRSAPrivate RSAKeyPair_OpenSSL::private_key_jwk(
     const std::optional<std::string>& kid) const
   {
-    JsonWebKeyRSAPrivate jwk = {RSAPublicKey_OpenSSL::public_key_jwk_rsa(kid)};
+    JsonWebKeyRSAPrivate jwk;
+    static_cast<JsonWebKeyRSAPublic&>(jwk) =
+      RSAPublicKey_OpenSSL::public_key_jwk(kid);
 
-    Unique_BIGNUM d, p, q, dp, dq, qi;
+    Unique_BIGNUM d;
+    Unique_BIGNUM p;
+    Unique_BIGNUM q;
+    Unique_BIGNUM dp;
+    Unique_BIGNUM dq;
+    Unique_BIGNUM qi;
 
-#if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
     d = RSAPublicKey_OpenSSL::get_bn_param(OSSL_PKEY_PARAM_RSA_D);
     p = RSAPublicKey_OpenSSL::get_bn_param(OSSL_PKEY_PARAM_RSA_FACTOR1);
     q = RSAPublicKey_OpenSSL::get_bn_param(OSSL_PKEY_PARAM_RSA_FACTOR2);
     dp = RSAPublicKey_OpenSSL::get_bn_param(OSSL_PKEY_PARAM_RSA_EXPONENT1);
     dq = RSAPublicKey_OpenSSL::get_bn_param(OSSL_PKEY_PARAM_RSA_EXPONENT2);
     qi = RSAPublicKey_OpenSSL::get_bn_param(OSSL_PKEY_PARAM_RSA_COEFFICIENT1);
-#else
-    const RSA* rsa = EVP_PKEY_get0_RSA(key);
-    if (!rsa)
-    {
-      throw std::logic_error("invalid RSA key");
-    }
 
-    d = RSA_get0_d(rsa);
-    p = RSA_get0_p(rsa);
-    q = RSA_get0_q(rsa);
-    dp = RSA_get0_dmp1(rsa);
-    dq = RSA_get0_dmq1(rsa);
-    qi = RSA_get0_iqmp(rsa);
-#endif
-
-    jwk.d = b64url_from_raw(RSAPublicKey_OpenSSL::bn_bytes(d), false);
-    jwk.p = b64url_from_raw(RSAPublicKey_OpenSSL::bn_bytes(p), false);
-    jwk.q = b64url_from_raw(RSAPublicKey_OpenSSL::bn_bytes(q), false);
-    jwk.dp = b64url_from_raw(RSAPublicKey_OpenSSL::bn_bytes(dp), false);
-    jwk.dq = b64url_from_raw(RSAPublicKey_OpenSSL::bn_bytes(dq), false);
-    jwk.qi = b64url_from_raw(RSAPublicKey_OpenSSL::bn_bytes(qi), false);
+    jwk.d = b64url_from_raw(bn_to_bytes(d), false);
+    jwk.p = b64url_from_raw(bn_to_bytes(p), false);
+    jwk.q = b64url_from_raw(bn_to_bytes(q), false);
+    jwk.dp = b64url_from_raw(bn_to_bytes(dp), false);
+    jwk.dq = b64url_from_raw(bn_to_bytes(dq), false);
+    jwk.qi = b64url_from_raw(bn_to_bytes(qi), false);
 
     return jwk;
+  }
+
+  std::vector<uint8_t> RSAKeyPair_OpenSSL::sign(
+    std::span<const uint8_t> d, MDType md_type, size_t salt_length) const
+  {
+    constexpr size_t MAX_SIG_SIZE = 2048;
+
+    std::vector<uint8_t> r(MAX_SIG_SIZE);
+    auto hash = OpenSSLHashProvider().hash(d.data(), d.size(), md_type);
+    Unique_EVP_PKEY_CTX pctx(key);
+    CHECK1(EVP_PKEY_sign_init(pctx));
+    CHECKPOSITIVE(EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING));
+    if (salt_length > INT_MAX)
+    {
+      throw std::invalid_argument(fmt::format(
+        "salt_length {} exceeds maximum ({})", salt_length, INT_MAX));
+    }
+    CHECKPOSITIVE(EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, salt_length));
+    CHECKPOSITIVE(EVP_PKEY_CTX_set_signature_md(pctx, get_md_type(md_type)));
+    size_t olen = r.size();
+    CHECK1(EVP_PKEY_sign(pctx, r.data(), &olen, hash.data(), hash.size()));
+    r.resize(olen);
+    return r;
+  }
+
+  RSAKeyPairPtr make_rsa_key_pair(
+    size_t public_key_size, size_t public_exponent)
+  {
+    return std::make_shared<RSAKeyPair_OpenSSL>(
+      public_key_size, public_exponent);
+  }
+
+  RSAKeyPairPtr make_rsa_key_pair(const Pem& pem)
+  {
+    return std::make_shared<RSAKeyPair_OpenSSL>(pem);
+  }
+
+  RSAKeyPairPtr make_rsa_key_pair(const JsonWebKeyRSAPrivate& jwk)
+  {
+    return std::make_shared<RSAKeyPair_OpenSSL>(jwk);
   }
 }

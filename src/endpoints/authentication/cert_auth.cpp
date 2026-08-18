@@ -3,14 +3,14 @@
 
 #include "ccf/endpoints/authentication/cert_auth.h"
 
+#include "ccf/ds/x509_time_fmt.h"
 #include "ccf/pal/locking.h"
 #include "ccf/rpc_context.h"
 #include "ccf/service/tables/members.h"
 #include "ccf/service/tables/nodes.h"
 #include "ccf/service/tables/users.h"
+#include "ds/internal_logger.h"
 #include "ds/lru.h"
-#include "ds/x509_time_fmt.h"
-#include "enclave/enclave_time.h"
 
 namespace ccf
 {
@@ -49,12 +49,12 @@ namespace ccf
 
         const auto valid_from_unix_time =
           duration_cast<seconds>(
-            ::ds::time_point_from_string(valid_from_timestring)
+            ccf::ds::time_point_from_string(valid_from_timestring)
               .time_since_epoch())
             .count();
         const auto valid_to_unix_time =
           duration_cast<seconds>(
-            ::ds::time_point_from_string(valid_to_timestring)
+            ccf::ds::time_point_from_string(valid_to_timestring)
               .time_since_epoch())
             .count();
 
@@ -73,7 +73,7 @@ namespace ccf
 
       using namespace std::chrono;
       const auto time_now =
-        duration_cast<seconds>(ccf::get_enclave_time()).count();
+        duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
 
       if (time_now < valid_from_unix_time)
       {
@@ -84,7 +84,8 @@ namespace ccf
           valid_from_unix_time);
         return false;
       }
-      else if (time_now > valid_to_unix_time)
+
+      if (time_now > valid_to_unix_time)
       {
         error_reason = fmt::format(
           "Current time {} is after certificate's Not After validity period {}",
@@ -117,12 +118,13 @@ namespace ccf
 
     if (!validity_periods->is_cert_valid_now(caller_cert, error_reason))
     {
+      // Error is set by the call when necessary
       return nullptr;
     }
 
     auto caller_id = ccf::crypto::Sha256Hash(caller_cert).hex_str();
 
-    auto user_certs = tx.ro<UserCerts>(Tables::USER_CERTS);
+    auto* user_certs = tx.ro<UserCerts>(Tables::USER_CERTS);
     if (user_certs->has(caller_id))
     {
       auto identity = std::make_unique<UserCertAuthnIdentity>();
@@ -154,7 +156,7 @@ namespace ccf
 
     auto caller_id = ccf::crypto::Sha256Hash(caller_cert).hex_str();
 
-    auto member_certs = tx.ro<MemberCerts>(Tables::MEMBER_CERTS);
+    auto* member_certs = tx.ro<MemberCerts>(Tables::MEMBER_CERTS);
     if (member_certs->has(caller_id))
     {
       auto identity = std::make_unique<MemberCertAuthnIdentity>();
@@ -180,7 +182,7 @@ namespace ccf
 
     auto node_caller_id = compute_node_id_from_cert_der(caller_cert);
 
-    auto nodes = tx.ro<ccf::Nodes>(Tables::NODES);
+    auto* nodes = tx.ro<ccf::Nodes>(Tables::NODES);
     auto node = nodes->get(node_caller_id);
     if (node.has_value())
     {
@@ -191,6 +193,7 @@ namespace ccf
 
     std::vector<ccf::NodeId> known_nids;
     nodes->foreach([&known_nids](const NodeId& nid, const NodeInfo& ni) {
+      (void)ni;
       known_nids.push_back(nid);
       return true;
     });
@@ -202,5 +205,35 @@ namespace ccf
 
     error_reason = "Could not find matching node certificate";
     return nullptr;
+  }
+
+  AnyCertAuthnPolicy::AnyCertAuthnPolicy() :
+    validity_periods(std::make_unique<ValidityPeriodsCache>())
+  {}
+
+  AnyCertAuthnPolicy::~AnyCertAuthnPolicy() = default;
+
+  std::unique_ptr<AuthnIdentity> AnyCertAuthnPolicy::authenticate(
+    ccf::kv::ReadOnlyTx& tx,
+    const std::shared_ptr<ccf::RpcContext>& ctx,
+    std::string& error_reason)
+  {
+    (void)tx;
+    const auto& caller_cert = ctx->get_session_context()->caller_cert;
+    if (caller_cert.empty())
+    {
+      error_reason = "No caller certificate";
+      return nullptr;
+    }
+
+    if (!validity_periods->is_cert_valid_now(caller_cert, error_reason))
+    {
+      // Error is set by the call when necessary
+      return nullptr;
+    }
+
+    auto identity = std::make_unique<AnyCertAuthnIdentity>();
+    identity->cert = caller_cert;
+    return identity;
   }
 }

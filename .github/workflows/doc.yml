@@ -6,24 +6,37 @@ on:
       - main
   workflow_dispatch:
 
+permissions: read-all
+
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/microsoft/ccf/ci/default:latest
+      image: mcr.microsoft.com/azurelinux/base/core:3.0
     steps:
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf -y update
+          tdnf -y install ca-certificates git
+
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
       - name: Setup Pages
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
       - name: Build Documentation
         run: |
           set -x
-          python3.8 -m venv env
+          ./scripts/setup-ci.sh
+          python3 -m venv env
           source env/bin/activate
           pip install -U pip
           pip install -U -e ./python
@@ -31,6 +44,7 @@ jobs:
           pip install -U -r doc/historical_ccf_requirements.txt
           sphinx-multiversion -D smv_remote_whitelist=origin doc build/html
         shell: bash
+
       - name: Set up top-level directory
         run: |
           set -x
@@ -38,20 +52,21 @@ jobs:
           touch .nojekyll
           cp ../../doc/index.html .
         shell: bash
+
       - name: Upload pages
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: build/html
 
-  # This is purposefully separate to keep the scope with
-  # with the permissions to deploy to a minimum.
   deploy:
     name: Deploy
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # Needed to authorize deployment to GitHub Pages
       pages: write
+      # Needed to authenticate via OIDC
+      # See https://github.com/actions/deploy-pages?tab=readme-ov-file#usage
       id-token: write
     environment:
       name: github-pages
@@ -59,4 +74,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

@@ -185,7 +185,7 @@ TEST_CASE("Buffer size and alignment" * doctest::test_suite("ringbuffer"))
     REQUIRE_NOTHROW(Reader(buffer->bd));
 
     auto data = buffer->bd.data;
-    for (auto i = 0; i < buffer->bd.size; ++i)
+    for (size_t i = 0; i < buffer->bd.size; ++i)
     {
       buffer->bd.data = data + i;
       if (i % 8 == 0)
@@ -594,7 +594,7 @@ TEST_CASE("Multiple threads can wait" * doctest::test_suite("ringbuffer"))
     // Create several threads writing more data than can fit at once
     for (size_t i = 0; i < thread_count; ++i)
     {
-      writer_threads.push_back(std::thread([&r, &writes, i, n = max_n]() {
+      writer_threads.push_back(std::thread([&r, &writes, n = max_n]() {
         Writer w(r);
 
         for (uint8_t j = 0u; j < n; ++j)
@@ -616,7 +616,7 @@ TEST_CASE("Multiple threads can wait" * doctest::test_suite("ringbuffer"))
         REQUIRE(last_message_body[0] < max_n);
         ++reads;
       }
-      CCF_PAUSE();
+      std::this_thread::yield();
     }
 
     REQUIRE(reads == target);
@@ -674,12 +674,7 @@ public:
 
 // This test checks that the ringbuffer functions correctly when the offsets
 // overflow and wrap around from their maximum representable size to 0
-TEST_CASE(
-  "Offset overflow" *
-  doctest::test_suite("ringbuffer")
-  // Skip when xAPIC mitigations are enabled, which are not correctly handled by
-  // SparseReader
-  * doctest::skip(ccf::pal::require_alignment_for_untrusted_reads()))
+TEST_CASE("Offset overflow" * doctest::test_suite("ringbuffer"))
 {
   const auto seed = time(NULL);
   INFO("Using seed: ", seed);
@@ -729,7 +724,7 @@ TEST_CASE(
 
       // Write a few messages this time. Deliberately randomised so it may fill
       // the buffer, may wrap, or may write a few small messages.
-      const auto message_count = (rand() % 4) + 1;
+      const size_t message_count = (rand() % 4) + 1;
       for (size_t m = 0; m < message_count; ++m)
       {
         const auto message_type = rand_message_type();
@@ -774,12 +769,7 @@ TEST_CASE(
   }
 }
 
-TEST_CASE(
-  "Malicious writer" *
-  doctest::test_suite("ringbuffer")
-  // Skip when xAPIC mitigations are enabled, since the core assertion that
-  // reads are within the original buffer is deliberately broken by the Reader
-  * doctest::skip(ccf::pal::require_alignment_for_untrusted_reads()))
+TEST_CASE("Malicious writer" * doctest::test_suite("ringbuffer"))
 {
   constexpr auto buffer_size = 256ull;
 

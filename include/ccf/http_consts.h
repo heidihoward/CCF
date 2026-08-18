@@ -14,30 +14,35 @@ namespace ccf
       static constexpr auto AUTHORIZATION = "authorization";
       static constexpr auto CACHE_CONTROL = "cache-control";
       static constexpr auto CONTENT_LENGTH = "content-length";
+      static constexpr auto CONTENT_RANGE = "content-range";
       static constexpr auto CONTENT_TYPE = "content-type";
       static constexpr auto DATE = "date";
       static constexpr auto DIGEST = "digest";
       static constexpr auto HOST = "host";
       static constexpr auto LOCATION = "location";
+      static constexpr auto RANGE = "range";
+      static constexpr auto ETAG = "etag";
+      static constexpr auto IF_NONE_MATCH = "if-none-match";
+      static constexpr auto REPR_DIGEST = "repr-digest";
       static constexpr auto RETRY_AFTER = "retry-after";
       static constexpr auto TRAILER = "trailer";
+      static constexpr auto WANT_REPR_DIGEST = "want-repr-digest";
       static constexpr auto WWW_AUTHENTICATE = "www-authenticate";
 
       static constexpr auto CCF_TX_ID = "x-ms-ccf-transaction-id";
+      static constexpr auto CCF_SNAPSHOT_NAME = "x-ms-ccf-snapshot-name";
+      static constexpr auto CCF_LEDGER_CHUNK_NAME =
+        "x-ms-ccf-ledger-chunk-name";
     }
 
-    namespace headervalues
+    namespace headervalues::contenttype
     {
-      namespace contenttype
-      {
-        static constexpr auto JSON = "application/json";
-        static constexpr auto TEXT = "text/plain";
-        static constexpr auto OCTET_STREAM = "application/octet-stream";
-        static constexpr auto GRPC = "application/grpc";
-        static constexpr auto COSE = "application/cose";
-        static constexpr auto JAVASCRIPT = "text/javascript";
-        static constexpr auto CBOR = "application/cbor";
-      }
+      static constexpr auto JSON = "application/json";
+      static constexpr auto TEXT = "text/plain";
+      static constexpr auto OCTET_STREAM = "application/octet-stream";
+      static constexpr auto COSE = "application/cose";
+      static constexpr auto JAVASCRIPT = "text/javascript";
+      static constexpr auto CBOR = "application/cbor";
     }
 
     namespace auth
@@ -64,13 +69,10 @@ namespace ccf
       auth::SIGN_HEADER_REQUEST_TARGET, ccf::http::headers::DIGEST};
   }
 
-  namespace http2
+  namespace http2::headers
   {
-    namespace headers
-    {
-      static constexpr auto PATH = ":path";
-      static constexpr auto STATUS = ":status";
-      static constexpr auto METHOD = ":method";
-    }
+    static constexpr auto PATH = ":path";
+    static constexpr auto STATUS = ":status";
+    static constexpr auto METHOD = ":method";
   }
 }

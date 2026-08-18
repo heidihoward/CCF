@@ -13,7 +13,7 @@ namespace ccf
 {
   struct NodeConfigurationState
   {
-    const StartupConfig& node_config;
+    const ccf::StartupConfig& node_config;
     std::map<NodeInfoNetwork::RpcInterfaceID, std::vector<std::regex>>
       rpc_interface_regexes;
     bool initialized = false;
@@ -22,7 +22,7 @@ namespace ccf
   class NodeConfigurationInterface : public AbstractNodeSubSystem
   {
   public:
-    virtual ~NodeConfigurationInterface() = default;
+    ~NodeConfigurationInterface() override = default;
 
     static char const* get_subsystem_name()
     {

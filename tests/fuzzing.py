@@ -1,10 +1,11 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import datetime
+import struct
+
+import boofuzz
 import infra.e2e_args
 import infra.network
-import struct
-import boofuzz
-import datetime
 from loguru import logger as LOG
 
 
@@ -23,7 +24,7 @@ class CCFFuzzLogger(boofuzz.IFuzzLogger):
         self.log_lines = self.log_lines[-self.keep_lines :]
 
         if self.session is not None:
-            now = datetime.datetime.now()
+            now = datetime.datetime.now(datetime.timezone.utc)
             if self.last_printed is None or now - self.last_printed > self.print_period:
                 fuzzed_this_period = (
                     self.session.num_cases_actually_fuzzed - self.last_fuzzed_count
@@ -42,10 +43,10 @@ class CCFFuzzLogger(boofuzz.IFuzzLogger):
         self._store_line(f" Test step: {description}")
 
     def log_send(self, data):
-        self._store_line(infra.clients.escape_loguru_tags(f"  Sent: {data}"))
+        self._store_line(f"  Sent: {data}")
 
     def log_recv(self, data):
-        self._store_line(infra.clients.escape_loguru_tags(f"  Received: {data}"))
+        self._store_line(f"  Received: {data}")
 
     def log_check(self, description):
         self._store_line(f"  Checking: {description}")
@@ -71,7 +72,7 @@ class CCFFuzzLogger(boofuzz.IFuzzLogger):
 
 def ccf_node_post_send(node):
     def post_send_callback(fuzz_data_logger=None, *args, **kwargs):
-        done = node.remote.check_done()
+        done = node.remote.check_done(timeout=0)
         if done:
             fuzz_data_logger.log_error("Node has exited")
         return done
@@ -114,7 +115,7 @@ def fuzz_node_to_node(network, args):
                             ),
                             boofuzz.RandomData(
                                 "SenderContent",
-                                default_value="OtherNode".encode(),
+                                default_value=b"OtherNode",
                                 max_length=32,
                             ),
                         ],
@@ -198,7 +199,7 @@ def fuzz_node_to_node(network, args):
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
@@ -214,11 +215,3 @@ def run(args):
         network.ignore_error_pattern_on_shutdown("Unknown frontend msg type")
 
         fuzz_node_to_node(network, args)
-
-
-if __name__ == "__main__":
-    args = infra.e2e_args.cli_args()
-    args.package = "samples/apps/logging/liblogging"
-
-    args.nodes = infra.e2e_args.min_nodes(args, f=0)
-    run(args)

@@ -25,9 +25,15 @@ The sample app has the following folder layout:
     ├── src
     │   └── endpoints
     │       ├── all.ts
+    │       ├── auth.ts
+    │       ├── base64.ts
+    │       ├── converters.ts
     │       ├── crypto.ts
+    │       ├── log.ts
     │       ├── partition.ts
-    │       └── proto.ts
+    │       ├── rpc.ts
+    │       ├── snp_attestation.ts
+    │       └── spin.ts
     ├── app.json
     ├── package.json
     ├── rollup.config.js
@@ -54,13 +60,13 @@ Dependencies
 ------------
 
 The sample uses several runtime and development packages (see ``package.json``).
-One of them is the :typedoc:package:`ccf-app` package.
+One of them is the :typedoc-package:`ccf-app` package.
 This package references the current branch's version of the ``ccf-app`` package using ``file:``.
 To test against a published version you should adjust the version number accordingly:
 
 .. code-block:: js
 
-    "@microsoft/ccf-app": "~1.0.0",
+    "@microsoft/ccf-app": "~7.0.0",
 
 Now you can continue with installing all dependencies:
 
@@ -101,7 +107,7 @@ An endpoint handler, here named ``abc``, has the following structure:
     }
 
 ``AbcRequest`` and ``AbcResponse`` define the JSON schema of the request and response body, respectively.
-If an endpoint has no request or response body, the type parameters of :typedoc:interface:`ccfapp.Request <ccf-app/endpoints/Request>`/:typedoc:interface:`ccfapp.Response <ccf-app/endpoints/Response>` can be omitted.
+If an endpoint has no request or response body, the type parameters of :typedoc-interface:`ccfapp.Request <ccf-app/endpoints/Request>`/:typedoc-interface:`ccfapp.Response <ccf-app/endpoints/Response>` can be omitted.
 
 As an example, the ``/partition`` endpoint of the sample app is implemented as:
 
@@ -110,7 +116,6 @@ As an example, the ``/partition`` endpoint of the sample app is implemented as:
 
 Here, the request body is a JSON array with elements of arbitrary type,
 and the response body is an even/odd partitioning of those elements as nested JSON array.
-The example also shows how an external library, here ``lodash``, is imported and used.
 
 .. warning::
     Even though request body schemas can be defined as part of the OpenAPI :ref:`metadata <build_apps/js_app_ts:Metadata>`,
@@ -118,8 +123,8 @@ The example also shows how an external library, here ``lodash``, is imported and
     It is up to the application to perform any necessary validation.
 
 .. tip::
-    See the :typedoc:package:`ccf-app` package API documentation for how to access the Key-Value Store and other CCF functionality.
-    Although not recommended, instead of using the :typedoc:package:`ccf-app` package, all native CCF functionality can also be directly accessed through the :typedoc:interface:`ccf <ccf-app/global/CCF>` global variable.
+    See the :typedoc-package:`ccf-app` package API documentation for how to access the Key-Value Store and other CCF functionality.
+    Although not recommended, instead of using the :typedoc-package:`ccf-app` package, all native CCF functionality can also be directly accessed through the :typedoc-interface:`ccf <ccf-app/global/CCF>` global variable.
 
 
 Metadata
@@ -138,7 +143,7 @@ Preparing the app for deployment means converting it to CCF's native JavaScript 
 This involves the following steps:
 
 - transform TypeScript into JavaScript,
-- transform bare imports (``lodash``) into relative imports (``./node_modules/lodash/lodash.js``),
+- transform bare imports into relative imports,
 - transform old-style CommonJS modules into native JavaScript modules, and
 - store all files according to the app bundle folder structure.
 

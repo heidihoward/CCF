@@ -21,7 +21,7 @@ import { TextEncoder, TextDecoder } from "util";
 
 // Note: It is important that only types are imported here to prevent executing
 // the module at this point (which would query the ccf global before we polyfilled it).
-import {
+import type {
   CCF,
   KvMaps,
   KvMap,
@@ -32,6 +32,7 @@ import {
   SnpAttestation,
   SnpAttestationResult,
   SigningAlgorithm,
+  JsonWebKey,
   JsonWebKeyECPublic,
   JsonWebKeyECPrivate,
   JsonWebKeyRSAPublic,
@@ -39,6 +40,7 @@ import {
   JsonWebKeyEdDSAPublic,
   JsonWebKeyEdDSAPrivate,
 } from "./global.js";
+import { toArrayBuffer } from "./utils.js";
 
 // JavaScript's Map uses reference equality for non-primitive types,
 // whereas CCF compares the content of the ArrayBuffer.
@@ -136,8 +138,8 @@ class CCFPolyfill implements CCF {
           .replace("-", "")
           .toLowerCase();
         const hmac = jscrypto.createHmac(hashAlg, key);
-        hmac.update(new Uint8Array(data));
-        return hmac.digest();
+        hmac.update(new Uint8Array<ArrayBuffer>(data));
+        return nodeBufToArrBuf(hmac.digest());
       }
       let padding = undefined;
       const privKey = jscrypto.createPrivateKey(key);
@@ -159,17 +161,21 @@ class CCFPolyfill implements CCF {
         throw new Error("unrecognized signing algorithm");
       }
       if (algorithm.name === "EdDSA") {
-        return jscrypto.sign(null, new Uint8Array(data), privKey);
+        return nodeBufToArrBuf(
+          jscrypto.sign(null, new Uint8Array(data), privKey),
+        );
       }
       const hashAlg = (algorithm.hash as string).replace("-", "").toLowerCase();
       const signer = jscrypto.createSign(hashAlg);
       signer.update(new Uint8Array(data));
-      return signer.sign({
-        key: privKey,
-        dsaEncoding: "ieee-p1363",
-        padding: padding,
-        saltLength: algorithm.saltLength ?? 0,
-      });
+      return nodeBufToArrBuf(
+        signer.sign({
+          key: privKey,
+          dsaEncoding: "ieee-p1363",
+          padding: padding,
+          saltLength: algorithm.saltLength ?? 0,
+        }),
+      );
     },
     verifySignature(
       algorithm: SigningAlgorithm,
@@ -457,6 +463,34 @@ class CCFPolyfill implements CCF {
         return false;
       }
     },
+    isValidX509RootCACert(pem: string): boolean {
+      if (!("X509Certificate" in jscrypto)) {
+        throw new Error(
+          "X509 validation unsupported, Node.js version too old (< 15.6.0)",
+        );
+      }
+      try {
+        const sep = "-----END CERTIFICATE-----";
+        const items = pem.split(sep);
+        // Expect exactly one certificate.
+        if (items.length !== 2 || items[0].trim() === "") {
+          return false;
+        }
+        const cert = new (<any>jscrypto).X509Certificate(items[0] + sep);
+        // Must be a CA certificate.
+        if (!cert.ca) {
+          return false;
+        }
+        // Must be self-signed: the certificate's public key must verify its own signature.
+        if (!cert.verify(cert.publicKey)) {
+          return false;
+        }
+        return true;
+      } catch (e: any) {
+        console.error(`isValidX509RootCACert validation failed: ${e.message}`);
+        return false;
+      }
+    },
     pubPemToJwk(pem: string, kid?: string): JsonWebKeyECPublic {
       const key = jscrypto.createPublicKey({
         key: pem,
@@ -464,8 +498,14 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyECPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        y: jwk.y,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyECPublic;
     },
     pemToJwk(pem: string, kid?: string): JsonWebKeyECPrivate {
       const key = jscrypto.createPrivateKey({
@@ -474,8 +514,15 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyECPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        y: jwk.y,
+        d: jwk.d,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyECPrivate;
     },
     pubRsaPemToJwk(pem: string, kid?: string): JsonWebKeyRSAPublic {
       const key = jscrypto.createPublicKey({
@@ -484,8 +531,13 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyRSAPublic;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        n: jwk.n,
+        e: jwk.e,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyRSAPublic;
     },
     rsaPemToJwk(pem: string, kid?: string): JsonWebKeyRSAPrivate {
       const key = jscrypto.createPrivateKey({
@@ -494,8 +546,19 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyRSAPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        n: jwk.n,
+        e: jwk.e,
+        d: jwk.d,
+        p: jwk.p,
+        q: jwk.q,
+        dp: jwk.dp,
+        dq: jwk.dq,
+        qi: jwk.qi,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyRSAPrivate;
     },
     pubEddsaPemToJwk(pem: string, kid?: string): JsonWebKeyEdDSAPublic {
       const key = jscrypto.createPublicKey({
@@ -504,8 +567,13 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyEdDSAPublic;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyEdDSAPublic;
     },
     eddsaPemToJwk(pem: string, kid?: string): JsonWebKeyEdDSAPrivate {
       const key = jscrypto.createPrivateKey({
@@ -514,47 +582,53 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyEdDSAPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        d: jwk.d,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyEdDSAPrivate;
     },
     pubJwkToPem(jwk: JsonWebKeyECPublic): string {
       const key = jscrypto.createPublicKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "spki", format: "pem" }).toString();
     },
     jwkToPem(jwk: JsonWebKeyECPrivate): string {
       const key = jscrypto.createPrivateKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "pkcs8", format: "pem" }).toString();
     },
     pubRsaJwkToPem(jwk: JsonWebKeyRSAPublic): string {
       const key = jscrypto.createPublicKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "spki", format: "pem" }).toString();
     },
     rsaJwkToPem(jwk: JsonWebKeyRSAPrivate): string {
       const key = jscrypto.createPrivateKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "pkcs8", format: "pem" }).toString();
     },
     pubEddsaJwkToPem(jwk: JsonWebKeyEdDSAPublic): string {
       const key = jscrypto.createPublicKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "spki", format: "pem" }).toString();
     },
     eddsaJwkToPem(jwk: JsonWebKeyEdDSAPrivate): string {
       const key = jscrypto.createPrivateKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "pkcs8", format: "pem" }).toString();
@@ -619,6 +693,10 @@ class CCFPolyfill implements CCF {
     return this.crypto.isValidX509CertChain(chain, trusted);
   }
 
+  isValidX509RootCACert(pem: string): boolean {
+    return this.crypto.isValidX509RootCACert(pem);
+  }
+
   enableUntrustedDateTime(enable: boolean): boolean {
     throw new Error("Not implemented");
   }
@@ -650,8 +728,10 @@ function nodeBufToArrBuf(buf: Buffer): ArrayBuffer {
   return arrBuf;
 }
 
-function typedArrToArrBuf(ta: ArrayBufferView) {
-  return ta.buffer.slice(ta.byteOffset, ta.byteOffset + ta.byteLength);
+function typedArrToArrBuf(ta: ArrayBufferView): ArrayBuffer {
+  return toArrayBuffer(
+    ta.buffer.slice(ta.byteOffset, ta.byteOffset + ta.byteLength),
+  );
 }
 
 function base64(buf: ArrayBuffer): string {

@@ -3,14 +3,12 @@
 import http
 import re
 
+import infra.clients
+import infra.consortium
 import infra.e2e_args
 import infra.network
-import infra.consortium
-import infra.clients
-from infra.proposal import ProposalState
-
 import suite.test_requirements as reqs
-
+from infra.proposal import ProposalState
 from loguru import logger as LOG
 
 
@@ -44,7 +42,7 @@ def test_missing_signature_header(network, args):
 def make_signature_corrupter(fn):
     class SignatureCorrupter(infra.clients.HttpSig):
         def auth_flow(self, request):
-            yield fn(next(super(SignatureCorrupter, self).auth_flow(request)))
+            yield fn(next(super().auth_flow(request)))
 
     return SignatureCorrupter
 
@@ -77,6 +75,24 @@ def modified_signature(request):
         signature_regex, f'signature="{new_s}",', original
     )
     return request
+
+
+@reqs.description(
+    "Send many governance transactions in a tight loop, with no commit waits in-between"
+)
+def test_rapid_governance(network, args):
+    node = network.find_node_by_role(role=infra.network.NodeRole.PRIMARY)
+
+    repeats = 50
+    for _ in range(repeats):
+        member = network.consortium.generate_and_add_new_member(
+            node,
+            curve=args.participants_curve,
+        )
+        member.ack(node)
+        network.consortium.remove_member(node, member)
+
+    return network
 
 
 @reqs.description("Send a corrupted signature where signed request is required")
@@ -151,7 +167,7 @@ def test_governance(network, args):
     assert new_member_proposal.state == ProposalState.ACCEPTED
 
     # Manually add new member to consortium
-    network.consortium.members.append(new_member)
+    network.consortium.add_member(new_member)
 
     LOG.debug("Further vote requests fail as the proposal has already been accepted")
     params_error = http.HTTPStatus.BAD_REQUEST.value
@@ -172,11 +188,7 @@ def test_governance(network, args):
 
     LOG.info("New non-active member should get insufficient rights response")
     current_recovery_thresold = network.consortium.recovery_threshold
-    expected_error = (
-        http.HTTPStatus.FORBIDDEN
-        if new_member.gov_api_impl_inst.API_VERSION == infra.clients.API_VERSION_CLASSIC
-        else http.HTTPStatus.UNAUTHORIZED
-    )
+    expected_error = http.HTTPStatus.UNAUTHORIZED
     try:
         proposal_recovery_threshold, careful_vote = network.consortium.make_proposal(
             "set_recovery_threshold", recovery_threshold=current_recovery_thresold
@@ -219,14 +231,9 @@ def test_governance(network, args):
     proposal = network.consortium.get_proposal(node, proposal.proposal_id)
     assert proposal.state == infra.proposal.ProposalState.WITHDRAWN
 
-    if new_member.gov_api_impl_inst.API_VERSION == infra.clients.API_VERSION_CLASSIC:
-        LOG.debug("Further withdraw proposals fail")
-        response = new_member.withdraw(node, proposal)
-        assert response.status_code == params_error
-    else:
-        LOG.debug("Further withdraws idempotently pass")
-        response = new_member.withdraw(node, proposal)
-        assert response.status_code == http.HTTPStatus.OK
+    LOG.debug("Further withdraws idempotently pass")
+    response = new_member.withdraw(node, proposal)
+    assert response.status_code == http.HTTPStatus.OK
 
     LOG.debug("Further votes fail")
     response = new_member.vote(node, proposal, careful_vote)
@@ -235,10 +242,11 @@ def test_governance(network, args):
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
         network = test_missing_signature_header(network, args)
+        network = test_rapid_governance(network, args)
         network = test_corrupted_signature(network, args)
         network = test_governance(network, args)

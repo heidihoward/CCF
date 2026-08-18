@@ -1,13 +1,13 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.network
-import infra.e2e_args
-import infra.interfaces
-import infra.net
-from infra.runner import ConcurrentRunner
 import http
 import time
 
+import infra.e2e_args
+import infra.interfaces
+import infra.net
+import infra.network
+from infra.runner import ConcurrentRunner
 from loguru import logger as LOG
 
 
@@ -20,7 +20,7 @@ def test_redirects_with_node_role_config(network, args):
         interface = redirect_to.host.rpc_interfaces[
             infra.interfaces.PRIMARY_RPC_INTERFACE
         ]
-        loc = f"https://{interface.public_host}:{interface.public_port}"
+        loc = f"https://{infra.interfaces.make_address(interface.public_host, interface.public_port)}"
 
         with talk_to.client("user0") as c:
             for path in paths:
@@ -55,7 +55,7 @@ def test_redirects_with_node_role_config(network, args):
             interface = backup.host.rpc_interfaces[
                 infra.interfaces.PRIMARY_RPC_INTERFACE
             ]
-            b_loc = f"https://{interface.public_host}:{interface.public_port}"
+            b_loc = f"https://{infra.interfaces.make_address(interface.public_host, interface.public_port)}"
             if loc.startswith(b_loc):
                 break
         else:
@@ -152,7 +152,7 @@ def test_redirects_with_static_name_config(network, args):
     original, _ = network.find_primary()
 
     new_node = network.create_node(host_spec)
-    network.join_node(new_node, args.package, args)
+    network.join_node(new_node, args.package, args, from_snapshot=False)
     network.trust_node(new_node, args)
 
     req = {"id": 42, "msg": msg}
@@ -172,7 +172,7 @@ def test_redirects_with_static_name_config(network, args):
     LOG.info("Add 2 more nodes with static address redirect config")
     for _ in range(2):
         other_node = network.create_node(host_spec)
-        network.join_node(other_node, args.package, args)
+        network.join_node(other_node, args.package, args, from_snapshot=False)
         network.trust_node(other_node, args)
 
     LOG.info(
@@ -205,7 +205,6 @@ def run_redirect_tests_role(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
     ) as network:
         network.start_and_open(args)
@@ -219,7 +218,6 @@ def run_redirect_tests_static(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
     ) as network:
         network.start_and_open(args)
@@ -233,28 +231,28 @@ if __name__ == "__main__":
     cr.add(
         "cpp_redirects_role",
         run_redirect_tests_role,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.min_nodes(cr.args, f=1),
     )
 
     cr.add(
         "cpp_redirects_static",
         run_redirect_tests_static,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.min_nodes(cr.args, f=0),
     )
 
     cr.add(
         "js_redirects_role",
         run_redirect_tests_role,
-        package="libjs_generic",
+        package="js_generic",
         nodes=infra.e2e_args.min_nodes(cr.args, f=1),
     )
 
     cr.add(
         "js_redirects_static",
         run_redirect_tests_static,
-        package="libjs_generic",
+        package="js_generic",
         nodes=infra.e2e_args.min_nodes(cr.args, f=0),
     )
 

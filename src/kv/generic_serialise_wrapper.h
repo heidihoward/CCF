@@ -2,21 +2,20 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ccf_assert.h"
 #include "ccf/kv/serialisers/serialised_entry.h"
+#include "ds/ccf_assert.h"
+#include "ds/serialized.h"
 #include "kv_types.h"
 #include "node/rpc/claims.h"
 #include "serialised_entry_format.h"
 
 #include <optional>
+#include <span>
 
 namespace ccf::kv
 {
-  using SerialisedKey = ccf::kv::serialisers::SerialisedEntry;
-  using SerialisedValue = ccf::kv::serialisers::SerialisedEntry;
-
   template <typename W>
-  class GenericSerialiseWrapper
+  class GenericSerialiseWrapper : public KvStoreSerialiser
   {
   private:
     W public_writer;
@@ -29,7 +28,7 @@ namespace ccf::kv
     std::shared_ptr<AbstractTxEncryptor> crypto_util;
 
     // must only be set by set_current_domain, since it affects current_writer
-    SecurityDomain current_domain;
+    SecurityDomain current_domain{SecurityDomain::PUBLIC};
 
     // If true, consider historical ledger secrets when encrypting entries
     bool historical_hint;
@@ -52,8 +51,10 @@ namespace ccf::kv
           current_writer = &public_writer;
           current_domain = SecurityDomain::PUBLIC;
           break;
-        default:
-          break;
+        case SecurityDomain::SECURITY_DOMAIN_MAX:
+        {
+          throw std::logic_error("Invalid security domain");
+        }
       }
     }
 
@@ -71,12 +72,12 @@ namespace ccf::kv
       tx_id(tx_id_),
       entry_type(entry_type_),
       header_flags(header_flags_),
-      crypto_util(e),
+      crypto_util(std::move(e)),
       historical_hint(historical_hint_)
     {
       set_current_domain(SecurityDomain::PUBLIC);
       serialise_internal(entry_type);
-      serialise_internal(tx_id.version);
+      serialise_internal(tx_id.seqno);
       if (has_claims(entry_type))
       {
         serialise_internal(claims_digest_.value());
@@ -89,7 +90,7 @@ namespace ccf::kv
       serialise_internal((Version)0u);
     }
 
-    void start_map(const std::string& name, SecurityDomain domain)
+    void start_map(const std::string& name, SecurityDomain domain) override
     {
       if (domain == SecurityDomain::PRIVATE && !crypto_util)
       {
@@ -105,45 +106,46 @@ namespace ccf::kv
       serialise_internal(name);
     }
 
-    void serialise_raw(const std::vector<uint8_t>& raw)
+    void serialise_raw(const std::vector<uint8_t>& raw) override
     {
       serialise_internal(raw);
     }
 
-    void serialise_view_history(const std::vector<Version>& view_history)
+    void serialise_view_history(
+      const std::vector<Version>& view_history) override
     {
       serialise_internal(view_history);
     }
 
-    template <class Version>
-    void serialise_entry_version(const Version& version)
+    void serialise_entry_version(const Version& version) override
     {
       serialise_internal(version);
     }
 
-    void serialise_count_header(uint64_t ctr)
+    void serialise_count_header(uint64_t ctr) override
     {
       serialise_internal(ctr);
     }
 
-    void serialise_read(const SerialisedKey& k, const Version& version)
+    void serialise_read(const SerialisedKey& k, const Version& version) override
     {
       serialise_internal(k);
       serialise_internal(version);
     }
 
-    void serialise_write(const SerialisedKey& k, const SerialisedValue& v)
+    void serialise_write(
+      const SerialisedKey& k, const SerialisedValue& v) override
     {
       serialise_internal(k);
       serialise_internal(v);
     }
 
-    void serialise_remove(const SerialisedKey& k)
+    void serialise_remove(const SerialisedKey& k) override
     {
       serialise_internal(k);
     }
 
-    std::vector<uint8_t> get_raw_data()
+    std::vector<uint8_t> get_raw_data() override
     {
       // make sure the private buffer is empty when we return
       auto writer_guard_func = [](W* writer) { writer->clear(); };
@@ -156,8 +158,7 @@ namespace ccf::kv
 
     std::vector<uint8_t> serialise_domains(
       const std::vector<uint8_t>& serialised_public_domain,
-      const std::vector<uint8_t>& serialised_private_domain =
-        std::vector<uint8_t>())
+      const std::vector<uint8_t>& serialised_private_domain) override
     {
       size_t size_ = serialised_public_domain.size();
 
@@ -177,7 +178,7 @@ namespace ccf::kv
       size_ += sizeof(SerialisedEntryHeader);
 
       std::vector<uint8_t> entry(size_);
-      auto data_ = entry.data();
+      auto* data_ = entry.data();
 
       serialized::write(data_, size_, entry_header);
 
@@ -210,7 +211,7 @@ namespace ccf::kv
             historical_hint))
       {
         throw KvSerialiserException(fmt::format(
-          "Could not serialise transaction at seqno {}", tx_id.version));
+          "Could not serialise transaction at seqno {}", tx_id.seqno));
       }
 
       serialized::write(
@@ -221,7 +222,7 @@ namespace ccf::kv
         size_,
         serialised_public_domain.data(),
         serialised_public_domain.size());
-      if (encrypted_private_domain.size() > 0)
+      if (!encrypted_private_domain.empty())
       {
         serialized::write(
           data_,
@@ -235,20 +236,20 @@ namespace ccf::kv
   };
 
   template <typename R>
-  class GenericDeserialiseWrapper
+  class GenericDeserialiseWrapper : public KvStoreDeserialiser
   {
   private:
     R public_reader;
     R private_reader;
     R* current_reader;
     std::vector<uint8_t> decrypted_buffer;
-    EntryType entry_type;
+    EntryType entry_type{EntryType::WriteSet};
     // Present systematically in regular transactions, but absent from snapshots
     ccf::ClaimsDigest claims_digest = ccf::no_claims();
     // Present systematically in regular transactions, but absent from snapshots
     std::optional<ccf::crypto::Sha256Hash> commit_evidence_digest =
       std::nullopt;
-    Version version;
+    Version version{0};
     std::shared_ptr<AbstractTxEncryptor> crypto_util;
     std::optional<SecurityDomain> domain_restriction;
 
@@ -282,16 +283,17 @@ namespace ccf::kv
     GenericDeserialiseWrapper(
       std::shared_ptr<AbstractTxEncryptor> e,
       std::optional<SecurityDomain> domain_restriction = std::nullopt) :
-      crypto_util(e),
+      crypto_util(std::move(e)),
       domain_restriction(domain_restriction)
     {}
 
-    ccf::ClaimsDigest&& consume_claims_digest()
+    ccf::ClaimsDigest&& consume_claims_digest() override
     {
       return std::move(claims_digest);
     }
 
     std::optional<ccf::crypto::Sha256Hash>&& consume_commit_evidence_digest()
+      override
     {
       return std::move(commit_evidence_digest);
     }
@@ -300,14 +302,17 @@ namespace ccf::kv
       const uint8_t* data,
       size_t size,
       ccf::kv::Term& term,
-      bool historical_hint = false)
+      EntryFlags& flags,
+      bool historical_hint) override
     {
       current_reader = &public_reader;
-      auto data_ = data;
+      const auto* data_ = data;
       auto size_ = size;
 
       const auto tx_header =
         serialized::read<SerialisedEntryHeader>(data_, size_);
+
+      flags = static_cast<EntryFlags>(tx_header.flags);
 
       if (tx_header.size != size_)
       {
@@ -317,7 +322,7 @@ namespace ccf::kv
           size_));
       }
 
-      auto gcm_hdr_data = data_;
+      const auto* gcm_hdr_data = data_;
 
       switch (tx_header.version)
       {
@@ -337,16 +342,24 @@ namespace ccf::kv
       // public only with no header (test only)
       if (!crypto_util)
       {
-        public_reader.init(data_, size_);
+        public_reader.init(std::span<const uint8_t>(data_, size_));
         read_public_header();
         return version;
       }
 
       serialized::skip(data_, size_, crypto_util->get_header_length());
-      auto public_domain_length = serialized::read<size_t>(data_, size_);
+      const auto public_domain_length = serialized::read<size_t>(data_, size_);
+      if (public_domain_length > size_)
+      {
+        throw std::logic_error(fmt::format(
+          "Public domain length {} exceeds remaining entry size {}",
+          public_domain_length,
+          size_));
+      }
 
-      auto data_public = data_;
-      public_reader.init(data_public, public_domain_length);
+      const auto* data_public = data_;
+      public_reader.init(
+        std::span<const uint8_t>(data_public, public_domain_length));
       read_public_header();
 
       // If the domain is public only, skip the decryption and only return the
@@ -379,11 +392,11 @@ namespace ccf::kv
         return std::nullopt;
       }
 
-      private_reader.init(decrypted_buffer.data(), decrypted_buffer.size());
+      private_reader.init(decrypted_buffer);
       return version;
     }
 
-    std::optional<std::string> start_map()
+    std::optional<std::string> start_map() override
     {
       if (current_reader->is_eos())
       {
@@ -400,56 +413,56 @@ namespace ccf::kv
       return current_reader->template read_next<std::string>();
     }
 
-    Version deserialise_entry_version()
+    Version deserialise_entry_version() override
     {
       return current_reader->template read_next<Version>();
     }
 
-    uint64_t deserialise_read_header()
+    uint64_t deserialise_read_header() override
     {
       return current_reader->template read_next<uint64_t>();
     }
 
-    std::tuple<SerialisedKey, Version> deserialise_read()
+    std::tuple<SerialisedKey, Version> deserialise_read() override
     {
       return {
         current_reader->template read_next<SerialisedKey>(),
         current_reader->template read_next<Version>()};
     }
 
-    uint64_t deserialise_write_header()
+    uint64_t deserialise_write_header() override
     {
       return current_reader->template read_next<uint64_t>();
     }
 
-    std::tuple<SerialisedKey, SerialisedValue> deserialise_write()
+    std::tuple<SerialisedKey, SerialisedValue> deserialise_write() override
     {
       return {
         current_reader->template read_next<SerialisedKey>(),
         current_reader->template read_next<SerialisedValue>()};
     }
 
-    std::vector<uint8_t> deserialise_raw()
+    std::vector<uint8_t> deserialise_raw() override
     {
       return current_reader->template read_next<std::vector<uint8_t>>();
     }
 
-    std::vector<Version> deserialise_view_history()
+    std::vector<Version> deserialise_view_history() override
     {
       return current_reader->template read_next<std::vector<Version>>();
     }
 
-    uint64_t deserialise_remove_header()
+    uint64_t deserialise_remove_header() override
     {
       return current_reader->template read_next<uint64_t>();
     }
 
-    SerialisedKey deserialise_remove()
+    SerialisedKey deserialise_remove() override
     {
       return current_reader->template read_next<SerialisedKey>();
     }
 
-    bool end()
+    bool end() override
     {
       return current_reader->is_eos() && public_reader.is_eos();
     }

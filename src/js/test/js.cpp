@@ -1,14 +1,18 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
+#include "ccf/js/core/wrapped_value.h"
+#include "ccf/js/extensions/ccf/gov.h"
+#include "js/global_class_ids.h"
 #include "js/permissions_checks.h"
 
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 #include <random>
 
+using namespace ccf::js;
+
 TEST_CASE("Check KV Map access")
 {
-  using namespace ccf::js;
   constexpr auto public_internal_table_name = "public:ccf.internal.table";
   constexpr auto private_internal_table_name = "ccf.internal.table";
 
@@ -155,10 +159,10 @@ TEST_CASE("Check KV Map access")
     }
 
     {
-      INFO("Public applications tables cannot even be read");
+      INFO("Public applications tables cannot be read, but can be written to");
       REQUIRE(
         check_kv_map_access(TxAccess::GOV_RW, public_app_table_name) ==
-        KVAccessPermissions::ILLEGAL);
+        KVAccessPermissions::WRITE_ONLY);
     }
 
     {
@@ -168,4 +172,477 @@ TEST_CASE("Check KV Map access")
         KVAccessPermissions::ILLEGAL);
     }
   }
+}
+
+bool str_contains(const std::string& s, std::string_view sv)
+{
+  const auto b = s.find(sv) != std::string::npos;
+  if (!b)
+  {
+    fmt::print("Didn't find\n {}\nin\n {}\n", sv, s);
+  }
+  return b;
+}
+
+bool str_contains(const std::optional<std::string>& s, std::string_view sv)
+{
+  return str_contains(s.value_or(""), sv);
+}
+
+// Returns error string, or nullopt if validation succeeded
+std::optional<std::string> call_validate_constitution(
+  const std::string& constitution,
+  ccf::js::extensions::ExtensionPtr extra_extension = nullptr,
+  const std::string& module_suffix = "")
+{
+  ccf::js::core::Context ctx(TxAccess::GOV_RO);
+
+  ctx.add_extension(std::make_shared<ccf::js::extensions::GovExtension>());
+
+  if (extra_extension != nullptr)
+  {
+    ctx.add_extension(extra_extension);
+  }
+
+  const auto path = "/path/to/constitution";
+
+  auto module = fmt::format(
+                  "export function call_validate () {{\n"
+                  "  let constitution = {};\n"
+                  "  return ccf.gov.validateConstitution(constitution);\n"
+                  "}}",
+                  constitution) +
+    module_suffix;
+
+  auto func = ctx.get_exported_function(module, "call_validate", path);
+
+  const auto result = ctx.call_with_rt_options(
+    func, {}, std::nullopt, ccf::js::core::RuntimeLimitsPolicy::NONE);
+  if (result.is_true())
+  {
+    return std::nullopt;
+  }
+
+  auto [reason, trace] = ctx.error_message();
+  return reason;
+}
+
+int64_t global_side_effect_value = 0;
+
+JSValue js_side_effect(
+  [[maybe_unused]] JSContext* ctx,
+  [[maybe_unused]] JSValueConst this_val,
+  [[maybe_unused]] int argc,
+  [[maybe_unused]] JSValueConst* argv)
+{
+  if (argc != 1)
+  {
+    return JS_ThrowTypeError(ctx, "Passed %d arguments, but expected 1", argc);
+  }
+
+  if (JS_ToInt64(ctx, &global_side_effect_value, argv[0]) < 0)
+  {
+    return ccf::js::core::constants::Exception;
+  }
+
+  return ccf::js::core::constants::Undefined;
+}
+
+class SideEffectExtension : public ccf::js::extensions::ExtensionInterface
+{
+public:
+  size_t n = 0;
+
+  SideEffectExtension() = default;
+
+  void install(ccf::js::core::Context& ctx) override
+  {
+    auto side_effect_func = ctx.new_c_function(js_side_effect, "setGlobal", 1);
+    ctx.get_or_create_global_property("setGlobal", std::move(side_effect_func));
+  }
+};
+
+TEST_CASE("Constitution validation")
+{
+  {
+    INFO("not a string");
+    for (const auto& c : {"1", "1 + 2", "{}", "true", "null"})
+    {
+      const auto error = call_validate_constitution(c);
+      REQUIRE(error.has_value());
+      REQUIRE(str_contains(error, "not a string"));
+    }
+  }
+
+  {
+    INFO("empty");
+    for (const auto& c : {"``", "\"\""})
+    {
+      const auto error = call_validate_constitution(c);
+      REQUIRE(error.has_value());
+      REQUIRE(str_contains(error, "empty"));
+    }
+  }
+
+  {
+    INFO("does not compile");
+    for (const auto& c : {"`this is not syntactically valid JavaScript`"})
+    {
+      const auto error = call_validate_constitution(c);
+      REQUIRE(error.has_value());
+      REQUIRE(str_contains(error, "Failed to compile"));
+    }
+  }
+
+  {
+    INFO("missing validate");
+    for (const auto& c : {R"!!!(`
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+`)!!!"})
+    {
+      const auto error = call_validate_constitution(c);
+      REQUIRE(error.has_value());
+      REQUIRE(str_contains(error, "Failed to find export 'validate'"));
+    }
+  }
+
+  {
+    INFO("missing resolve");
+    for (const auto& c : {R"!!!(`
+export function validate(input) {}
+export function apply(proposal, proposerId) {}
+`)!!!"})
+    {
+      const auto error = call_validate_constitution(c);
+      REQUIRE(error.has_value());
+      REQUIRE(str_contains(error, "Failed to find export 'resolve'"));
+    }
+  }
+
+  {
+    INFO("missing apply");
+    for (const auto& c : {R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+`)!!!"})
+    {
+      const auto error = call_validate_constitution(c);
+      REQUIRE(error.has_value());
+      REQUIRE(str_contains(error, "Failed to find export 'apply'"));
+    }
+  }
+
+  {
+    INFO("valid");
+
+    for (const auto& c :
+         {R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+`)!!!",
+          // Alternate signature for resolve, taking additional proposalId arg
+          R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes, proposalId) {}
+export function apply(proposal, proposerId) {}
+`)!!!"})
+    {
+      const auto error = call_validate_constitution(c);
+      REQUIRE(!error.has_value());
+    }
+  }
+
+  {
+    INFO("sandboxing");
+
+    {
+      INFO(
+        "code in outer module (existing constitution) may have side effects");
+      const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+`)!!!";
+
+      auto side_effect_extension = std::make_shared<SideEffectExtension>();
+      REQUIRE(global_side_effect_value == 0);
+      const auto error = call_validate_constitution(
+        constitution, {side_effect_extension}, "\nsetGlobal(42);");
+      REQUIRE(!error.has_value());
+      REQUIRE(global_side_effect_value == 42);
+    }
+
+    {
+      INFO("code inside proposed constitution has no side effects");
+      const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+setGlobal(100)
+`)!!!";
+
+      auto side_effect_extension = std::make_shared<SideEffectExtension>();
+      REQUIRE(global_side_effect_value == 42);
+      auto error =
+        call_validate_constitution(constitution, {side_effect_extension});
+      REQUIRE(!error.has_value());
+      REQUIRE(global_side_effect_value == 42); // No change
+    }
+  }
+
+  {
+    INFO("error detectability");
+
+    {
+      INFO("global throws");
+      const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+
+throw new Error(`I'm not happy`);
+`)!!!";
+
+      REQUIRE_THROWS(call_validate_constitution(constitution));
+    }
+
+    {
+      INFO("incorrect signatures");
+
+      {
+        INFO("arg count is checked");
+
+        {
+          INFO("validate low");
+          const auto constitution = R"!!!(`
+export function validate() {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+`)!!!";
+
+          auto error = call_validate_constitution(constitution);
+          REQUIRE(error.has_value());
+          REQUIRE(str_contains(
+            error,
+            "exports function validate with 0 args, expected 1 arg (input)"));
+        }
+
+        {
+          INFO("validate high");
+          const auto constitution = R"!!!(`
+export function validate(a, b) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+`)!!!";
+
+          auto error = call_validate_constitution(constitution);
+          REQUIRE(error.has_value());
+          REQUIRE(str_contains(
+            error,
+            "exports function validate with 2 args, expected 1 arg (input)"));
+        }
+
+        {
+          INFO("resolve low");
+          const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(a, b) {}
+export function apply(proposal, proposerId) {}
+`)!!!";
+
+          auto error = call_validate_constitution(constitution);
+          REQUIRE(error.has_value());
+          REQUIRE(str_contains(
+            error,
+            "exports function resolve with 2 args, expected between 3 and 4 "
+            "args (proposal, proposerId, votes[, proposalId])"));
+        }
+
+        {
+          INFO("resolve high");
+          const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(a, b, c, d, e) {}
+export function apply(proposal, proposerId) {}
+`)!!!";
+
+          auto error = call_validate_constitution(constitution);
+          REQUIRE(error.has_value());
+          REQUIRE(str_contains(
+            error,
+            "exports function resolve with 5 args, expected between 3 and 4 "
+            "args (proposal, proposerId, votes[, proposalId])"));
+        }
+
+        {
+          INFO("apply low");
+          const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(a) {}
+`)!!!";
+
+          auto error = call_validate_constitution(constitution);
+          REQUIRE(error.has_value());
+          REQUIRE(str_contains(
+            error,
+            "exports function apply with 1 arg, expected 2 args (proposal, "
+            "proposerId)"));
+        }
+
+        {
+          INFO("apply high");
+          const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(a, b, c) {}
+`)!!!";
+
+          auto error = call_validate_constitution(constitution);
+          REQUIRE(error.has_value());
+          REQUIRE(str_contains(
+            error,
+            "exports function apply with 3 args, expected 2 args (proposal, "
+            "proposerId)"));
+        }
+      }
+
+      {
+        INFO("arg names are not checked");
+        const auto constitution = R"!!!(`
+export function validate(a) {}
+export function resolve(a, b, c) {}
+export function apply(a, b) {}
+`)!!!";
+
+        auto error = call_validate_constitution(constitution);
+        REQUIRE_FALSE(error.has_value());
+      }
+    }
+
+    {
+      INFO("null accesses can't be checked");
+      const auto constitution = R"!!!(`
+export function validate(input) {}
+export function resolve(proposal, proposerId, votes) {}
+export function apply(proposal, proposerId) {}
+
+foo.bar.baz;
+`)!!!";
+
+      auto error = call_validate_constitution(constitution);
+      REQUIRE_FALSE(error.has_value());
+    }
+  }
+}
+
+static int get_ref_count(JSValue v)
+{
+  REQUIRE(JS_VALUE_HAS_REF_COUNT(v));
+  auto* p = (JSRefCountHeader*)JS_VALUE_GET_PTR(v);
+  return p->ref_count;
+}
+
+TEST_CASE("JSWrappedValue copy assignment frees old value")
+{
+  JSRuntime* rt = JS_NewRuntime();
+  REQUIRE(rt != nullptr);
+  JSContext* ctx = JS_NewContext(rt);
+  REQUIRE(ctx != nullptr);
+
+  // Create two distinct JS objects (heap-allocated, so ref-counted)
+  JSValue obj_a = JS_NewObject(ctx); // ref_count == 1
+  JSValue obj_b = JS_NewObject(ctx); // ref_count == 1
+
+  // Keep raw copies so we can inspect ref counts after wrapping
+  JSValue raw_a = JS_DupValue(ctx, obj_a); // ref_count(a) == 2
+  JSValue raw_b = JS_DupValue(ctx, obj_b); // ref_count(b) == 2
+
+  {
+    // Wrap both via the rvalue constructor (takes ownership, no dup)
+    ccf::js::core::JSWrappedValue wa(ctx, std::move(obj_a));
+    ccf::js::core::JSWrappedValue wb(ctx, std::move(obj_b));
+
+    // raw_a has ref 2 (raw_a + wa), raw_b has ref 2 (raw_b + wb)
+    REQUIRE(get_ref_count(raw_a) == 2);
+    REQUIRE(get_ref_count(raw_b) == 2);
+
+    // Copy-assign: wa = wb.  This should free the old obj_a held by wa
+    wa = wb;
+
+    // obj_a should have been freed by the assignment, leaving only raw_a
+    REQUIRE(get_ref_count(raw_a) == 1);
+    // obj_b should now be referenced by wa, wb, and raw_b
+    REQUIRE(get_ref_count(raw_b) == 3);
+  }
+  // After both wrappers are destroyed, only our raw refs should remain
+  REQUIRE(get_ref_count(raw_a) == 1);
+  REQUIRE(get_ref_count(raw_b) == 1);
+
+  JS_FreeValue(ctx, raw_a);
+  JS_FreeValue(ctx, raw_b);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
+TEST_CASE("Context::to_str preserves embedded NUL bytes")
+{
+  ccf::js::core::Context ctx(TxAccess::APP_RW);
+
+  // JS strings are not NUL-terminated internally, and may contain arbitrary
+  // embedded NUL bytes. Constructing a std::string from the NUL-terminated
+  // buffer returned by JS_ToCString (rather than from the buffer and its
+  // real length, as returned by JS_ToCStringLen) would silently truncate at
+  // the first embedded NUL. Regression test for that.
+  const std::string input("abc\0def", 7);
+  REQUIRE(input.size() == 7);
+
+  auto js_str = ctx.new_string_len(input.data(), input.size());
+  REQUIRE(js_str.is_str());
+
+  {
+    INFO("to_str(const JSWrappedValue&)");
+    auto result = ctx.to_str(js_str);
+    REQUIRE(result.has_value());
+    REQUIRE(*result == input);
+  }
+
+  {
+    INFO("to_str(const JSValue&)");
+    auto result = ctx.to_str(js_str.val);
+    REQUIRE(result.has_value());
+    REQUIRE(*result == input);
+  }
+
+  {
+    INFO("to_str(const JSValue&, size_t&)");
+    size_t len = 0;
+    auto result = ctx.to_str(js_str.val, len);
+    REQUIRE(result.has_value());
+    REQUIRE(len == input.size());
+    REQUIRE(*result == input);
+  }
+
+  {
+    INFO("to_str(const JSAtom&)");
+    JSAtom atom = JS_NewAtomLen(ctx, input.data(), input.size());
+    auto result = ctx.to_str(atom);
+    JS_FreeAtom(ctx, atom);
+    REQUIRE(result.has_value());
+    REQUIRE(*result == input);
+  }
+}
+
+int main(int argc, char** argv)
+{
+  ccf::js::register_class_ids();
+
+  doctest::Context context;
+  context.applyCommandLine(argc, argv);
+  int res = context.run();
+  if (context.shouldExit())
+    return res;
+  return res;
 }

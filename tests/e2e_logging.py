@@ -1,80 +1,75 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.network
-import suite.test_requirements as reqs
-import infra.logging_app as app
-import infra.e2e_args
-from infra.tx_status import TxStatus
-import infra.checker
-import infra.jwt_issuer
-import infra.proc
-import http
-from http.client import HTTPResponse
-import ssl
-import socket
-import os
-from collections import defaultdict
-import time
-import json
+import base64
+import copy
 import hashlib
-import infra.clients
-from infra.log_capture import flush_info
-import ccf.receipt
-from ccf.tx_id import TxID
-from cryptography.x509 import load_pem_x509_certificate
-from cryptography.hazmat.backends import default_backend
-from cryptography.exceptions import InvalidSignature
-from cryptography.x509 import ObjectIdentifier
-import urllib.parse
+import http
+import json
+import os
 import random
 import re
-import infra.crypto
-from infra.runner import ConcurrentRunner
-from hashlib import sha256
-from infra.member import AckException
-from types import MappingProxyType
-import threading
-import copy
-import programmability
-import e2e_common_endpoints
+import socket
+import ssl
 import subprocess
+import threading
+import time
+import urllib.parse
+from collections import defaultdict
+from datetime import datetime, timezone
+from hashlib import sha256
+from http.client import HTTPResponse
+from types import MappingProxyType
+from typing import ClassVar
 
+import cbor2
+import ccf.receipt
+import e2e_common_endpoints
+import infra.checker
+import infra.clients
+import infra.crypto
+import infra.e2e_args
+import infra.jwt_issuer
+import infra.logging_app as app
+import infra.network
+import infra.proc
+import programmability
+import suite.test_requirements as reqs
+from ccf.tx_id import TxID
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.backends import default_backend
+from cryptography.x509 import ObjectIdentifier, load_pem_x509_certificate
+from infra.log_capture import flush_info
+from infra.member import AckException
+from infra.runner import ConcurrentRunner
+from infra.tx_status import TxStatus
 from loguru import logger as LOG
 
 
-def show_cert(name, cert):
-    from OpenSSL.crypto import dump_certificate, FILETYPE_TEXT
+def get_service_key(network):
+    service_cert_path = os.path.join(network.common_dir, "service_cert.pem")
+    with open(service_cert_path, "rb") as service_cert_file:
+        service_cert = load_pem_x509_certificate(
+            service_cert_file.read(), default_backend()
+        )
+    return service_cert.public_key()
 
-    dc = dump_certificate(FILETYPE_TEXT, cert).decode("unicode_escape")
-    LOG.info(f"{name} cert: {dc}")
 
-
-def verify_endorsements_openssl(service_cert, receipt):
-    from OpenSSL.crypto import (
-        load_certificate,
-        FILETYPE_PEM,
-        X509,
-        X509Store,
-        X509StoreContext,
-    )
-
-    store = X509Store()
-
-    # pyopenssl does not support X509_V_FLAG_NO_CHECK_TIME. For recovery of expired
-    # services and historical receipt, we want to ignore the validity time. 0x200000
-    # is the bitmask for this option in more recent versions of OpenSSL.
-    X509_V_FLAG_NO_CHECK_TIME = 0x200000
-    store.set_flags(X509_V_FLAG_NO_CHECK_TIME)
-
-    store.add_cert(X509.from_cryptography(service_cert))
-    chain = None
-    if "service_endorsements" in receipt:
-        chain = []
-        for endo in receipt["service_endorsements"]:
-            chain.append(load_certificate(FILETYPE_PEM, endo.encode()))
-    node_cert_pem = receipt["cert"].encode()
-    ctx = X509StoreContext(store, load_certificate(FILETYPE_PEM, node_cert_pem), chain)
-    ctx.verify_certificate()  # (throws on error)
+def fetch_and_verify_cose_receipt(
+    client, view, seqno, service_key, claim_digest, timeout=3.0
+):
+    start_time = time.time()
+    while time.time() < (start_time + timeout):
+        rc = client.get(f"/node/receipt/cose?transaction_id={view}.{seqno}")
+        if rc.status_code == http.HTTPStatus.OK:
+            ccf.receipt.verify_cose(rc.body.data(), service_key, claim_digest)
+            return rc
+        elif rc.status_code == http.HTTPStatus.NOT_FOUND:
+            return rc
+        elif rc.status_code == http.HTTPStatus.ACCEPTED:
+            time.sleep(0.1)
+        else:
+            assert False, rc
+    assert False, f"Timed out fetching COSE receipt for {view}.{seqno}"
 
 
 def verify_receipt(
@@ -84,6 +79,7 @@ def verify_receipt(
     generic=True,
     skip_endorsement_check=False,
     is_signature_tx=False,
+    skip_cert_chain_checks=False,
 ):
     """
     Raises an exception on failure
@@ -91,16 +87,26 @@ def verify_receipt(
 
     node_cert = load_pem_x509_certificate(receipt["cert"].encode(), default_backend())
 
-    if not skip_endorsement_check:
-        service_endorsements = []
-        if "service_endorsements" in receipt:
-            service_endorsements = [
-                load_pem_x509_certificate(endo.encode(), default_backend())
-                for endo in receipt["service_endorsements"]
-            ]
-        ccf.receipt.check_endorsements(node_cert, service_cert, service_endorsements)
+    service_endorsements = []
+    if "service_endorsements" in receipt:
+        service_endorsements = [
+            load_pem_x509_certificate(endorsement.encode(), default_backend())
+            for endorsement in receipt["service_endorsements"]
+        ]
 
-        verify_endorsements_openssl(service_cert, receipt)
+    if not skip_endorsement_check:
+        ccf.receipt.check_endorsements(
+            node_cert,
+            service_cert,
+            service_endorsements,
+        )
+
+    if not skip_cert_chain_checks:
+        ccf.receipt.check_cert_chain(
+            node_cert,
+            service_cert,
+            service_endorsements,
+        )
 
     if claims is not None:
         assert "leaf_components" in receipt
@@ -112,15 +118,11 @@ def verify_receipt(
             assert "claims_digest" not in receipt["leaf_components"]
         claims_digest = sha256(claims).digest()
 
-        leaf = (
-            sha256(
-                bytes.fromhex(receipt["leaf_components"]["write_set_digest"])
-                + commit_evidence_digest
-                + claims_digest
-            )
-            .digest()
-            .hex()
-        )
+        leaf = sha256(
+            bytes.fromhex(receipt["leaf_components"]["write_set_digest"])
+            + commit_evidence_digest
+            + claims_digest
+        ).hexdigest()
     elif not is_signature_tx:
         assert "leaf_components" in receipt, receipt
         assert "write_set_digest" in receipt["leaf_components"]
@@ -134,11 +136,9 @@ def verify_receipt(
             if "claims_digest" in receipt["leaf_components"]
             else b""
         )
-        leaf = (
-            sha256(write_set_digest + commit_evidence_digest + claims_digest)
-            .digest()
-            .hex()
-        )
+        leaf = sha256(
+            write_set_digest + commit_evidence_digest + claims_digest
+        ).hexdigest()
     else:
         assert is_signature_tx
         leaf = receipt["leaf"]
@@ -356,13 +356,12 @@ def test_protocols(network, args):
                 "-H",
                 "Connection: Upgrade",
             ],
-            "http_status": "200",
-            "http_version": "1.1",
         },
         # HTTP3 is not supported by curl _or_ CCF
         "--http3": {
             "errors": [
                 "the installed libcurl version doesn't support this",
+                "the installed libcurl version does not support this",
                 "option --http3: is unknown",
             ]
         },
@@ -374,25 +373,20 @@ def test_protocols(network, args):
                 "--http1.0": {"errors": ["Empty reply from server"]},
                 "--http1.1": {"errors": ["Empty reply from server"]},
                 # TLS handshake negotiates HTTP/2
-                "--http2": {"http_status": "200", "http_version": "1.1"},
-                "--http2-prior-knowledge": {
-                    "http_status": "200",
-                    "http_version": "1.1",
-                },
+                "--http2": {},
+                "--http2-prior-knowledge": {},
             }
         )
     else:  # HTTP/1.1
         protocols.update(
             {
                 # HTTP/1.x requests succeed, as HTTP/1.1
-                "--http1.0": {"http_status": "200", "http_version": "1.1"},
-                "--http1.1": {"http_status": "200", "http_version": "1.1"},
+                "--http1.0": {},
+                "--http1.1": {},
                 # TLS handshake negotiates HTTP/1.1
-                "--http2": {"http_status": "200", "http_version": "1.1"},
-                "--http2-prior-knowledge": {
-                    "http_status": "200",
-                    "http_version": "1.1",
-                },
+                "--http2": {},
+                # This is disabled because the behaviour of curl differs from version 8.10, so we do not get consistent results across platforms
+                # "--http2-prior-knowledge": {},
             }
         )
 
@@ -664,6 +658,13 @@ def test_multi_auth(network, args):
             assert r.body.text().startswith("Member TLS cert"), r.body.text()
             require_new_response(r)
 
+        # Create a keypair that is not a user
+        network.create_user("not_a_user", args.participants_curve, record=False)
+        with primary.client("not_a_user") as c:
+            r = c.post("/app/multi_auth")
+            assert r.body.text().startswith("Any TLS cert"), r.body.text()
+            require_new_response(r)
+
         LOG.info("Authenticate via JWT token")
         jwt_issuer = infra.jwt_issuer.JwtIssuer()
         jwt_issuer.register(network)
@@ -830,28 +831,46 @@ def test_historical_query(network, args):
 @reqs.description("Read historical receipts")
 @reqs.supports_methods("/app/log/private", "/app/log/private/historical_receipt")
 def test_historical_receipts(network, args):
+    cose_only = args.package.endswith("_cose_only")
     primary, backups = network.find_nodes()
     TXS_COUNT = 5
     start_idx = network.txs.idx + 1
     network.txs.issue(network, number_txs=TXS_COUNT)
-    for idx in range(start_idx, TXS_COUNT + start_idx):
-        for node in [primary, backups[0]]:
-            first_msg = network.txs.priv[idx][0]
-            first_receipt = network.txs.get_receipt(
-                node, idx, first_msg["seqno"], first_msg["view"]
-            )
-            r = first_receipt.json()["receipt"]
-            verify_receipt(r, network.cert)
 
-    # receipt.verify() and ccf.receipt.check_endorsement() raise if they fail, but do not return anything
-    verified = True
-    try:
-        ccf.receipt.verify(
-            hashlib.sha256(b"").hexdigest(), r["signature"], network.cert
-        )
-    except InvalidSignature:
-        verified = False
-    assert not verified
+    if cose_only:
+        service_key = get_service_key(network)
+        for idx in range(start_idx, TXS_COUNT + start_idx):
+            for node in [primary, backups[0]]:
+                first_msg = network.txs.priv[idx][0]
+                with node.client("user0") as c:
+                    infra.commit.wait_for_commit(
+                        c, first_msg["seqno"], first_msg["view"], timeout=3
+                    )
+                    fetch_and_verify_cose_receipt(
+                        c,
+                        first_msg["view"],
+                        first_msg["seqno"],
+                        service_key,
+                        b"\0" * 32,
+                    )
+    else:
+        for idx in range(start_idx, TXS_COUNT + start_idx):
+            for node in [primary, backups[0]]:
+                first_msg = network.txs.priv[idx][0]
+                first_receipt = network.txs.get_receipt(
+                    node, idx, first_msg["seqno"], first_msg["view"]
+                )
+                r = first_receipt.json()["receipt"]
+                verify_receipt(r, network.cert)
+
+        verified = True
+        try:
+            ccf.receipt.verify(
+                hashlib.sha256(b"").hexdigest(), r["signature"], network.cert
+            )
+        except InvalidSignature:
+            verified = False
+        assert not verified
 
     return network
 
@@ -859,91 +878,167 @@ def test_historical_receipts(network, args):
 @reqs.description("Read historical receipts with claims")
 @reqs.supports_methods("/app/log/public", "/app/log/public/historical_receipt")
 def test_historical_receipts_with_claims(network, args):
+    cose_only = args.package.endswith("_cose_only")
     primary, backups = network.find_nodes()
     TXS_COUNT = 5
     start_idx = network.txs.idx + 1
     network.txs.issue(network, number_txs=TXS_COUNT, record_claim=True)
-    for idx in range(start_idx, TXS_COUNT + start_idx):
-        for node in [primary, backups[0]]:
-            first_msg = network.txs.pub[idx][0]
-            first_receipt = network.txs.get_receipt(
-                node, idx, first_msg["seqno"], first_msg["view"], domain="public"
-            )
-            r = first_receipt.json()["receipt"]
-            verify_receipt(r, network.cert, first_receipt.json()["msg"].encode())
 
-    # receipt.verify() and ccf.receipt.check_endorsement() raise if they fail, but do not return anything
-    verified = True
-    try:
-        ccf.receipt.verify(
-            hashlib.sha256(b"").hexdigest(), r["signature"], network.cert
-        )
-    except InvalidSignature:
-        verified = False
-    assert not verified
+    if cose_only:
+        service_key = get_service_key(network)
+        for idx in range(start_idx, TXS_COUNT + start_idx):
+            for node in [primary, backups[0]]:
+                first_msg = network.txs.pub[idx][0]
+                claim_digest = sha256(first_msg["msg"].encode()).digest()
+                with node.client("user0") as c:
+                    infra.commit.wait_for_commit(
+                        c, first_msg["seqno"], first_msg["view"], timeout=3
+                    )
+                    fetch_and_verify_cose_receipt(
+                        c,
+                        first_msg["view"],
+                        first_msg["seqno"],
+                        service_key,
+                        claim_digest,
+                    )
+    else:
+        for idx in range(start_idx, TXS_COUNT + start_idx):
+            for node in [primary, backups[0]]:
+                first_msg = network.txs.pub[idx][0]
+                first_receipt = network.txs.get_receipt(
+                    node, idx, first_msg["seqno"], first_msg["view"], domain="public"
+                )
+                r = first_receipt.json()["receipt"]
+                verify_receipt(r, network.cert, first_receipt.json()["msg"].encode())
+
+        verified = True
+        try:
+            ccf.receipt.verify(
+                hashlib.sha256(b"").hexdigest(), r["signature"], network.cert
+            )
+        except InvalidSignature:
+            verified = False
+        assert not verified
 
     return network
 
 
 @reqs.description("Read genesis receipt")
 def test_genesis_receipt(network, args):
+    cose_only = args.package.endswith("_cose_only")
     primary, _ = network.find_nodes()
 
-    genesis_receipt = primary.get_receipt(2, 1)
-    verify_receipt(genesis_receipt.json(), network.cert, generic=True)
-    claims_digest = genesis_receipt.json()["leaf_components"]["claims_digest"]
-
-    with primary.client() as client:
-        constitution = client.get(
-            "/gov/service/constitution?api-version=2023-06-01-preview"
-        ).body.text()
-
-    if args.package == "samples/apps/logging/liblogging":
-        # Only the logging app sets a claim on the genesis
-        assert claims_digest == sha256(constitution.encode()).hexdigest()
+    if cose_only:
+        service_key = get_service_key(network)
+        with primary.client("user0") as c:
+            with primary.client() as gov_c:
+                constitution = gov_c.get(
+                    "/gov/service/constitution?api-version=2023-06-01-preview"
+                ).body.text()
+            if args.package.startswith("samples/apps/logging/logging"):
+                genesis_claim_digest = sha256(constitution.encode()).digest()
+            else:
+                genesis_claim_digest = b"\0" * 32
+            rc = fetch_and_verify_cose_receipt(
+                c, 2, 1, service_key, genesis_claim_digest
+            )
+            assert rc.status_code == http.HTTPStatus.OK, rc
     else:
-        assert (
-            claims_digest
-            == "0000000000000000000000000000000000000000000000000000000000000000"
-        )
+        genesis_receipt = primary.get_receipt(2, 1)
+        verify_receipt(genesis_receipt.json(), network.cert, generic=True)
+        claims_digest = genesis_receipt.json()["leaf_components"]["claims_digest"]
+
+        with primary.client() as client:
+            constitution = client.get(
+                "/gov/service/constitution?api-version=2023-06-01-preview"
+            ).body.text()
+
+        if args.package.startswith("samples/apps/logging/logging"):
+            # Only the logging app sets a claim on the genesis
+            assert claims_digest == sha256(constitution.encode()).hexdigest()
+        else:
+            assert (
+                claims_digest
+                == "0000000000000000000000000000000000000000000000000000000000000000"
+            )
 
     return network
 
 
 @reqs.description("Read CBOR Merkle Proof")
-def test_cbor_merkle_proof(network, args):
+def test_cbor_receipts(network, args):
     primary, _ = network.find_nodes()
 
     with primary.client("user0") as client:
         r = client.get("/commit")
         assert r.status_code == http.HTTPStatus.OK
         last_txid = TxID.from_str(r.body.json()["transaction_id"])
+        found_receipt = False
 
         for seqno in range(last_txid.seqno, last_txid.seqno - 10, -1):
             txid = f"{last_txid.view}.{seqno}"
-            LOG.debug(f"Trying to get CBOR Merkle proof for txid {txid}")
+            LOG.debug(f"Trying to get COSE receipt for txid {txid}")
             max_retries = 10
-            found_proof = False
             for _ in range(max_retries):
                 r = client.get(
-                    "/log/public/cbor_merkle_proof",
+                    "/log/public/cose_receipt",
                     headers={infra.clients.CCF_TX_ID_HEADER: txid},
                     log_capture=[],  # Do not emit raw binary to stdout
                 )
                 if r.status_code == http.HTTPStatus.OK:
-                    cbor_proof = r.body.data()
-                    cbor_proof_filename = os.path.join(
-                        network.common_dir, f"proof_{txid}.cbor"
+                    cose_receipt = r.body.data()
+                    uhdr = cbor2.loads(cose_receipt).value[1]
+                    VDP_KEY = 396
+                    if VDP_KEY not in uhdr:
+                        # Signature TX: valid receipt with empty UHDR, skip to next seqno
+                        LOG.debug(
+                            f"Transaction {txid} is a signature TX (empty UHDR), skipping"
+                        )
+                        break
+                    found_receipt = True
+                    proofs = uhdr[VDP_KEY][-1]
+                    assert len(proofs) > 0, "No Merkle proofs found in receipt"
+
+                    r = client.get(
+                        "/log/public/verify_cose_receipt",
+                        cose_receipt,
+                        headers={"Content-Type": "application/cose"},
                     )
-                    with open(cbor_proof_filename, "wb") as f:
-                        f.write(cbor_proof)
-                    subprocess.run(
-                        ["cddl", "../cddl/ccf-tree-alg.cddl", "v", cbor_proof_filename],
-                        check=True,
+                    assert (
+                        r.status_code == http.HTTPStatus.NO_CONTENT
+                    ), f"Failed to verify COSE receipt for txid {txid}: {r.status_code} {r.body.text()}"
+
+                    for cbor_proof in proofs:
+                        cbor_proof_filename = os.path.join(
+                            network.common_dir, f"proof_{txid}.cbor"
+                        )
+                        with open(cbor_proof_filename, "wb") as f:
+                            f.write(cbor_proof)
+                        subprocess.run(
+                            [
+                                "cddl",
+                                "../cddl/ccf-tree-alg.cddl",
+                                "v",
+                                cbor_proof_filename,
+                            ],
+                            check=True,
+                        )
+                        LOG.debug(f"Checked CBOR Merkle proof for txid {txid}")
+
+                    # change last four bytes of cose_receipt to 0000 and call verify again
+                    corrupted_receipt = cose_receipt[:-4] + b"\x00\x00\x00\x00"
+                    r = client.get(
+                        "/log/public/verify_cose_receipt",
+                        corrupted_receipt,
+                        headers={"Content-Type": "application/cose"},
                     )
-                    found_proof = True
-                    LOG.debug(f"Checked CBOR Merkle proof for txid {txid}")
-                    break
+                    assert (
+                        r.status_code != http.HTTPStatus.NO_CONTENT
+                    ), f"Corrupted COSE receipt should not verify for txid {txid}"
+                    LOG.debug(f"Verified that corrupted receipt fails for txid {txid}")
+
+                    break  # inner, found a receipt
+
                 elif r.status_code == http.HTTPStatus.ACCEPTED:
                     LOG.debug(f"Transaction {txid} accepted, retrying")
                     time.sleep(0.1)
@@ -954,10 +1049,118 @@ def test_cbor_merkle_proof(network, args):
                 assert (
                     False
                 ), f"Failed to get receipt for txid {txid} after {max_retries} retries"
-            if found_proof:
+
+        assert (
+            found_receipt
+        ), "Failed to find a non-signature in the last 10 transactions"
+
+    return network
+
+
+@reqs.description("Check COSE signature CDDL model")
+def test_cose_signature_schema(network, args):
+    primary, _ = network.find_nodes()
+
+    with primary.client("user0") as client:
+        r = client.get("/commit")
+        assert r.status_code == http.HTTPStatus.OK
+        txid = TxID.from_str(r.body.json()["transaction_id"])
+        max_retries = 10
+        for _ in range(max_retries):
+            response = client.get(
+                "/log/public/cose_signature",
+                headers={infra.clients.CCF_TX_ID_HEADER: f"{txid.view}.{txid.seqno}"},
+            )
+
+            if response.status_code == http.HTTPStatus.OK:
+                signature = response.body.json()["cose_signature"]
+                signature = base64.b64decode(signature)
+                signature_filename = os.path.join(
+                    network.common_dir, f"cose_signature_{txid}.cose"
+                )
+                with open(signature_filename, "wb") as f:
+                    f.write(signature)
+                subprocess.run(
+                    [
+                        "cddl",
+                        "../cddl/ccf-merkle-tree-cose-signature.cddl",
+                        "v",
+                        signature_filename,
+                    ],
+                    check=True,
+                )
+                LOG.debug(f"Checked COSE signature schema for txid {txid}")
+                break
+            elif response.status_code == http.HTTPStatus.ACCEPTED:
+                LOG.debug(f"Transaction {txid} accepted, retrying")
+                time.sleep(0.1)
+            else:
+                LOG.error(f"Failed to get COSE signature for txid {txid}")
                 break
         else:
-            assert False, "Failed to find a non-signature in the last 10 transactions"
+            assert (
+                False
+            ), f"Failed to get receipt for txid {txid} after {max_retries} retries"
+
+    return network
+
+
+@reqs.description("Check COSE receipt CDDL schema")
+def test_cose_receipt_schema(network, args):
+    primary, _ = network.find_nodes()
+
+    # Make sure the last transaction does not contain application claims
+    member = network.consortium.get_any_active_member()
+    r = member.update_ack_state_digest(primary)
+    with primary.client() as client:
+        client.wait_for_commit(r)
+
+    txid = r.headers[infra.clients.CCF_TX_ID_HEADER]
+
+    service_cert_path = os.path.join(network.common_dir, "service_cert.pem")
+    with open(service_cert_path, "rb") as service_cert_file:
+        service_cert = load_pem_x509_certificate(
+            service_cert_file.read(), default_backend()
+        )
+    service_key = service_cert.public_key()
+
+    with primary.client("user0") as client:
+        LOG.debug(f"Trying to get COSE receipt for txid {txid}")
+        max_retries = 10
+        for _ in range(max_retries):
+            r = client.get(
+                "/log/public/cose_receipt",
+                headers={infra.clients.CCF_TX_ID_HEADER: txid},
+                log_capture=[],  # Do not emit raw binary to stdout
+            )
+
+            if r.status_code == http.HTTPStatus.OK:
+                cbor_proof = r.body.data()
+                receipt_phdr = ccf.receipt.verify_cose(
+                    cbor_proof, service_key, b"\0" * 32
+                )
+                assert receipt_phdr[15][1] == "service.example.com"
+                assert receipt_phdr[15][2] == "ledger.signature"
+                cbor_proof_filename = os.path.join(
+                    network.common_dir, f"receipt_{txid}.cose"
+                )
+                with open(cbor_proof_filename, "wb") as f:
+                    f.write(cbor_proof)
+                subprocess.run(
+                    ["cddl", "../cddl/ccf-receipt.cddl", "v", cbor_proof_filename],
+                    check=True,
+                )
+                LOG.debug(f"Checked COSE receipt for txid {txid}")
+                break
+            elif r.status_code == http.HTTPStatus.ACCEPTED:
+                LOG.debug(f"Transaction {txid} accepted, retrying")
+                time.sleep(0.1)
+            else:
+                assert False, r
+        else:
+            assert (
+                False
+            ), f"Failed to get receipt for txid {txid} after {max_retries} retries"
 
     return network
 
@@ -1037,8 +1240,8 @@ def test_historical_query_range(network, args):
 
         # - Try the first invalid seqno.
         # !! If implicit TX occurs during this time, fetch last TX id and retry.
-        attemtps = 5
-        for _ in range(0, attemtps):
+        attempts = 5
+        for _ in range(attempts):
             r = c.get(
                 f"/app/log/public/historical/range?to_seqno={last_valid_seqno+1}&id={id_a}"
             )
@@ -1097,6 +1300,100 @@ def test_historical_query_range(network, args):
         assert len(entries_a) == 0
         assert len(entries_b) == 0
         assert len(entries_c) == 0
+
+    return network
+
+
+@reqs.description("Read paginated range of historical state across index buckets")
+@reqs.supports_methods("/app/log/public", "/app/log/public/historical/range")
+@reqs.at_least_n_nodes(1)
+def test_historical_query_range_pagination(network, args):
+    # Arbitrary distinct log IDs used to create sparse writes for one ID, with
+    # filler writes to extend the ledger between them.
+    SPARSE_ENTRY_ID = 1542
+    FILLER_ENTRY_ID = 1543
+
+    expected_entries = []
+    first_seqno = None
+    last_seqno = None
+    view = None
+
+    primary, _ = network.find_primary()
+    with primary.client("user0") as c:
+        # With the test app config's page and bucket sizes of 5, 50 writes
+        # reliably span multiple pages and indexing buckets.
+        ENTRY_COUNT = 50
+        target_write_positions = {0, ENTRY_COUNT - 1}
+        for i in range(ENTRY_COUNT):
+            idx = SPARSE_ENTRY_ID if i in target_write_positions else FILLER_ENTRY_ID
+            msg = f"Multi-bucket indexing message {i}"
+            r = c.post(
+                "/app/log/public",
+                {
+                    "id": idx,
+                    "msg": msg,
+                },
+                log_capture=[],
+            )
+            assert r.status_code == http.HTTPStatus.OK
+
+            if first_seqno is None:
+                first_seqno = r.seqno
+
+            if idx == SPARSE_ENTRY_ID:
+                expected_entries.append(
+                    {
+                        "id": idx,
+                        "msg": msg,
+                        "seqno": r.seqno,
+                    }
+                )
+
+            last_seqno = r.seqno
+            view = r.view
+
+        infra.commit.wait_for_commit(c, seqno=last_seqno, view=view, timeout=3)
+
+        path = (
+            f"/app/log/public/historical/range?from_seqno={first_seqno}"
+            f"&to_seqno={last_seqno}&id={SPARSE_ENTRY_ID}"
+        )
+        entries = []
+        page_count = 0
+        pages_with_next_link = 0
+        empty_page_count = 0
+        timeout = 30
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            r = c.get(path, log_capture=[])
+            if r.status_code == http.HTTPStatus.OK:
+                body = r.body.json()
+                page_count += 1
+
+                page_entries = body["entries"]
+                entries += page_entries
+                if not page_entries:
+                    empty_page_count += 1
+
+                next_link = body.get("@nextLink")
+                if next_link:
+                    pages_with_next_link += 1
+                    path = next_link
+                    continue
+
+                break
+            elif r.status_code == http.HTTPStatus.ACCEPTED:
+                time.sleep(0.1)
+                continue
+            else:
+                assert False, r
+        else:
+            assert False, f"Historical range did not complete within {timeout}s"
+
+    assert entries == expected_entries
+    assert page_count > 2
+    assert pages_with_next_link == page_count - 1
+    assert empty_page_count > 0
 
     return network
 
@@ -1219,7 +1516,7 @@ def escaped_query_tests(c, endpoint):
             unescaped_query,
         )
 
-    all_chars = list(range(0, 255))
+    all_chars = list(range(255))
     max_args = 50
     for ichars in [
         all_chars[i : i + max_args] for i in range(0, len(all_chars), max_args)
@@ -1289,7 +1586,7 @@ def test_forwarding_frontends(network, args):
     else:
         assert args.http2 is False
 
-    if args.package == "samples/apps/logging/liblogging" and not args.http2:
+    if args.package.startswith("samples/apps/logging/logging") and not args.http2:
         with backup.client("user0") as c:
             escaped_query_tests(c, "request_query")
 
@@ -1323,7 +1620,7 @@ def test_long_lived_forwarding(network, args):
     primary, _ = network.find_primary()
 
     # Create a new node
-    new_node = network.create_node("local://localhost")
+    new_node = network.create_node()
 
     # Message limit must be high enough that the hard limit will not be reached
     # by the combined work of all threads. Note that each thread produces multiple
@@ -1336,7 +1633,7 @@ def test_long_lived_forwarding(network, args):
 
     new_node_args = copy.deepcopy(args)
     new_node_args.node_to_node_message_limit = message_limit
-    network.join_node(new_node, args.package, new_node_args)
+    network.join_node(new_node, args.package, new_node_args, from_snapshot=False)
     network.trust_node(new_node, new_node_args)
 
     # Send many messages to new node over long-lived connections,
@@ -1489,7 +1786,7 @@ def test_view_history(network, args):
 
 class SentTxs:
     # view -> seqno -> status
-    txs = defaultdict(lambda: defaultdict(lambda: TxStatus.Unknown))
+    txs: ClassVar = defaultdict(lambda: defaultdict(lambda: TxStatus.Unknown))
 
     @staticmethod
     def update_status(view, seqno, status=None):
@@ -1503,10 +1800,10 @@ class SentTxs:
         if status != current_status:
             valid = False
             # Only valid transitions from Unknown to any, or Pending to Committed/Invalid
-            if current_status == TxStatus.Unknown:
-                valid = True
-            elif current_status == TxStatus.Pending and (
-                status == TxStatus.Committed or status == TxStatus.Invalid
+            if (
+                current_status == TxStatus.Unknown
+                or current_status == TxStatus.Pending
+                and (status == TxStatus.Committed or status == TxStatus.Invalid)
             ):
                 valid = True
 
@@ -1575,25 +1872,36 @@ def test_tx_statuses(network, args):
 @reqs.at_least_n_nodes(2)
 @app.scoped_txs()
 def test_receipts(network, args):
+    cose_only = args.package.endswith("_cose_only")
     primary, _ = network.find_primary_and_any_backup()
     msg = "Hello world"
 
     LOG.info("Write/Read on primary")
-    with primary.client("user0") as c:
-        for j in range(10):
-            idx = j + 10000
-            r = network.txs.issue(network, 1, idx=idx, send_public=False, msg=msg)
-            start_time = time.time()
-            while time.time() < (start_time + 3.0):
-                rc = c.get(f"/app/receipt?transaction_id={r.view}.{r.seqno}")
-                if rc.status_code == http.HTTPStatus.OK:
-                    receipt = rc.body.json()
-                    verify_receipt(receipt, network.cert)
-                    break
-                elif rc.status_code == http.HTTPStatus.ACCEPTED:
-                    time.sleep(0.5)
-                else:
-                    assert False, rc
+    if cose_only:
+        service_key = get_service_key(network)
+        with primary.client("user0") as c:
+            for j in range(10):
+                idx = j + 10000
+                r = network.txs.issue(network, 1, idx=idx, send_public=False, msg=msg)
+                fetch_and_verify_cose_receipt(
+                    c, r.view, r.seqno, service_key, b"\0" * 32
+                )
+    else:
+        with primary.client("user0") as c:
+            for j in range(10):
+                idx = j + 10000
+                r = network.txs.issue(network, 1, idx=idx, send_public=False, msg=msg)
+                start_time = time.time()
+                while time.time() < (start_time + 3.0):
+                    rc = c.get(f"/app/receipt?transaction_id={r.view}.{r.seqno}")
+                    if rc.status_code == http.HTTPStatus.OK:
+                        receipt = rc.body.json()
+                        verify_receipt(receipt, network.cert)
+                        break
+                    elif rc.status_code == http.HTTPStatus.ACCEPTED:
+                        time.sleep(0.5)
+                    else:
+                        assert False, rc
 
     return network
 
@@ -1609,6 +1917,16 @@ def test_random_receipts(
     node=None,
     log_capture=None,
 ):
+    cose_only = args.package.endswith("_cose_only")
+
+    # Extract claims digest from a COSE receipt leaf - needed because
+    # randomly sampled seqnos may hit any TX and we don't know its claims.
+    def claims_digest_from_receipt(receipt_bytes):
+        receipt = cbor2.loads(receipt_bytes)
+        _, uhdr, _, _ = receipt.value
+        proof = uhdr[396][-1]  # VDP / inclusion proofs
+        return cbor2.loads(proof[0])[1][2]  # leaf[2] = claims_digest
+
     if node is None:
         node, _ = network.find_primary_and_any_backup()
 
@@ -1623,6 +1941,8 @@ def test_random_receipts(
         with open(path, encoding="utf-8") as c:
             cert = c.read()
         certs[infra.crypto.compute_public_key_der_hash_hex_from_pem(cert)] = cert
+
+    service_key = get_service_key(network)
 
     with node.client("user0") as c:
         r = c.get("/app/commit")
@@ -1646,36 +1966,70 @@ def test_random_receipts(
         ):
             start_time = time.time()
             while time.time() < (start_time + 3.0):
-                rc = c.get(
-                    f"/app/receipt?transaction_id={view}.{s}", log_capture=log_capture
-                )
-                if rc.status_code == http.HTTPStatus.OK:
-                    receipt = rc.body.json()
-                    if "leaf" in receipt:
-                        if not lts:
-                            assert "proof" in receipt, receipt
-                            assert len(receipt["proof"]) == 0, receipt
-                        # Legacy signature receipt
+                if cose_only:
+                    rc = c.get(
+                        f"/node/receipt/cose?transaction_id={view}.{s}",
+                        log_capture=log_capture,
+                    )
+                    if rc.status_code == http.HTTPStatus.OK:
+                        receipt_bytes = rc.body.data()
+                        # For randomly sampled seqnos we don't know which
+                        # transaction they correspond to, so extract the
+                        # claims digest from the receipt itself. For seqnos
+                        # with known claims, verify it matches.
+                        claim_digest = claims_digest_from_receipt(receipt_bytes)
+                        if s in additional_seqnos:
+                            assert (
+                                claim_digest == additional_seqnos[s]
+                            ), f"Claim digest mismatch for seqno {s}"
+                        ccf.receipt.verify_cose(
+                            receipt_bytes, service_key, claim_digest
+                        )
+                        break
+                    elif rc.status_code == http.HTTPStatus.NOT_FOUND:
+                        # Signature TX - no COSE receipt available, skip
                         LOG.warning(
-                            f"Skipping verification of signature receipt at {view}.{s}"
+                            f"Skipping signature TX at {view}.{s} (no COSE receipt)"
                         )
+                        break
+                    elif rc.status_code == http.HTTPStatus.ACCEPTED:
+                        time.sleep(0.1)
                     else:
-                        if lts and not receipt.get("cert"):
-                            receipt["cert"] = certs[receipt["node_id"]]
-                        verify_receipt(
-                            receipt,
-                            network.cert,
-                            claims=additional_seqnos.get(s),
-                            generic=True,
-                            skip_endorsement_check=lts,
-                        )
-                    break
-                elif rc.status_code == http.HTTPStatus.ACCEPTED:
-                    time.sleep(0.1)
+                        view += 1
+                        if view > max_view:
+                            assert False, rc
                 else:
-                    view += 1
-                    if view > max_view:
-                        assert False, rc
+                    rc = c.get(
+                        f"/app/receipt?transaction_id={view}.{s}",
+                        log_capture=log_capture,
+                    )
+                    if rc.status_code == http.HTTPStatus.OK:
+                        receipt = rc.body.json()
+                        if "leaf" in receipt:
+                            if not lts:
+                                assert "proof" in receipt, receipt
+                                assert len(receipt["proof"]) == 0, receipt
+                            # Legacy signature receipt
+                            LOG.warning(
+                                f"Skipping verification of signature receipt at {view}.{s}"
+                            )
+                        else:
+                            if lts and not receipt.get("cert"):
+                                receipt["cert"] = certs[receipt["node_id"]]
+                            verify_receipt(
+                                receipt,
+                                network.cert,
+                                claims=additional_seqnos.get(s),
+                                generic=True,
+                                skip_cert_chain_checks=lts,
+                            )
+                        break
+                    elif rc.status_code == http.HTTPStatus.ACCEPTED:
+                        time.sleep(0.1)
+                    else:
+                        view += 1
+                        if view > max_view:
+                            assert False, rc
 
     return network
 
@@ -1852,7 +2206,7 @@ def test_basic_constraints(network, args):
     )
     assert basic_constraints.critical is True
     assert basic_constraints.value.ca is True
-    assert basic_constraints.value.path_length == 0
+    assert basic_constraints.value.path_length == 1
 
     node_pem = primary.get_tls_certificate_pem()
     node_cert = load_pem_x509_certificate(node_pem.encode(), default_backend())
@@ -2041,7 +2395,6 @@ def run_udp_tests(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
         txs=txs,
     ) as network:
@@ -2070,13 +2423,41 @@ def run(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
         txs=txs,
     ) as network:
         network.start_and_open(args)
 
-        run_main_tests(network, args)
+        do_main_tests(network, args)
+
+
+def run_multi_bucket_indexing(args):
+    os.makedirs(args.workspace, exist_ok=True)
+    node_data_json_file = os.path.join(
+        args.workspace, f"{args.label}_logging_node_data.json"
+    )
+    with open(node_data_json_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "logging": {
+                    "seqnos_per_indexing_bucket": 5,
+                    "indexing_buckets_per_key": 3,
+                    "max_historical_range_seqnos_per_page": 5,
+                }
+            },
+            f,
+        )
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        node_data_json_file=node_data_json_file,
+    ) as network:
+        network.start_and_open(args)
+
+        test_historical_query_range_pagination(network, args)
 
 
 def run_app_space_js(args):
@@ -2085,7 +2466,6 @@ def run_app_space_js(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
         txs=txs,
     ) as network:
@@ -2133,23 +2513,152 @@ def run_app_space_js(args):
             )
             assert r.status_code == http.HTTPStatus.OK.value, r.status_code
 
-        run_main_tests(network, args)
+        do_main_tests(network, args)
 
 
-def run_main_tests(network, args):
+def test_cose_config(network, args):
+
+    configs = set()
+
+    for node in network.get_joined_nodes():
+        with node.client("user0") as c:
+            r = c.get("/cose_signatures_config")
+            assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+            configs.add(r.body.text())
+
+    assert len(configs) == 1, configs
+    expected = '{"issuer":"service.example.com","subject":"ledger.signature"}'
+    assert configs.pop() == expected, configs
+    return network
+
+
+def test_blocking_calls(network, args):
+    primary, _ = network.find_nodes()
+
+    class CommitPoller(infra.concurrency.StoppableThread):
+        def __init__(self, node):
+            super().__init__(name="commit poller")
+            self.node = node
+            self.known_commit_times = []
+
+        def run(self):
+            with self.node.client() as c:
+                prev_txid = None
+                while not self.is_stopped():
+                    r = c.get("/node/commit", log_capture=[])
+                    assert r.status_code == http.HTTPStatus.OK, r.status_code
+                    txid = TxID.from_str(r.body.json()["transaction_id"])
+                    if txid != prev_txid:
+                        self.known_commit_times.append(
+                            (datetime.now(timezone.utc), txid)
+                        )
+                        prev_txid = txid
+
+    cp = CommitPoller(primary)
+    cp.start()
+
+    response_times = []
+
+    paths = [
+        "/log/private",
+        "/log/blocking/private",
+        "/log/blocking/private/receipt",
+        "/log/private/optional_commit",
+        "/log/private/optional_commit?wait_for_commit=true",
+    ]
+    n_requests = 5
+    request_order = paths * n_requests
+    random.shuffle(request_order)
+
+    with primary.client("user0") as c:
+        for path in request_order:
+            r = c.post(path, {"id": 42, "msg": "Hello world"})
+            assert r.status_code == http.HTTPStatus.OK, r.status_code
+
+            if path == "/log/blocking/private/receipt":
+                # Response is a binary COSE receipt
+                assert r.headers["content-type"] == "application/cose", r.headers[
+                    "content-type"
+                ]
+                ccf.receipt.verify_cose(
+                    r.body.data(),
+                    network.cert.public_key(),
+                    b"\0" * 32,
+                )
+
+            now = datetime.now(timezone.utc)
+            txid = TxID.from_str(r.headers[infra.clients.CCF_TX_ID_HEADER])
+            response_times.append((now, path, txid))
+
+        c.wait_for_commit(r)
+
+    cp.stop()
+    cp.join()
+
+    commit_deltas = {p: [] for p in paths}
+
+    for response_time, path, txid in response_times:
+        for commit_time, commit_txid in cp.known_commit_times:
+            assert commit_txid.view == txid.view
+            if commit_txid.seqno >= txid.seqno:
+                delta = (commit_time - response_time).total_seconds()
+                commit_deltas[path].append(delta)
+                break
+        else:
+            raise AssertionError(f"No commit found for {txid}")
+
+    mean_commit_deltas = {p: sum(ds) / len(ds) for p, ds in commit_deltas.items()}
+    LOG.info(f"Mean commit deltas: {mean_commit_deltas}")
+
+    # Over a large-enough sample size, we'd expect:
+    # - blocking means (both /blocking/private and /blocking/private/receipt)
+    #   to approach 0. We get a response and see commit advance at exactly
+    #   the same time, because the response is held until global commit.
+    # - non-blocking mean (/private) to approach the signature interval.
+    #   We get responses eagerly, and they're committed later at regular
+    #   signature intervals.
+    # - the receipt endpoint to behave similarly to the plain blocking
+    #   endpoint, since the receipt is constructed inline at commit time
+    #   with negligible overhead.
+    #
+    # Our actual test has far more variation (small sample, timing noise),
+    # so we can only make much broader claims - each blocking mean is
+    # smaller than the non-blocking mean.
+    assert (
+        mean_commit_deltas["/log/blocking/private"] < mean_commit_deltas["/log/private"]
+    )
+    assert (
+        mean_commit_deltas["/log/blocking/private/receipt"]
+        < mean_commit_deltas["/log/private"]
+    )
+    # The optional_commit endpoint with wait_for_commit=true should behave
+    # like the blocking endpoints, while without the parameter it should
+    # behave like the non-blocking endpoint.
+    assert (
+        mean_commit_deltas["/log/private/optional_commit?wait_for_commit=true"]
+        < mean_commit_deltas["/log/private/optional_commit"]
+    )
+
+    return network
+
+
+def do_main_tests(network, args):
     test_basic_constraints(network, args)
     test(network, args)
     test_remove(network, args)
     test_clear(network, args)
     test_record_count(network, args)
-    if args.package == "samples/apps/logging/liblogging":
-        test_cbor_merkle_proof(network, args)
+    if args.package.startswith("samples/apps/logging/logging"):
+        test_cbor_receipts(network, args)
+        test_cose_signature_schema(network, args)
+        test_cose_receipt_schema(network, args)
 
     # HTTP2 doesn't support forwarding
     if not args.http2:
         test_forwarding_frontends(network, args)
         test_forwarding_frontends_without_app_prefix(network, args)
-        test_long_lived_forwarding(network, args)
+        if not os.getenv("TSAN_OPTIONS"):
+            test_long_lived_forwarding(network, args)
     test_user_data_ACL(network, args)
     test_cert_prefix(network, args)
     test_anonymous_caller(network, args)
@@ -2161,7 +2670,7 @@ def run_main_tests(network, args):
     test_historical_query_range(network, args)
     test_view_history(network, args)
     test_empty_path(network, args)
-    if args.package == "samples/apps/logging/liblogging":
+    if args.package.startswith("samples/apps/logging/logging"):
         # Local-commit lambda is currently only supported in C++
         test_post_local_commit_failure(network, args)
         # Custom indexers currently only supported in C++
@@ -2170,14 +2679,17 @@ def run_main_tests(network, args):
     test_rekey(network, args)
     test_liveness(network, args)
     test_random_receipts(network, args, False)
-    if args.package == "samples/apps/logging/liblogging":
+    if args.package.startswith("samples/apps/logging/logging"):
         test_receipts(network, args)
         test_historical_query_sparse(network, args)
     test_historical_receipts(network, args)
     test_historical_receipts_with_claims(network, args)
     test_genesis_receipt(network, args)
-    if args.package == "samples/apps/logging/liblogging":
+    if args.package.startswith("samples/apps/logging/logging"):
         test_etags(network, args)
+        test_cose_config(network, args)
+        if not args.http2:
+            test_blocking_calls(network, args)
 
 
 def run_parsing_errors(args):
@@ -2186,7 +2698,6 @@ def run_parsing_errors(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
         txs=txs,
     ) as network:
@@ -2200,10 +2711,14 @@ def run_parsing_errors(args):
 if __name__ == "__main__":
     cr = ConcurrentRunner()
 
+    app_space_js_election_timeout_ms = cr.args.election_timeout_ms
+    if os.getenv("CCF_GLIBCXX_DEBUG") or os.getenv("ASAN_SYMBOLIZER_PATH"):
+        app_space_js_election_timeout_ms = max(app_space_js_election_timeout_ms, 10000)
+
     cr.add(
         "js",
         run,
-        package="libjs_generic",
+        package="js_generic",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         initial_user_count=4,
         initial_member_count=2,
@@ -2212,16 +2727,39 @@ if __name__ == "__main__":
     cr.add(
         "app_space_js",
         run_app_space_js,
-        package="samples/apps/programmability/libprogrammability",
+        package="samples/apps/programmability/programmability",
+        nodes=infra.e2e_args.max_nodes(cr.args, f=0),
+        initial_user_count=4,
+        initial_member_count=2,
+        election_timeout_ms=app_space_js_election_timeout_ms,
+    )
+
+    cr.add(
+        "cpp",
+        run,
+        package="samples/apps/logging/logging",
+        js_app_bundle=None,
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         initial_user_count=4,
         initial_member_count=2,
     )
 
     cr.add(
-        "cpp",
+        "cpp_multi_bucket_indexing",
+        run_multi_bucket_indexing,
+        package="samples/apps/logging/logging",
+        js_app_bundle=None,
+        nodes=infra.e2e_args.max_nodes(cr.args, f=0),
+        initial_user_count=1,
+        initial_member_count=1,
+        sig_tx_interval=5,
+        sig_ms_interval=100,
+    )
+
+    cr.add(
+        "cpp_cose_only",
         run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging_cose_only",
         js_app_bundle=None,
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         initial_user_count=4,
@@ -2231,7 +2769,14 @@ if __name__ == "__main__":
     cr.add(
         "common",
         e2e_common_endpoints.run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.max_nodes(cr.args, f=0),
+    )
+
+    cr.add(
+        "common_ipv6",
+        e2e_common_endpoints.run_ipv6,
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
     )
 
@@ -2239,14 +2784,14 @@ if __name__ == "__main__":
     cr.add(
         "js_illegal",
         run_parsing_errors,
-        package="libjs_generic",
+        package="js_generic",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
     )
 
     cr.add(
         "cpp_illegal",
         run_parsing_errors,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
     )
 
@@ -2254,7 +2799,7 @@ if __name__ == "__main__":
     cr.add(
         "udp",
         run_udp_tests,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.max_nodes(cr.args, f=0),
     )
 

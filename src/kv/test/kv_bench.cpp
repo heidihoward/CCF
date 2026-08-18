@@ -54,7 +54,7 @@ std::string build_map_name(
 template <ccf::kv::SecurityDomain SD>
 static void serialise(picobench::state& s)
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   ccf::kv::Store kv_store;
   auto secrets = create_ledger_secrets();
@@ -86,7 +86,7 @@ static void serialise(picobench::state& s)
 template <ccf::kv::SecurityDomain SD>
 static void deserialise(picobench::state& s)
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   ccf::kv::Store kv_store;
   ccf::kv::Store kv_store2;
@@ -127,7 +127,7 @@ static void deserialise(picobench::state& s)
 template <size_t S>
 static void commit_latency(picobench::state& s)
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   ccf::kv::Store kv_store;
   auto secrets = create_ledger_secrets();
@@ -142,7 +142,7 @@ static void commit_latency(picobench::state& s)
     auto tx = kv_store.create_tx();
     auto tx0 = tx.rw<MapType>(map0);
     auto tx1 = tx.rw<MapType>(map1);
-    for (int iTx = 0; iTx < S; iTx++)
+    for (size_t iTx = 0; iTx < S; iTx++)
     {
       const auto key = gen_key(i, std::to_string(iTx));
       const auto value = gen_value(i);
@@ -165,7 +165,7 @@ static void commit_latency(picobench::state& s)
 template <size_t KEY_COUNT>
 static void ser_snap(picobench::state& s)
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   ccf::kv::Store kv_store;
   auto secrets = create_ledger_secrets();
@@ -176,7 +176,7 @@ static void ser_snap(picobench::state& s)
   for (int i = 0; i < s.iterations(); i++)
   {
     auto handle = tx.rw<MapType>(fmt::format("map{}", i));
-    for (int j = 0; j < KEY_COUNT; j++)
+    for (size_t j = 0; j < KEY_COUNT; j++)
     {
       const auto key = gen_key(j);
       const auto value = gen_value(j);
@@ -203,7 +203,7 @@ static void ser_snap(picobench::state& s)
 template <size_t KEY_COUNT>
 static void des_snap(picobench::state& s)
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   ccf::kv::Store kv_store;
   ccf::kv::Store kv_store2;
@@ -216,7 +216,7 @@ static void des_snap(picobench::state& s)
   for (int i = 0; i < s.iterations(); i++)
   {
     auto handle = tx.rw<MapType>(fmt::format("map{}", i));
-    for (int j = 0; j < KEY_COUNT; j++)
+    for (size_t j = 0; j < KEY_COUNT; j++)
     {
       const auto key = gen_key(j);
       const auto value = gen_value(j);
@@ -249,8 +249,8 @@ const uint32_t sample_size = 100;
 using SD = ccf::kv::SecurityDomain;
 
 PICOBENCH_SUITE("commit_latency");
-PICOBENCH(commit_latency<10>).iterations(tx_count).samples(10).baseline();
-PICOBENCH(commit_latency<100>).iterations(tx_count).samples(10);
+PICOBENCH(commit_latency<10>).iterations(tx_count).baseline();
+PICOBENCH(commit_latency<100>).iterations(tx_count);
 
 PICOBENCH_SUITE("serialise");
 PICOBENCH(serialise<SD::PUBLIC>)
@@ -266,27 +266,18 @@ PICOBENCH(deserialise<SD::PUBLIC>)
   .baseline();
 PICOBENCH(deserialise<SD::PRIVATE>).iterations(tx_count).samples(sample_size);
 
-const uint32_t snapshot_sample_size = 10;
 const std::vector<int> map_count = {20, 100};
 
 PICOBENCH_SUITE("serialise_snapshot");
-PICOBENCH(ser_snap<100>)
-  .iterations(map_count)
-  .samples(snapshot_sample_size)
-  .baseline();
-PICOBENCH(ser_snap<1000>).iterations(map_count).samples(snapshot_sample_size);
+PICOBENCH(ser_snap<100>).iterations(map_count).baseline();
+PICOBENCH(ser_snap<1000>).iterations(map_count);
 
 PICOBENCH_SUITE("deserialise_snapshot");
-PICOBENCH(des_snap<100>)
-  .iterations(map_count)
-  .samples(snapshot_sample_size)
-  .baseline();
-PICOBENCH(des_snap<1000>).iterations(map_count).samples(snapshot_sample_size);
+PICOBENCH(des_snap<100>).iterations(map_count).baseline();
+PICOBENCH(des_snap<1000>).iterations(map_count);
 
 int main(int argc, char** argv)
 {
-  ccf::crypto::openssl_sha256_init();
-
   picobench::runner runner;
   runner.parse_cmd_line(argc, argv);
   return runner.run();

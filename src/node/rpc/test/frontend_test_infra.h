@@ -6,9 +6,9 @@
 #define DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS
 #include "ccf/app_interface.h"
 #include "ccf/crypto/rsa_key_pair.h"
-#include "ccf/ds/logger.h"
 #include "ccf/service/signed_req.h"
 #include "ds/files.h"
+#include "ds/internal_logger.h"
 #include "kv/test/null_encryptor.h"
 #include "kv/test/stub_consensus.h"
 #include "node/history.h"
@@ -31,15 +31,15 @@ using TResponse = ::http::SimpleResponseProcessor::Response;
 constexpr size_t certificate_validity_period_days = 365;
 using namespace std::literals;
 auto valid_from =
-  ::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
+  ccf::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
 auto valid_to = ccf::crypto::compute_cert_valid_to_string(
   valid_from, certificate_validity_period_days);
 
-auto kp = ccf::crypto::make_key_pair();
-auto member_cert = kp -> self_sign("CN=name_member", valid_from, valid_to);
+auto kp = ccf::crypto::make_ec_key_pair();
+auto member_cert = kp->self_sign("CN=name_member", valid_from, valid_to);
 auto verifier_mem = ccf::crypto::make_verifier(member_cert);
-auto user_cert = kp -> self_sign("CN=name_user", valid_from, valid_to);
-auto dummy_enc_pubk = ccf::crypto::make_rsa_key_pair() -> public_key_pem();
+auto user_cert = kp->self_sign("CN=name_user", valid_from, valid_to);
+auto dummy_enc_pubk = ccf::crypto::make_rsa_key_pair()->public_key_pem();
 
 auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
 
@@ -65,7 +65,7 @@ std::string parse_response_body(const TResponse& r)
   return std::string(r.body.begin(), r.body.end());
 }
 
-void check_error(const TResponse& r, http_status expected)
+void check_error(const TResponse& r, ccf::http_status expected)
 {
   DOCTEST_CHECK(r.status == expected);
 }
@@ -108,7 +108,7 @@ auto frontend_process(
   return processor.received.front();
 }
 
-auto get_cert(uint64_t member_id, ccf::crypto::KeyPairPtr& kp_mem)
+auto get_cert(uint64_t member_id, ccf::crypto::ECKeyPairPtr& kp_mem)
 {
   return kp_mem->self_sign(
     "CN=new member" + to_string(member_id), valid_from, valid_to);
@@ -117,12 +117,12 @@ auto get_cert(uint64_t member_id, ccf::crypto::KeyPairPtr& kp_mem)
 std::unique_ptr<ccf::NetworkIdentity> make_test_network_ident()
 {
   using namespace std::literals;
-  const auto valid_from =
-    ::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
-  return std::make_unique<ReplicatedNetworkIdentity>(
+  const auto ident_valid_from =
+    ccf::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
+  return std::make_unique<ccf::NetworkIdentity>(
     "CN=CCF test network",
     ccf::crypto::service_identity_curve_choice,
-    valid_from,
+    ident_valid_from,
     2);
 }
 

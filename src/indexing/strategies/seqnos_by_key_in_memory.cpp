@@ -10,6 +10,7 @@ namespace ccf::indexing::strategies
   void SeqnosByKey_InMemory_Untyped::visit_entry(
     const ccf::TxID& tx_id, const ccf::ByteVector& k, const ccf::ByteVector& v)
   {
+    (void)v;
     std::lock_guard<ccf::pal::Mutex> guard(lock);
     seqnos_by_key[k].insert(tx_id.seqno);
   }
@@ -31,7 +32,7 @@ namespace ccf::indexing::strategies
 
       if (
         max_seqnos.has_value() &&
-        std::distance(from_it, seqnos.end()) > *max_seqnos)
+        static_cast<size_t>(std::distance(from_it, seqnos.end())) > *max_seqnos)
       {
         std::advance(to_it, *max_seqnos);
       }

@@ -1,7 +1,7 @@
 Consensus Protocol
 ==================
 
-The consensus protocol for CCF is Crash Fault Tolerance (:term:`CFT`) and is based on `Raft <https://raft.github.io/>`_. The key differences between the original Raft protocol (as described in the `Raft paper <https://raft.github.io/raft.pdf>`_), and CCF Raft are as follows:
+The consensus protocol for CCF implements Crash Fault Tolerance (:term:`CFT`) and is based on `Raft <https://raft.github.io/>`_. The key differences between the original Raft protocol (as described in the `Raft paper <https://raft.github.io/raft.pdf>`_), and CCF Raft are as follows:
 
 * Transactions in CCF Raft are not considered to be committed until a subsequent signed transaction has been committed. More information can be found :doc:`here </architecture/merkle_tree>`. Transactions in the ledger before the last signed transactions are discarded during leader election.
 * CCF Raft does not support node restart as the unique identity of each node is tied to the node process launch. If a node fails and is replaced, it must rejoin Raft via reconfiguration.
@@ -16,14 +16,15 @@ CFT parameters can be configured when starting up a network (see :doc:`here </op
 Extensions for Omission Faults
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. warning:: Support for these extensions is work-in-progress. See https://github.com/microsoft/CCF/issues/2577. 
-
-The CFT consensus variant also supports some extensions for :term:`omission fault`.
+The CFT consensus implementation in CCF also supports some extensions for :term:`omission fault`.
 This may happen when the network is unreliable and may lead to one or more nodes being isolated from the rest of the network.
 
 Supported extensions include:
 
 - "CheckQuorum": the primary node automatically steps down, in the same view, if it does not hear back (via ``AppendEntriesResponse`` messages) from a majority of backups within a ``consensus.election_timeout`` period. This prevents an isolated primary node from still processing client write requests without being able to commit them.
+- "NoTimeoutRetirement": a primary node that completes its retirement sends a ``ProposeRequestVote`` message to the most up-to-date node in the new configuration, causing that node to run for election without waiting for time out.
+  - A ``ProposeRequestVote`` message is also sent when a primary receives a termination signal. This reduces downtime when the orchestrator must suddenly retire the primary's host, but there is insufficient time to reconfigure the network first.
+- "PreVote": followers must first request a pre-vote before starting a new election. This prevents followers from starting elections (and increasing the view) when they are isolated from the rest of the network.
 
 Replica State Machine
 ---------------------
@@ -203,5 +204,77 @@ A node permanently transitions to the ``Completed`` phase once it has observed c
 
 Until the very last phase (``RetiredCommitted``) is reached, a retiring leader will continue to act as leader, although it will not execute new transactions once it observes RCI. 
 
-Note that because the rollback triggered when a node becomes aware of a new term never preserves unsigned transactions,
+Note that because the rollback triggered when a node becomes aware of a new view never preserves unsigned transactions,
 and because RCI is always the first signature after RI, RI and RCI are always both rolled back if RCI itself is rolled back.
+
+PreVote Extensions
+~~~~~~~~~~~~~~~~~~
+
+If a node's ``RequestVote`` requests are able to reach the cluster, but it is unable to hear the ``AppendEntries`` messages from the current leader (for example, due to network partitioning), it may start new elections, incrementing its view, which deposes the leader and disrupts the cluster.
+
+To mitigate this, the PreVote extension requires that a follower first become ``PreVoteCandidate`` and receive a quorum of speculative pre-votes, proving that they could be elected using the standard Raft election conditions, before becoming ``Candidate`` and potentially disrupting the cluster.
+
+More specifically, when a follower's election timeout elapses, it becomes a ``PreVoteCandidate`` for the current view and sends out ``RequestPreVote`` messages.
+If the ``PreVoteCandidate`` hears from a current leader, or a new leader, it reverts back to being a ``Follower``.
+Nodes receive this pre-vote request, and respond positively if node would have voted for the ``PreVoteCandidate``'s ledger during an election, (ie. if the ``PreVoteCandidate``'s ledger is at least as up to date as the receiver's ledger).
+If the ``PreVoteCandidate`` receives a quorum of positive pre-vote responses, it then becomes a ``Candidate``, increments its view, sends a ``RequestVote`` message and the election proceeds as normal from here.
+
+.. mermaid::
+
+    sequenceDiagram
+        participant Node 0
+        participant Node 1
+        participant Node 2
+
+        Note over Node 0: Leader for view 2
+
+        Note over Node 1: PreVoteCandidate in view 2
+        Node 1 ->> Node 2: RequestPreVote(view=2)
+
+        Note right of Node 2: No changes to Node 2's state
+        Node 2 ->> Node 1: RequestPreVoteResponse(view=2, granted=true)
+
+        Note over Node 1: Candidate in view 3
+        Node 1 ->> Node 2: RequestVote(view=3)
+
+        Note right of Node 2: Updates view to 3 and votes for Node 1
+        Node 2 ->> Node 1: RequestVoteResponse(view=3, granted=true)
+
+        Note over Node 1: Leader for view 3
+
+The only state update in response to a pre-vote message is that if the node's current view is older than the one carried by the pre-vote message, it will update it.
+This allows the pre-vote request to inform lagging nodes that a more recent view had a node succeed in its pre-vote, becoming a Candidate or a Leader.
+This can be viewed as piggybacking the view information from that previous Candidate or Leader, with the pre-vote request to the lagging node.
+
+.. mermaid::
+
+    sequenceDiagram
+        participant Node 0
+        participant Node 1
+        participant Node 2
+
+        Note over Node 0: Leader for view 2
+        Note over Node 1: Follower in view 2
+        Note over Node 2: Lagging Follower in view 1
+
+        Note over Node 1: PreVoteCandidate in view 2
+        Node 1 ->> Node 2: RequestPreVote(view=2)
+
+        Note right of Node 2: Updates view to 2
+        Node 2 ->> Node 1: RequestPreVoteResponse(view=2, granted=true)
+
+        Note over Node 1: Candidate in view 3
+        Node 1 ->> Node 2: RequestVote(view=3)
+
+        Note right of Node 2: Updates to view 3 and votes for Node 1
+        Node 2 ->> Node 1: RequestVoteResponse(view=3, granted=true)
+
+        Note over Node 1: Leader for view 3
+
+Migration to PreVote
+~~~~~~~~~~~~~~~~~~~~
+
+Supposing we have a cluster of nodes which currently do not support PreVote, we must first migrate the cluster to support PreVote before we can enable it, as the nodes that do not support PreVote will respond incorrectly to PreVote requests.
+
+To enable PreVote safely, we must first migrate the cluster to support PreVote messages, and then enable PreVote.
+During the migration to enable PreVote, the pre-vote candidates will be less likely to be elected leader, as the other followers may preempt the pre-vote candidate and become candidates themselves.

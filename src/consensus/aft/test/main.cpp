@@ -7,9 +7,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
-std::unique_ptr<threading::ThreadMessaging>
-  threading::ThreadMessaging::singleton = nullptr;
-
 using ms = std::chrono::milliseconds;
 
 DOCTEST_TEST_CASE("Single node startup" * doctest::test_suite("single"))
@@ -80,8 +77,6 @@ DOCTEST_TEST_CASE("Single node commit" * doctest::test_suite("single"))
     entry->push_back(2);
     entry->push_back(3);
 
-    auto hooks = std::make_shared<ccf::kv::ConsensusHookPtrs>();
-
     r0.replicate(ccf::kv::BatchVector{{i, entry, true, hooks}}, 1);
     DOCTEST_REQUIRE(r0.get_last_idx() == i);
     DOCTEST_REQUIRE(r0.get_committed_seqno() == i);
@@ -149,6 +144,73 @@ DOCTEST_TEST_CASE(
 
   r0.start_ticking();
   r0.periodic(election_timeout * 2);
+  DOCTEST_REQUIRE(
+    r0c->count_messages_with_type(aft::RaftMsgType::raft_request_pre_vote) ==
+    3);
+
+  DOCTEST_INFO("Node 1 receives the request pre-vote");
+
+  auto rpv_raw =
+    r0c->pop_first(aft::RaftMsgType::raft_request_pre_vote, node_id1);
+  DOCTEST_REQUIRE(rpv_raw.has_value());
+  {
+    auto rpv = *(aft::RequestPreVote*)rpv_raw->data();
+    DOCTEST_REQUIRE(rpv.term == 0);
+    DOCTEST_REQUIRE(rpv.last_committable_idx == 0);
+    DOCTEST_REQUIRE(
+      rpv.term_of_last_committable_idx == aft::ViewHistory::InvalidView);
+  }
+
+  receive_message(r0, r1, *rpv_raw);
+
+  DOCTEST_INFO("Node 2 receives the request pre-vote");
+
+  rpv_raw = r0c->pop_first(aft::RaftMsgType::raft_request_pre_vote, node_id2);
+  DOCTEST_REQUIRE(rpv_raw.has_value());
+  {
+    auto rpv = *(aft::RequestPreVote*)rpv_raw->data();
+    DOCTEST_REQUIRE(rpv.term == 0);
+    DOCTEST_REQUIRE(rpv.last_committable_idx == 0);
+    DOCTEST_REQUIRE(
+      rpv.term_of_last_committable_idx == aft::ViewHistory::InvalidView);
+  }
+
+  receive_message(r0, r2, *rpv_raw);
+
+  DOCTEST_INFO("Node 1 pre-votes for Node 0");
+
+  DOCTEST_REQUIRE(
+    r1c->count_messages_with_type(
+      aft::RaftMsgType::raft_request_pre_vote_response) == 1);
+
+  auto rpvr_raw =
+    r1c->pop_first(aft::RaftMsgType::raft_request_pre_vote_response, node_id0);
+  DOCTEST_REQUIRE(rpvr_raw.has_value());
+  {
+    auto rvrc = *(aft::RequestPreVoteResponse*)rpvr_raw->data();
+    DOCTEST_REQUIRE(rvrc.term == 0);
+    DOCTEST_REQUIRE(rvrc.vote_granted);
+  }
+
+  receive_message(r1, r0, *rpvr_raw);
+
+  DOCTEST_INFO("Node 2 pre-votes for Node 0");
+
+  DOCTEST_REQUIRE(
+    r2c->count_messages_with_type(
+      aft::RaftMsgType::raft_request_pre_vote_response) == 1);
+
+  rpvr_raw =
+    r2c->pop_first(aft::RaftMsgType::raft_request_pre_vote_response, node_id0);
+  DOCTEST_REQUIRE(rpvr_raw.has_value());
+  {
+    auto rvrc = *(aft::RequestPreVoteResponse*)rpvr_raw->data();
+    DOCTEST_REQUIRE(rvrc.term == 0);
+    DOCTEST_REQUIRE(rvrc.vote_granted);
+  }
+
+  receive_message(r2, r0, *rpvr_raw);
+
   DOCTEST_REQUIRE(
     r0c->count_messages_with_type(aft::RaftMsgType::raft_request_vote) == 3);
 
@@ -325,6 +387,13 @@ DOCTEST_TEST_CASE(
   r0.start_ticking();
   r0.periodic(election_timeout * 2);
 
+  DOCTEST_INFO("Send request_pre_votes to other nodes");
+  DOCTEST_REQUIRE(2 == dispatch_all(nodes, node_id0, r0c->messages));
+
+  DOCTEST_INFO("Send request_pre_vote_reponses back");
+  DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
+  DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id2, r2c->messages));
+
   DOCTEST_INFO("Send request_votes to other nodes");
   DOCTEST_REQUIRE(2 == dispatch_all(nodes, node_id0, r0c->messages));
 
@@ -359,7 +428,6 @@ DOCTEST_TEST_CASE(
   DOCTEST_INFO("Try to replicate on a follower, and fail");
   std::vector<uint8_t> entry = {1, 2, 3};
   auto data = std::make_shared<std::vector<uint8_t>>(entry);
-  auto hooks = std::make_shared<ccf::kv::ConsensusHookPtrs>();
   DOCTEST_REQUIRE_FALSE(
     r1.replicate(ccf::kv::BatchVector{{1, data, true, hooks}}, 1));
 
@@ -459,6 +527,10 @@ DOCTEST_TEST_CASE("Multiple nodes late join" * doctest::test_suite("multiple"))
   r0.start_ticking();
   r0.periodic(election_timeout * 2);
 
+  // Pre-vote
+  DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
+  DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
+  // Vote
   DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
   DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
   DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
@@ -476,7 +548,6 @@ DOCTEST_TEST_CASE("Multiple nodes late join" * doctest::test_suite("multiple"))
 
   std::vector<uint8_t> first_entry = {1, 2, 3};
   auto data = std::make_shared<std::vector<uint8_t>>(first_entry);
-  auto hooks = std::make_shared<ccf::kv::ConsensusHookPtrs>();
   DOCTEST_REQUIRE(
     r0.replicate(ccf::kv::BatchVector{{1, data, true, hooks}}, 1));
   r0.periodic(request_timeout);
@@ -550,7 +621,6 @@ DOCTEST_TEST_CASE("Recv append entries logic" * doctest::test_suite("multiple"))
     std::make_shared<aft::ChannelStubProxy>(),
     std::make_shared<aft::State>(node_id1),
     nullptr);
-  auto hooks = std::make_shared<ccf::kv::ConsensusHookPtrs>();
 
   aft::Configuration::Nodes config0;
   config0[node_id0] = {};
@@ -570,6 +640,10 @@ DOCTEST_TEST_CASE("Recv append entries logic" * doctest::test_suite("multiple"))
 
   DOCTEST_INFO("Initial election");
   {
+    // Pre-vote
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
+    // Vote
     DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
     DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
 
@@ -780,7 +854,7 @@ DOCTEST_TEST_CASE("Recv append entries logic" * doctest::test_suite("multiple"))
 
 DOCTEST_TEST_CASE("Exceed append entries limit")
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   ccf::NodeId node_id0 = ccf::kv::test::PrimaryNodeId;
   ccf::NodeId node_id1 = ccf::kv::test::FirstBackupNodeId;
@@ -828,6 +902,10 @@ DOCTEST_TEST_CASE("Exceed append entries limit")
   r0.start_ticking();
   r0.periodic(election_timeout * 2);
 
+  // Pre-vote
+  DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
+  DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
+  // Vote
   DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
   DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
   DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
@@ -856,14 +934,13 @@ DOCTEST_TEST_CASE("Exceed append entries limit")
   // send_append_entries() triggered or not
   bool expected_ae = false;
 
-  for (size_t i = 1; i <= num_big_entries; ++i)
+  for (size_t i = 1; i <= static_cast<size_t>(num_big_entries); ++i)
   {
-    auto hooks = std::make_shared<ccf::kv::ConsensusHookPtrs>();
     DOCTEST_REQUIRE(
       r0.replicate(ccf::kv::BatchVector{{i, data, true, hooks}}, 1));
     const auto received_ae =
       dispatch_all_and_DOCTEST_CHECK<aft::AppendEntries>(
-        nodes, node_id0, r0c->messages, [&i](const auto& msg) {
+        nodes, node_id0, r0c->messages, [](const auto& msg) {
           DOCTEST_REQUIRE(msg.term == 1);
         }) > 0;
     DOCTEST_REQUIRE(received_ae == expected_ae);
@@ -874,9 +951,10 @@ DOCTEST_TEST_CASE("Exceed append entries limit")
     (individual_entries - num_big_entries);
   auto smaller_data = std::make_shared<std::vector<uint8_t>>(data_size, 1);
 
-  for (size_t i = num_big_entries + 1; i <= individual_entries; ++i)
+  for (size_t i = num_big_entries + 1;
+       i <= static_cast<size_t>(individual_entries);
+       ++i)
   {
-    auto hooks = std::make_shared<ccf::kv::ConsensusHookPtrs>();
     DOCTEST_REQUIRE(
       r0.replicate(ccf::kv::BatchVector{{i, smaller_data, true, hooks}}, 1));
     dispatch_all(nodes, node_id0, r0c->messages);
@@ -986,6 +1064,10 @@ DOCTEST_TEST_CASE(
 
   DOCTEST_INFO("Initial election");
   {
+    // Pre-vote
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
+    // Vote
     DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id0, r0c->messages));
     DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_id1, r1c->messages));
 
@@ -1000,7 +1082,8 @@ DOCTEST_TEST_CASE(
     "because it isn't ticking yet");
   r1.periodic(election_timeout * 2);
   DOCTEST_REQUIRE(
-    r1c->count_messages_with_type(aft::RaftMsgType::raft_request_vote) == 0);
+    r1c->count_messages_with_type(aft::RaftMsgType::raft_request_pre_vote) ==
+    0);
 
   r1.start_ticking();
   DOCTEST_INFO(
@@ -1008,12 +1091,12 @@ DOCTEST_TEST_CASE(
     "election");
   r1.periodic(election_timeout * 2);
   DOCTEST_REQUIRE(
-    r1c->count_messages_with_type(aft::RaftMsgType::raft_request_vote) == 1);
+    r1c->count_messages_with_type(aft::RaftMsgType::raft_request_pre_vote) ==
+    1);
 }
 
 int main(int argc, char** argv)
 {
-  threading::ThreadMessaging::init(1);
   doctest::Context context;
   context.applyCommandLine(argc, argv);
   int res = context.run();

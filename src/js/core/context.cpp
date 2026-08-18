@@ -8,25 +8,22 @@
 #include "ccf/js/core/wrapped_value.h"
 #include "ccf/js/extensions/console.h"
 #include "ccf/js/tx_access.h"
-#include "enclave/enclave_time.h"
-#include "js/ffi_plugins.h"
+#include "ds/internal_logger.h"
+#include "js/checks.h"
 #include "js/global_class_ids.h"
 
 #include <chrono>
+#include <cstdarg>
 #include <quickjs/quickjs.h>
-
-#if defined(INSIDE_ENCLAVE) && !defined(VIRTUAL_ENCLAVE)
-#  include <openenclave/3rdparty/libc/sys/time.h> // For timeval
-#endif
 
 namespace ccf::js::core
 {
   namespace
   {
-    static inline JSModuleDef* load_module_via_context(
+    inline JSModuleDef* load_module_via_context(
       JSContext* ctx, const char* module_name, void* opaque)
     {
-      auto context = (Context*)opaque;
+      auto* context = reinterpret_cast<Context*>(opaque);
 
       try
       {
@@ -35,13 +32,14 @@ namespace ccf::js::core
         {
           return nullptr;
         }
-        return (JSModuleDef*)JS_VALUE_GET_PTR(opt_module->val);
+        return reinterpret_cast<JSModuleDef*>(
+          JS_VALUE_GET_PTR(opt_module->val));
       }
       catch (const std::exception& exc)
       {
         JS_ThrowReferenceError(ctx, "%s", exc.what());
         js::core::Context& jsctx =
-          *(js::core::Context*)JS_GetContextOpaque(ctx);
+          *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
         auto [reason, trace] = jsctx.error_message();
 
         auto& rt = jsctx.runtime();
@@ -67,18 +65,12 @@ namespace ccf::js::core
     }
     JS_SetContextOpaque(ctx, this);
 
-    for (auto& plugin : ffi_plugins)
-    {
-      LOG_DEBUG_FMT("Extending JS context with plugin {}", plugin.name);
-      plugin.extend(*this);
-    }
-
     JS_SetModuleLoaderFunc(rt, nullptr, load_module_via_context, this);
   }
 
   Context::~Context()
   {
-    JS_SetInterruptHandler(JS_GetRuntime(ctx), NULL, NULL);
+    JS_SetInterruptHandler(JS_GetRuntime(ctx), nullptr, nullptr);
     JS_FreeContext(ctx);
   }
 
@@ -123,22 +115,23 @@ namespace ccf::js::core
 
       return module_val;
     }
-    else
-    {
-      LOG_TRACE_FMT("Module cache hit for '{}'", module_name);
-    }
+    LOG_TRACE_FMT("Module cache hit for '{}'", module_name);
 
     return it->second;
   }
 
   JSWrappedValue Context::wrap(JSValue&& val) const
   {
-    return JSWrappedValue(ctx, std::move(val));
+    // NOLINTBEGIN(performance-move-const-arg)
+    // Retained to call distinct overload of JSWrappedValue constructor, which
+    // avoids DupValue
+    return {ctx, std::move(val)};
+    // NOLINTEND(performance-move-const-arg)
   };
 
   JSWrappedValue Context::wrap(const JSValue& val) const
   {
-    return JSWrappedValue(ctx, val);
+    return {ctx, val};
   };
 
   JSValue Context::extract_string_array(
@@ -146,14 +139,14 @@ namespace ccf::js::core
   {
     auto args = wrap(argv);
 
-    if (!JS_IsArray(ctx, argv))
+    if (JS_IsArray(ctx, argv) == 0)
     {
       return JS_ThrowTypeError(ctx, "First argument must be an array");
     }
 
     auto len_val = args["length"];
     uint32_t len = 0;
-    if (JS_ToUint32(ctx, &len, len_val.val))
+    if (JS_ToUint32(ctx, &len, len_val.val) != 0)
     {
       return ccf::js::core::constants::Exception;
     }
@@ -229,14 +222,14 @@ namespace ccf::js::core
   }
 
   JSWrappedValue Context::get_or_create_global_property(
-    const char* s, JSWrappedValue default_value) const
+    const char* s, JSWrappedValue&& default_value) const
   {
     auto g = Context::get_global_obj();
     auto val = wrap(JS_GetPropertyStr(ctx, g.val, s));
     if (val.is_undefined())
     {
       val = default_value;
-      g.set(s, std::move(default_value));
+      JS_CHECK_OR_THROW(g.set(s, std::move(default_value)));
     }
 
     return val;
@@ -274,7 +267,10 @@ namespace ccf::js::core
     const std::string& func,
     const std::string& path)
   {
-    auto eval_val = wrap(JS_EvalFunction(ctx, module.val));
+    // JS_EvalFunction consumes one reference to the module value, so we must
+    // provide it with its own via JS_DupValue. Our JSWrappedValue destructor
+    // will free the original reference separately.
+    auto eval_val = wrap(JS_EvalFunction(ctx, JS_DupValue(ctx, module.val)));
 
     if (eval_val.is_exception())
     {
@@ -288,29 +284,32 @@ namespace ccf::js::core
         fmt::format("Failed to execute {}: {}", path, reason));
     }
 
-    // Get exported function from module
+    // Get exported function from module via namespace object
     assert(JS_VALUE_GET_TAG(module.val) == JS_TAG_MODULE);
-    auto module_def = (JSModuleDef*)JS_VALUE_GET_PTR(module.val);
-    auto export_count = JS_GetModuleExportEntriesCount(module_def);
-    for (auto i = 0; i < export_count; i++)
+    auto* module_def =
+      reinterpret_cast<JSModuleDef*>(JS_VALUE_GET_PTR(module.val));
+    auto ns = wrap(JS_GetModuleNamespace(ctx, module_def));
+    if (JS_IsException(ns.val) != 0)
     {
-      auto export_name_atom = JS_GetModuleExportEntryName(ctx, module_def, i);
-      auto export_name = to_str(export_name_atom);
-      JS_FreeAtom(ctx, export_name_atom);
-      if (export_name.value_or("") == func)
-      {
-        auto export_func = wrap(JS_GetModuleExportEntry(ctx, module_def, i));
-        if (!JS_IsFunction(ctx, export_func.val))
-        {
-          throw std::runtime_error(fmt::format(
-            "Export '{}' of module '{}' is not a function", func, path));
-        }
-        return export_func;
-      }
+      throw std::runtime_error(
+        fmt::format("Failed to get namespace for module '{}'", path));
     }
 
-    throw std::runtime_error(
-      fmt::format("Failed to find export '{}' in module '{}'", func, path));
+    auto func_atom = JS_NewAtom(ctx, func.c_str());
+    auto export_func = wrap(JS_GetProperty(ctx, ns.val, func_atom));
+    JS_FreeAtom(ctx, func_atom);
+
+    if (JS_IsUndefined(export_func.val) != 0)
+    {
+      throw std::runtime_error(
+        fmt::format("Failed to find export '{}' in module '{}'", func, path));
+    }
+    if (JS_IsFunction(ctx, export_func.val) == 0)
+    {
+      throw std::runtime_error(fmt::format(
+        "Export '{}' of module '{}' is not a function", func, path));
+    }
+    return export_func;
   }
 
   JSWrappedValue Context::null() const
@@ -347,15 +346,16 @@ namespace ccf::js::core
   JSWrappedValue Context::new_array_buffer_copy(
     const char* buf, size_t buf_len) const
   {
-    return JSWrappedValue(
-      ctx, JS_NewArrayBufferCopy(ctx, (uint8_t*)buf, buf_len));
+    return {
+      ctx,
+      JS_NewArrayBufferCopy(
+        ctx, reinterpret_cast<const uint8_t*>(buf), buf_len)};
   }
 
   JSWrappedValue Context::new_array_buffer_copy(
     std::span<const uint8_t> data) const
   {
-    return JSWrappedValue(
-      ctx, JS_NewArrayBufferCopy(ctx, data.data(), data.size()));
+    return {ctx, JS_NewArrayBufferCopy(ctx, data.data(), data.size())};
   }
 
   JSWrappedValue Context::new_string(const std::string_view& str) const
@@ -371,7 +371,8 @@ namespace ccf::js::core
   JSWrappedValue Context::new_string_len(
     const std::span<const uint8_t> buf) const
   {
-    return wrap(JS_NewStringLen(ctx, (const char*)buf.data(), buf.size()));
+    return wrap(JS_NewStringLen(
+      ctx, reinterpret_cast<const char*>(buf.data()), buf.size()));
   }
 
   JSWrappedValue Context::new_type_error(const char* fmt, ...) const
@@ -434,26 +435,27 @@ namespace ccf::js::core
     return wrap(JS_ReadObject(ctx, buf, buf_len, flags));
   }
 
-  static int js_custom_interrupt_handler(JSRuntime* rt, void* opaque)
+  namespace
   {
-    InterruptData* inter = reinterpret_cast<InterruptData*>(opaque);
-    auto now = ccf::get_enclave_time();
-    auto elapsed_time = now - inter->start_time;
-    auto elapsed_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_time);
-    if (elapsed_ms.count() >= inter->max_execution_time.count())
+    int js_custom_interrupt_handler(JSRuntime* rt, void* opaque)
     {
-      extensions::ConsoleExtension::log_info_with_tag(
-        inter->access,
-        fmt::format(
-          "JS execution has timed out after {}ms (max is {}ms)",
-          elapsed_ms.count(),
-          inter->max_execution_time.count()));
-      inter->request_timed_out = true;
-      return 1;
-    }
-    else
-    {
+      (void)rt;
+      auto* inter = reinterpret_cast<InterruptData*>(opaque);
+      auto now = std::chrono::high_resolution_clock::now();
+      auto elapsed_time = now - inter->start_time;
+      auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_time);
+      if (elapsed_ms.count() >= inter->max_execution_time.count())
+      {
+        extensions::ConsoleExtension::log_info_with_tag(
+          inter->access,
+          fmt::format(
+            "JS execution has timed out after {}ms (max is {}ms)",
+            elapsed_ms.count(),
+            inter->max_execution_time.count()));
+        inter->request_timed_out = true;
+        return 1;
+      }
       return 0;
     }
   }
@@ -465,14 +467,14 @@ namespace ccf::js::core
     RuntimeLimitsPolicy policy)
   {
     rt.set_runtime_options(options, policy);
-    const auto curr_time = ccf::get_enclave_time();
+    const auto curr_time = decltype(InterruptData::start_time)::clock::now();
     interrupt_data.start_time = curr_time;
     interrupt_data.max_execution_time = rt.get_max_exec_time();
     JS_SetInterruptHandler(rt, js_custom_interrupt_handler, &interrupt_data);
 
     auto rv = inner_call(f, argv);
 
-    JS_SetInterruptHandler(rt, NULL, NULL);
+    JS_SetInterruptHandler(rt, nullptr, nullptr);
     rt.reset_runtime_options();
 
     return rv;
@@ -483,7 +485,7 @@ namespace ccf::js::core
   {
     std::vector<JSValue> argvn;
     argvn.reserve(argv.size());
-    for (auto& a : argv)
+    for (const auto& a : argv)
     {
       argvn.push_back(a.val);
     }
@@ -519,26 +521,36 @@ namespace ccf::js::core
 
   std::optional<std::string> Context::to_str(const JSWrappedValue& x) const
   {
-    auto val = JS_ToCString(ctx, x.val);
-    if (!val)
+    size_t len = 0;
+    const auto* val = JS_ToCStringLen(ctx, &len, x.val);
+    if (val == nullptr)
     {
-      new_type_error("value is not a string");
+      // JS_ToCStringLen returns nullptr when a JS exception is already set (eg
+      // OOM, or an exception during coercion). Preserve that exception for
+      // callers.
       return std::nullopt;
     }
-    std::string r(val);
+    // Construct with explicit length rather than relying on the returned
+    // buffer's NUL terminator, since the JS string may itself contain
+    // embedded NUL characters which would otherwise silently truncate it.
+    std::string r(val, len);
     JS_FreeCString(ctx, val);
     return r;
   }
 
   std::optional<std::string> Context::to_str(const JSValue& x) const
   {
-    auto val = JS_ToCString(ctx, x);
-    if (!val)
+    size_t len = 0;
+    const auto* val = JS_ToCStringLen(ctx, &len, x);
+    if (val == nullptr)
     {
-      new_type_error("value is not a string");
+      // JS_ToCStringLen returns nullptr when a JS exception is already set (eg
+      // OOM, or an exception during coercion). Preserve that exception for
+      // callers.
       return std::nullopt;
     }
-    std::string r(val);
+    // See comment in to_str(const JSWrappedValue&) above.
+    std::string r(val, len);
     JS_FreeCString(ctx, val);
     return r;
   }
@@ -546,26 +558,32 @@ namespace ccf::js::core
   std::optional<std::string> Context::to_str(
     const JSValue& x, size_t& len) const
   {
-    auto val = JS_ToCStringLen(ctx, &len, x);
-    if (!val)
+    const auto* val = JS_ToCStringLen(ctx, &len, x);
+    if (val == nullptr)
     {
-      new_type_error("value is not a string");
+      // JS_ToCStringLen returns nullptr when a JS exception is already set (eg
+      // OOM, or an exception during coercion). Preserve that exception for
+      // caller
       return std::nullopt;
     }
-    std::string r(val);
+    // See comment in to_str(const JSWrappedValue&) above.
+    std::string r(val, len);
     JS_FreeCString(ctx, val);
     return r;
   }
 
   std::optional<std::string> Context::to_str(const JSAtom& atom) const
   {
-    auto val = JS_AtomToCString(ctx, atom);
-    if (!val)
+    size_t len = 0;
+    const auto* val = JS_AtomToCStringLen(ctx, &len, atom);
+    if (val == nullptr)
     {
-      new_type_error("atom is not a string");
+      // JS_AtomToCStringLen returns nullptr when a JS exception is already set
+      // (eg OOM). Preserve that exception for callers.
       return std::nullopt;
     }
-    std::string r(val);
+    // See comment in to_str(const JSWrappedValue&) above.
+    std::string r(val, len);
     JS_FreeCString(ctx, val);
     return r;
   }
@@ -585,31 +603,5 @@ namespace ccf::js::core
       return true;
     }
     return false;
-  }
-}
-
-extern "C"
-{
-  int qjs_gettimeofday(struct JSContext* ctx, struct timeval* tv, void* tz)
-  {
-    if (tv != NULL)
-    {
-      // Opaque may be null, when this is called during Context construction
-      const ccf::js::core::Context* jsctx =
-        (ccf::js::core::Context*)JS_GetContextOpaque(ctx);
-      if (jsctx != nullptr && jsctx->implement_untrusted_time)
-      {
-        const auto microseconds_since_epoch = ccf::get_enclave_time();
-        tv->tv_sec = std::chrono::duration_cast<std::chrono::seconds>(
-                       microseconds_since_epoch)
-                       .count();
-        tv->tv_usec = microseconds_since_epoch.count() % std::micro::den;
-      }
-      else
-      {
-        memset(tv, 0, sizeof(struct timeval));
-      }
-    }
-    return 0;
   }
 }

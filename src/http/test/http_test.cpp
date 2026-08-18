@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 
-#include "ccf/crypto/key_pair.h"
+#include "ccf/http_accept.h"
 #include "ccf/http_query.h"
-#include "http/http_accept.h"
+#include "crypto/openssl/ec_public_key.h"
 #include "http/http_builder.h"
+#include "http/http_digest.h"
 #include "http/http_parser.h"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -29,6 +30,30 @@ std::string to_lowercase(std::string s)
   ccf::nonstd::to_lower(s);
   return s;
 }
+
+// Production parsing rejects conflicting Content-Length and Transfer-Encoding
+// headers. These test-only parsers exercise llhttp's chunked precedence path.
+class LenientChunkedLengthRequestParser : public http::RequestParser
+{
+public:
+  LenientChunkedLengthRequestParser(
+    http::RequestProcessor& proc,
+    const ccf::http::ParserConfiguration& config) :
+    http::RequestParser(proc, config)
+  {
+    llhttp_set_lenient_chunked_length(&parser, 1);
+  }
+};
+
+class LenientChunkedLengthResponseParser : public http::ResponseParser
+{
+public:
+  explicit LenientChunkedLengthResponseParser(http::ResponseProcessor& proc) :
+    http::ResponseParser(proc)
+  {
+    llhttp_set_lenient_chunked_length(&parser, 1);
+  }
+};
 
 DOCTEST_TEST_CASE("Complete request")
 {
@@ -166,6 +191,177 @@ DOCTEST_TEST_CASE("Partial body")
   DOCTEST_CHECK(m.body == r0);
 }
 
+DOCTEST_TEST_CASE("Body too large")
+{
+  ccf::http::ParserConfiguration config;
+  config.max_body_size = ccf::ds::SizeString("8B");
+
+  // Response parsing uses the same base Parser, so an oversized Content-Length
+  // should also be rejected at headers-complete time.
+  {
+    ::http::SimpleResponseProcessor sp;
+    ::http::ResponseParser p(sp);
+
+    const auto too_big = ccf::http::default_max_body_size.count_bytes() + 1;
+    const auto res =
+      fmt::format("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", too_big);
+    const auto bytes = std::vector<uint8_t>(res.begin(), res.end());
+
+    DOCTEST_CHECK_THROWS_AS(
+      p.execute(bytes.data(), bytes.size()),
+      http::RequestPayloadTooLargeException);
+    DOCTEST_CHECK(sp.received.empty());
+  }
+
+  // A body exceeding max_body_size is rejected. With a Content-Length header
+  // the parser exits early, at the point where headers are complete, before
+  // any body chunk has been appended.
+  {
+    http::SimpleRequestProcessor sp;
+    http::RequestParser p(sp, config);
+
+    const std::vector<uint8_t> body(16, 'a');
+    auto req = http::build_post_request(body);
+
+    DOCTEST_CHECK_THROWS_AS(
+      p.execute(req.data(), req.size()), http::RequestPayloadTooLargeException);
+    DOCTEST_CHECK(sp.received.empty());
+  }
+
+  // The early exit happens before any body bytes are received. Send only the
+  // headers (advertising a large Content-Length) with no body at all, and the
+  // request is still rejected.
+  {
+    http::SimpleRequestProcessor sp;
+    http::RequestParser p(sp, config);
+
+    const std::vector<uint8_t> body(16, 'a');
+    auto header = http::build_post_header(body);
+
+    DOCTEST_CHECK_THROWS_AS(
+      p.execute(header.data(), header.size()),
+      http::RequestPayloadTooLargeException);
+    DOCTEST_CHECK(sp.received.empty());
+  }
+
+  // A body within max_body_size is accepted.
+  {
+    http::SimpleRequestProcessor sp;
+    http::RequestParser p(sp, config);
+
+    const std::vector<uint8_t> body(4, 'a');
+    auto req = http::build_post_request(body);
+
+    p.execute(req.data(), req.size());
+    DOCTEST_CHECK(!sp.received.empty());
+    DOCTEST_CHECK(sp.received.front().body == body);
+  }
+
+  // A body exactly at max_body_size is accepted: the check is strictly
+  // greater-than, so the boundary value is allowed.
+  {
+    http::SimpleRequestProcessor sp;
+    http::RequestParser p(sp, config);
+
+    const std::vector<uint8_t> body(8, 'a');
+    auto req = http::build_post_request(body);
+
+    p.execute(req.data(), req.size());
+    DOCTEST_CHECK(!sp.received.empty());
+    DOCTEST_CHECK(sp.received.front().body == body);
+  }
+
+  // The append_body accumulation check is the fallback that rejects chunked
+  // messages once the chunks received exceed max_body_size.
+  auto build_chunked_message = [](
+                                 std::string_view start_line,
+                                 size_t body_size,
+                                 std::string_view additional_headers = {}) {
+    const std::string chunk(body_size, 'a');
+    const std::string message = fmt::format(
+      "{}\r\n"
+      "transfer-encoding: chunked\r\n"
+      "{}"
+      "\r\n"
+      "{:x}\r\n"
+      "{}\r\n"
+      "0\r\n"
+      "\r\n",
+      start_line,
+      additional_headers,
+      body_size,
+      chunk);
+    return std::vector<uint8_t>(message.begin(), message.end());
+  };
+
+  // An oversized chunked body is rejected by append_body as the chunks
+  // accumulate, even though no Content-Length was advertised.
+  {
+    http::SimpleRequestProcessor sp;
+    http::RequestParser p(sp, config);
+
+    auto req = build_chunked_message("POST / HTTP/1.1", 16);
+
+    DOCTEST_CHECK_THROWS_AS(
+      p.execute(req.data(), req.size()), http::RequestPayloadTooLargeException);
+    DOCTEST_CHECK(sp.received.empty());
+  }
+
+  // A chunked body within max_body_size is accepted.
+  {
+    http::SimpleRequestProcessor sp;
+    http::RequestParser p(sp, config);
+
+    auto req = build_chunked_message("POST / HTTP/1.1", 4);
+
+    p.execute(req.data(), req.size());
+    DOCTEST_CHECK(!sp.received.empty());
+    DOCTEST_CHECK(sp.received.front().body.size() == 4);
+  }
+
+  // When llhttp accepts both headers, Transfer-Encoding takes precedence and
+  // the ignored Content-Length must not trigger the early size check.
+  {
+    http::SimpleRequestProcessor sp;
+    LenientChunkedLengthRequestParser p(sp, config);
+
+    auto req =
+      build_chunked_message("POST / HTTP/1.1", 4, "content-length: 16\r\n");
+
+    p.execute(req.data(), req.size());
+    DOCTEST_CHECK(!sp.received.empty());
+    DOCTEST_CHECK(sp.received.front().body.size() == 4);
+  }
+
+  // Ignoring Content-Length for a chunked message does not bypass the limit:
+  // append_body still rejects the actual accumulated body size.
+  {
+    http::SimpleRequestProcessor sp;
+    LenientChunkedLengthRequestParser p(sp, config);
+
+    auto req =
+      build_chunked_message("POST / HTTP/1.1", 16, "content-length: 4\r\n");
+
+    DOCTEST_CHECK_THROWS_AS(
+      p.execute(req.data(), req.size()), http::RequestPayloadTooLargeException);
+    DOCTEST_CHECK(sp.received.empty());
+  }
+
+  // The same chunked precedence applies to responses in the shared Parser.
+  {
+    ::http::SimpleResponseProcessor sp;
+    LenientChunkedLengthResponseParser p(sp);
+
+    const auto too_big = ccf::http::default_max_body_size.count_bytes() + 1;
+    const auto content_length = fmt::format("content-length: {}\r\n", too_big);
+    auto response = build_chunked_message("HTTP/1.1 200 OK", 4, content_length);
+
+    p.execute(response.data(), response.size());
+    DOCTEST_CHECK(!sp.received.empty());
+    DOCTEST_CHECK(sp.received.front().body.size() == 4);
+  }
+}
+
 DOCTEST_TEST_CASE("Multiple requests")
 {
   http::SimpleRequestProcessor sp;
@@ -277,7 +473,7 @@ DOCTEST_TEST_CASE("URL parsing")
 
 DOCTEST_TEST_CASE("Pessimal transport")
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   const ccf::http::HeaderMap h1 = {{"foo", "bar"}, {"baz", "42"}};
   const ccf::http::HeaderMap h2 = {
@@ -467,6 +663,79 @@ DOCTEST_TEST_CASE("URL parser")
   }
 }
 
+DOCTEST_TEST_CASE("Query component decoding")
+{
+  // Passes plain ASCII through unchanged
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("") == "");
+  DOCTEST_REQUIRE(
+    ccf::http::decode_query_component("plain_ascii123") == "plain_ascii123");
+
+  // '+' is decoded to a space
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("a+b+c") == "a b c");
+
+  // %XX escapes are decoded, for both upper and lower case hex digits
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%41%42%43") == "ABC");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%61%62%63") == "abc");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%2f%2F") == "//");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("100%25") == "100%");
+
+  // Truncated escapes at the end of the string are passed through literally,
+  // rather than reading out of bounds or throwing
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%") == "%");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("a%") == "a%");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("a%2") == "a%2");
+
+  // Escapes with non-hex-digit characters are passed through literally
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%zz") == "%zz");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%2g") == "%2g");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%g2") == "%g2");
+
+  // Multi-byte (UTF-8) sequences are decoded byte-by-byte, and recombine to
+  // the original encoded code point
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%C3%A9") == "\xC3\xA9");
+
+  // '+' and %20 both decode to a space, while %2B is a literal '+'
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("a+b%20c") == "a b c");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("a%2Bb%20c") == "a+b c");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%2B") == "+");
+
+  // A literal '%' is kept when it does not begin a valid escape, including
+  // immediately before an otherwise-valid escape
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%%41") == "%A");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%41%") == "A%");
+  DOCTEST_REQUIRE(ccf::http::decode_query_component("%41%%42") == "A%B");
+
+  // NUL bytes are decoded and preserved (std::string can hold them)
+  DOCTEST_REQUIRE(
+    ccf::http::decode_query_component("%00") == std::string(1, '\0'));
+  DOCTEST_REQUIRE(
+    ccf::http::decode_query_component("a%00b") == std::string("a\0b", 3));
+
+  {
+    DOCTEST_INFO(
+      "Every possible byte value round-trips through percent-encoding and "
+      "decode_query_component");
+    for (size_t byte = 0; byte < 256; ++byte)
+    {
+      const auto c = static_cast<char>(byte);
+
+      // '+' is ambiguous with space when percent-encoding is not used, so
+      // skip it here (it is covered explicitly above) - every other byte
+      // should round-trip when escaped as %XX
+      if (c == '+')
+      {
+        continue;
+      }
+
+      const auto escaped =
+        fmt::format("%{:02X}", static_cast<unsigned char>(byte));
+      const auto decoded = ccf::http::decode_query_component(escaped);
+      DOCTEST_REQUIRE(decoded.size() == 1);
+      DOCTEST_REQUIRE(decoded[0] == c);
+    }
+  }
+}
+
 DOCTEST_TEST_CASE("Query parser")
 {
   constexpr auto query =
@@ -479,6 +748,13 @@ DOCTEST_TEST_CASE("Query parser")
 
     // Parses certain things as empty-string values
     "&empty&also_empty="
+
+    // Splits before URL-decoding each key and value
+    "&bar%26baz=tom%26jerry&encoded%3Dkey=encoded%3Dvalue"
+
+    // Malformed or truncated percent-escapes within a key or value are kept
+    // literally, rather than being dropped or causing a parse failure
+    "&malformed%=oops&trailing%"
 
     // Will even produce empty-string keys, since it splits at every ampersand
     "&"
@@ -517,6 +793,10 @@ DOCTEST_TEST_CASE("Query parser")
   REQUIRE_PARSED_SINGLE_QUERY_PARAM("awkward!key?\"", "fine");
   REQUIRE_PARSED_EMPTY_QUERY_PARAM("empty");
   REQUIRE_PARSED_EMPTY_QUERY_PARAM("also_empty");
+  REQUIRE_PARSED_SINGLE_QUERY_PARAM("bar&baz", "tom&jerry");
+  REQUIRE_PARSED_SINGLE_QUERY_PARAM("encoded=key", "encoded=value");
+  REQUIRE_PARSED_SINGLE_QUERY_PARAM("malformed%", "oops");
+  REQUIRE_PARSED_EMPTY_QUERY_PARAM("trailing%");
   REQUIRE_PARSED_EMPTY_QUERY_PARAM("");
 
 #undef REQUIRE_PARSED_SINGLE_QUERY_PARAM
@@ -562,15 +842,43 @@ DOCTEST_TEST_CASE("Query parser")
   }
 }
 
+DOCTEST_TEST_CASE("Query parser edge cases")
+{
+  {
+    // A leading '=' produces an empty key with a (decoded) value
+    const auto parsed = ccf::http::parse_query("=value");
+    const auto it = parsed.find("");
+    DOCTEST_REQUIRE(it != parsed.end());
+    DOCTEST_REQUIRE(it->second == "value");
+  }
+
+  {
+    // A trailing '=' produces an empty value
+    const auto parsed = ccf::http::parse_query("key=");
+    const auto it = parsed.find("key");
+    DOCTEST_REQUIRE(it != parsed.end());
+    DOCTEST_REQUIRE(it->second.empty());
+  }
+
+  {
+    // Splitting happens on the first raw '=' only; a '=' escaped as %3D and an
+    // '&' escaped as %26 inside the value are preserved
+    const auto parsed = ccf::http::parse_query("k=a=b%26c");
+    const auto it = parsed.find("k");
+    DOCTEST_REQUIRE(it != parsed.end());
+    DOCTEST_REQUIRE(it->second == "a=b&c");
+  }
+}
+
 DOCTEST_TEST_CASE("Parse Accept header")
 {
   {
-    const auto fields = http::parse_accept_header("");
+    const auto fields = ccf::http::parse_accept_header("");
     DOCTEST_REQUIRE(fields.empty());
   }
 
   {
-    const auto fields = http::parse_accept_header("foo/bar;q=0.25");
+    const auto fields = ccf::http::parse_accept_header("foo/bar;q=0.25");
     DOCTEST_REQUIRE(fields.size() == 1);
     const auto& field = fields[0];
     DOCTEST_REQUIRE(field.mime_type == "foo");
@@ -581,7 +889,7 @@ DOCTEST_TEST_CASE("Parse Accept header")
   {
     // Shuffled and modified version of Firefox 91 default value, to test
     // sorting
-    const auto fields = http::parse_accept_header(
+    const auto fields = ccf::http::parse_accept_header(
       "image/webp;q=0.8, "
       "image/*;q=0.8, "
       "text/html, "
@@ -591,31 +899,35 @@ DOCTEST_TEST_CASE("Parse Accept header")
       "*/*;q=0.8");
     DOCTEST_REQUIRE(fields.size() == 7);
 
-    DOCTEST_REQUIRE(fields[0] == http::AcceptHeaderField{"text", "html", 1.0f});
     DOCTEST_REQUIRE(
-      fields[1] == http::AcceptHeaderField{"image", "avif", 1.0f});
+      fields[0] == ccf::http::AcceptHeaderField{"text", "html", 1.0f});
     DOCTEST_REQUIRE(
-      fields[2] == http::AcceptHeaderField{"application", "xhtml+xml", 1.0f});
+      fields[1] == ccf::http::AcceptHeaderField{"image", "avif", 1.0f});
     DOCTEST_REQUIRE(
-      fields[3] == http::AcceptHeaderField{"application", "xml", 0.9f});
+      fields[2] ==
+      ccf::http::AcceptHeaderField{"application", "xhtml+xml", 1.0f});
     DOCTEST_REQUIRE(
-      fields[4] == http::AcceptHeaderField{"image", "webp", 0.8f});
-    DOCTEST_REQUIRE(fields[5] == http::AcceptHeaderField{"image", "*", 0.8f});
-    DOCTEST_REQUIRE(fields[6] == http::AcceptHeaderField{"*", "*", 0.8f});
+      fields[3] == ccf::http::AcceptHeaderField{"application", "xml", 0.9f});
+    DOCTEST_REQUIRE(
+      fields[4] == ccf::http::AcceptHeaderField{"image", "webp", 0.8f});
+    DOCTEST_REQUIRE(
+      fields[5] == ccf::http::AcceptHeaderField{"image", "*", 0.8f});
+    DOCTEST_REQUIRE(fields[6] == ccf::http::AcceptHeaderField{"*", "*", 0.8f});
   }
 
   {
-    DOCTEST_REQUIRE_THROWS(http::parse_accept_header("not_a_mime_type"));
-    DOCTEST_REQUIRE_THROWS(http::parse_accept_header("valid/mime;q=notnum"));
-    DOCTEST_REQUIRE_THROWS(http::parse_accept_header(","));
+    DOCTEST_REQUIRE_THROWS(ccf::http::parse_accept_header("not_a_mime_type"));
+    DOCTEST_REQUIRE_THROWS(
+      ccf::http::parse_accept_header("valid/mime;q=notnum"));
+    DOCTEST_REQUIRE_THROWS(ccf::http::parse_accept_header(","));
   }
 }
 
 DOCTEST_TEST_CASE("Accept header MIME matching")
 {
-  const auto a = http::AcceptHeaderField{"foo", "bar", 1.0f};
-  const auto b = http::AcceptHeaderField{"foo", "*", 1.0f};
-  const auto c = http::AcceptHeaderField{"*", "*", 1.0f};
+  const auto a = ccf::http::AcceptHeaderField{"foo", "bar", 1.0f};
+  const auto b = ccf::http::AcceptHeaderField{"foo", "*", 1.0f};
+  const auto c = ccf::http::AcceptHeaderField{"*", "*", 1.0f};
 
   DOCTEST_REQUIRE(a.matches("foo/bar"));
   DOCTEST_REQUIRE_FALSE(a.matches("foo/baz"));
@@ -631,4 +943,282 @@ DOCTEST_TEST_CASE("Accept header MIME matching")
   DOCTEST_REQUIRE(c.matches("foo/baz"));
   DOCTEST_REQUIRE(c.matches("fob/bar"));
   DOCTEST_REQUIRE(c.matches("fob/baz"));
+}
+
+DOCTEST_TEST_CASE("Query parser getters")
+{
+  {
+    constexpr auto query = "foo=bar&baz=123";
+    const auto parsed = ccf::http::parse_query(query);
+
+    std::string err = "";
+
+    {
+      std::string val;
+      DOCTEST_REQUIRE(ccf::http::get_query_value(parsed, "foo", val, err));
+      DOCTEST_REQUIRE(val == "bar");
+      DOCTEST_REQUIRE(err.empty());
+    }
+
+    {
+      size_t val;
+      DOCTEST_REQUIRE(ccf::http::get_query_value(parsed, "baz", val, err));
+      DOCTEST_REQUIRE(val == 123);
+      DOCTEST_REQUIRE(err.empty());
+    }
+
+    {
+      std::string val;
+      DOCTEST_REQUIRE(ccf::http::get_query_value(parsed, "baz", val, err));
+      DOCTEST_REQUIRE(val == "123");
+      DOCTEST_REQUIRE(err.empty());
+    }
+
+    {
+      size_t val;
+      DOCTEST_REQUIRE(!ccf::http::get_query_value(parsed, "foo", val, err));
+      DOCTEST_REQUIRE(err == "Unable to parse value 'bar' in parameter 'foo'");
+    }
+  }
+
+  {
+    constexpr auto query = "t=true&f=false&fnf=filenotfound";
+    const auto parsed = ccf::http::parse_query(query);
+    std::string err = "";
+
+    {
+      bool val = false;
+      DOCTEST_REQUIRE(ccf::http::get_query_value(parsed, "t", val, err));
+      DOCTEST_REQUIRE(val == true);
+      DOCTEST_REQUIRE(err.empty());
+    }
+
+    {
+      bool val = true;
+      DOCTEST_REQUIRE(ccf::http::get_query_value(parsed, "f", val, err));
+      DOCTEST_REQUIRE(val == false);
+      DOCTEST_REQUIRE(err.empty());
+    }
+
+    {
+      bool val;
+      DOCTEST_REQUIRE(!ccf::http::get_query_value(parsed, "fnf", val, err));
+      DOCTEST_REQUIRE(
+        err ==
+        "Unable to parse value 'filenotfound' as bool in parameter 'fnf'");
+    }
+  }
+
+  {
+    DOCTEST_INFO("Signed integral types accept negative values");
+    constexpr auto query = "neg=-42&pos=42";
+    const auto parsed = ccf::http::parse_query(query);
+    std::string err;
+
+    {
+      int val = 0;
+      DOCTEST_REQUIRE(ccf::http::get_query_value(parsed, "neg", val, err));
+      DOCTEST_REQUIRE(val == -42);
+      DOCTEST_REQUIRE(err.empty());
+    }
+
+    {
+      // Unsigned types correctly reject a negative value, rather than
+      // wrapping around to a large positive value
+      size_t val = 0;
+      DOCTEST_REQUIRE(!ccf::http::get_query_value(parsed, "neg", val, err));
+      DOCTEST_REQUIRE(err == "Unable to parse value '-42' in parameter 'neg'");
+    }
+
+    {
+      uint8_t val = 0;
+      err.clear();
+      DOCTEST_REQUIRE(ccf::http::get_query_value(parsed, "pos", val, err));
+      DOCTEST_REQUIRE(val == 42);
+      DOCTEST_REQUIRE(err.empty());
+    }
+  }
+
+  {
+    DOCTEST_INFO(
+      "Values which overflow the target integral type, or contain trailing "
+      "garbage, are rejected rather than silently truncated");
+    constexpr auto query =
+      "overflow=999999999999999999999999&trailing=123abc&"
+      "leading_space= 123&hex=0x1A";
+    const auto parsed = ccf::http::parse_query(query);
+    std::string err;
+
+    {
+      uint8_t val = 0;
+      DOCTEST_REQUIRE(
+        !ccf::http::get_query_value(parsed, "overflow", val, err));
+    }
+
+    {
+      int val = 0;
+      DOCTEST_REQUIRE(
+        !ccf::http::get_query_value(parsed, "trailing", val, err));
+    }
+
+    {
+      int val = 0;
+      DOCTEST_REQUIRE(
+        !ccf::http::get_query_value(parsed, "leading_space", val, err));
+    }
+
+    {
+      // from_chars parses decimal by default, so a hex-prefixed string is
+      // parsed only up to the invalid 'x', and rejected as trailing garbage
+      int val = 0;
+      DOCTEST_REQUIRE(!ccf::http::get_query_value(parsed, "hex", val, err));
+    }
+  }
+
+  {
+    DOCTEST_INFO("Percent-escaped integral values are decoded before parsing");
+    constexpr auto query = "escaped_neg=%2D42";
+    const auto parsed = ccf::http::parse_query(query);
+    std::string err;
+
+    int val = 0;
+    DOCTEST_REQUIRE(
+      ccf::http::get_query_value(parsed, "escaped_neg", val, err));
+    DOCTEST_REQUIRE(val == -42);
+    DOCTEST_REQUIRE(err.empty());
+  }
+}
+
+DOCTEST_TEST_CASE("parse_want_repr_digest - single supported algorithm")
+{
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("sha-256=1");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("sha-384=5");
+    DOCTEST_CHECK(algo == "sha-384");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA384);
+  }
+
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("sha-512=10");
+    DOCTEST_CHECK(algo == "sha-512");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA512);
+  }
+}
+
+DOCTEST_TEST_CASE(
+  "parse_want_repr_digest - multiple algorithms with priorities")
+{
+  {
+    auto [algo, md] =
+      ccf::http::parse_want_repr_digest("sha-256=1, sha-512=10");
+    DOCTEST_CHECK(algo == "sha-512");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA512);
+  }
+
+  {
+    auto [algo, md] =
+      ccf::http::parse_want_repr_digest("sha-512=3, sha-256=7, sha-384=5");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    auto [algo, md] =
+      ccf::http::parse_want_repr_digest("sha-384=10, sha-256=10");
+    // Equal preference - first one wins
+    DOCTEST_CHECK(algo == "sha-384");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA384);
+  }
+}
+
+DOCTEST_TEST_CASE("parse_want_repr_digest - unknown algorithms are ignored")
+{
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("md5=10, sha-256=1");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    auto [algo, md] =
+      ccf::http::parse_want_repr_digest("crc32=5, sha-384=3, unknown=10");
+    DOCTEST_CHECK(algo == "sha-384");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA384);
+  }
+}
+
+DOCTEST_TEST_CASE("parse_want_repr_digest - defaults to sha-256 when no match")
+{
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("md5=10");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("unknown=5");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+}
+
+DOCTEST_TEST_CASE("parse_want_repr_digest - malformed entries are skipped")
+{
+  {
+    // Preference of 0 is invalid (must be >= 1)
+    auto [algo, md] = ccf::http::parse_want_repr_digest("sha-256=0");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    // Negative preference is invalid
+    auto [algo, md] = ccf::http::parse_want_repr_digest("sha-512=-1");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    // Non-numeric preference is skipped, but valid entry is used
+    auto [algo, md] =
+      ccf::http::parse_want_repr_digest("sha-256=abc, sha-384=5");
+    DOCTEST_CHECK(algo == "sha-384");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA384);
+  }
+}
+
+DOCTEST_TEST_CASE("parse_want_repr_digest - whitespace handling")
+{
+  {
+    auto [algo, md] = ccf::http::parse_want_repr_digest("  sha-256 = 1  ");
+    DOCTEST_CHECK(algo == "sha-256");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA256);
+  }
+
+  {
+    auto [algo, md] =
+      ccf::http::parse_want_repr_digest("sha-256=1 , sha-512=10");
+    DOCTEST_CHECK(algo == "sha-512");
+    DOCTEST_CHECK(md == ccf::crypto::MDType::SHA512);
+  }
+}
+
+DOCTEST_TEST_CASE(
+  "parse_want_repr_digest - algorithm without explicit preference")
+{
+  // No "=" means preference defaults to 1
+  auto [algo, md] = ccf::http::parse_want_repr_digest("sha-512");
+  DOCTEST_CHECK(algo == "sha-512");
+  DOCTEST_CHECK(md == ccf::crypto::MDType::SHA512);
 }

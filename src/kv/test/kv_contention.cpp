@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
-#include "ccf/ds/logger.h"
 #include "crypto/openssl/hash.h"
+#include "ds/internal_logger.h"
 #include "kv/compacted_version_conflict.h"
 #include "kv/kv_serialiser.h"
 #include "kv/store.h"
@@ -36,7 +36,7 @@ public:
 
 DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 {
-  ccf::logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   // Multiple threads write random entries into random tables, and attempt to
   // commit them. A single thread continually compacts the kv to the latest
@@ -80,7 +80,6 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
   }
 
   auto thread_fn = [](void* a) {
-    ccf::crypto::openssl_sha256_init();
     auto args = static_cast<ThreadArgs*>(a);
 
     for (size_t i = 0u; i < tx_count; ++i)
@@ -139,7 +138,6 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 
     // Notify that this thread has finished
     --*args->counter;
-    ccf::crypto::openssl_sha256_shutdown();
   };
 
   // Start a thread which continually compacts at the latest version, until all
@@ -199,12 +197,12 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
     const auto initial_version = kv_store.compacted_version();
 
     // Start tx threads
-    for (size_t i = 0u; i < thread_count; ++i)
+    for (size_t t = 0u; t < thread_count; ++t)
     {
-      args[i].kv_store = &kv_store;
-      args[i].counter = &active_tx_threads;
+      args[t].kv_store = &kv_store;
+      args[t].counter = &active_tx_threads;
 
-      tx_threads[i] = std::thread(thread_fn, &args[i]);
+      tx_threads[t] = std::thread(thread_fn, &args[t]);
     }
 
     // Wait for the compact thread to start
@@ -237,9 +235,9 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
     DOCTEST_REQUIRE(consensus->number_of_replicas() == expected);
 
     // Wait for tx threads to complete
-    for (size_t i = 0u; i < thread_count; ++i)
+    for (size_t t = 0u; t < thread_count; ++t)
     {
-      tx_threads[i].join();
+      tx_threads[t].join();
     }
 
     // Wait for compact thread to complete
@@ -252,6 +250,8 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 DOCTEST_TEST_CASE(
   "get_version_of_previous_write ordering" * doctest::test_suite("concurrency"))
 {
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
+
   // Many threads attempt to produce a chain of transactions pointing at the
   // previous write to a single key, at that key.
   ccf::kv::Store kv_store;
@@ -268,7 +268,6 @@ DOCTEST_TEST_CASE(
   std::atomic<size_t> conflict_count = 0;
 
   auto point_at_previous_write = [&]() {
-    ccf::crypto::openssl_sha256_init();
     auto sleep_time = std::chrono::microseconds(5);
     while (true)
     {
@@ -310,12 +309,11 @@ DOCTEST_TEST_CASE(
       sleep_time =
         std::chrono::microseconds((size_t)(sleep_time.count() * factor));
     }
-    ccf::crypto::openssl_sha256_shutdown();
   };
 
   std::vector<std::thread> threads;
   constexpr auto num_threads = 64;
-  constexpr auto writes_per_thread = 10;
+  constexpr auto writes_per_thread = 100;
   for (size_t i = 0; i < num_threads; ++i)
   {
     threads.emplace_back([&]() {
@@ -331,6 +329,7 @@ DOCTEST_TEST_CASE(
     thread.join();
   }
 
+  LOG_INFO_FMT("Found {} conflicts", conflict_count);
   DOCTEST_CHECK(conflict_count > 0);
   constexpr auto last_write_version = num_threads * writes_per_thread;
 

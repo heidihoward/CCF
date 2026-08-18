@@ -17,7 +17,7 @@ namespace ccf
     nlohmann::json payload;
   };
 
-  struct VerifiersCache;
+  struct PublicKeysCache;
 
   bool validate_issuer(
     const std::string& iss,
@@ -28,13 +28,13 @@ namespace ccf
   {
   protected:
     static const OpenAPISecuritySchema security_schema;
-    std::unique_ptr<VerifiersCache> verifiers;
+    std::unique_ptr<PublicKeysCache> keys_cache;
 
   public:
     static constexpr auto SECURITY_SCHEME_NAME = "jwt";
 
     JwtAuthnPolicy();
-    virtual ~JwtAuthnPolicy();
+    ~JwtAuthnPolicy() override;
 
     std::unique_ptr<AuthnIdentity> authenticate(
       ccf::kv::ReadOnlyTx& tx,
@@ -45,8 +45,8 @@ namespace ccf
       std::shared_ptr<ccf::RpcContext> ctx,
       std::string&& error_reason) override;
 
-    std::optional<OpenAPISecuritySchema> get_openapi_security_schema()
-      const override
+    [[nodiscard]] std::optional<OpenAPISecuritySchema>
+    get_openapi_security_schema() const override
     {
       return security_schema;
     }

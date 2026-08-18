@@ -2,12 +2,41 @@
 # Licensed under the Apache 2.0 License.
 import argparse
 import os
-import infra.interfaces
-import infra.path
-import infra.network
 import sys
 
 from loguru import logger as LOG
+
+import infra.interfaces
+import infra.network
+import infra.path
+
+_LOG_LEVEL_DISPLAY = {
+    "TRACE": "TRC ",
+    "DEBUG": "DBG ",
+    "INFO": "INFO",
+    "SUCCESS": "SUCC",
+    "WARNING": "WARN",
+    "ERROR": "ERR ",
+    "CRITICAL": "CRIT",
+}
+
+_LOG_MESSAGE_MARKERS = {
+    "SUCCESS": "\u2705 ",
+    "WARNING": "\u26a0\ufe0f ",
+    "ERROR": "\u274c ",
+}
+
+
+def format_log_record(record, include_thread=False):
+    level_name = record["level"].name
+    display_level = _LOG_LEVEL_DISPLAY[level_name]
+    marker = _LOG_MESSAGE_MARKERS.get(level_name, "")
+    time_format = "YYYY-MM-DD HH:mm:ss.SSS" if include_thread else "HH:mm:ss.SSS"
+    thread = "{{{thread.name}}} " if include_thread else ""
+    return (
+        f"{{time:{time_format}}} | {display_level} | {thread}"
+        f"{{name}}:{{function}}:{{line}} - {marker}{{message}}\n{{exception}}"
+    )
 
 
 def absolute_path_to_existing_file(arg):
@@ -19,16 +48,7 @@ def absolute_path_to_existing_file(arg):
 
 
 def nodes(args, n):
-    return [
-        infra.interfaces.HostSpec(
-            rpc_interfaces={
-                infra.interfaces.PRIMARY_RPC_INTERFACE: infra.interfaces.RPCInterface.from_args(
-                    args
-                )
-            }
-        )
-        for _ in range(n)
-    ]
+    return [infra.interfaces.HostSpec().with_args(args) for _ in range(n)]
 
 
 def min_nodes(args, f):
@@ -51,6 +71,10 @@ def max_f(args, number_nodes):
     return (number_nodes - 1) // 2
 
 
+def default_platform():
+    return "virtual"
+
+
 def cli_args(
     add=lambda x: None,
     parser=None,
@@ -60,7 +84,7 @@ def cli_args(
     LOG.remove()
     LOG.add(
         sys.stdout,
-        format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        format=format_log_record,
     )
 
     if parser is None:
@@ -70,15 +94,8 @@ def cli_args(
     parser.add_argument(
         "-b",
         "--binary-dir",
-        help="Path to CCF binaries (cchost, scurl, keygenerator)",
+        help="Path to CCF binaries (node executable, scurl, keygenerator)",
         default=".",
-    )
-    parser.add_argument(
-        "--oe-binary",
-        help="Path to Open Enclave binary folder",
-        type=str,
-        nargs="?",
-        default="/opt/openenclave/bin/",
     )
     parser.add_argument(
         "--library-dir",
@@ -92,38 +109,11 @@ def cli_args(
         action="append",
         default=[],
     )
-    parser.add_argument(
-        "--perf-nodes",
-        help="List of node ids. Nodes that should be run under perf, capturing performance data",
-        action="append",
-        default=[],
-    )
-    # "virtual" is deprecated (use enclave-platform)
-    parser.add_argument(
-        "-e",
-        "--enclave-type",
-        help="Enclave type",
-        default=os.getenv("TEST_ENCLAVE", os.getenv("DEFAULT_ENCLAVE_TYPE", "release")),
-        choices=("release", "debug", "virtual"),
-    )
-    parser.add_argument(
-        "-t",
-        "--enclave-platform",
-        help="Enclave platform (Trusted Execution Environment)",
-        default=os.getenv("TEST_ENCLAVE", os.getenv("DEFAULT_ENCLAVE_PLATFORM", "sgx")),
-        choices=("sgx", "snp", "virtual"),
-    )
     log_level_choices = ("trace", "debug", "info", "fail", "fatal")
     default_log_level = "info"
     parser.add_argument(
-        "--host-log-level",
-        help="Runtime host log level",
-        default=default_log_level,
-        choices=log_level_choices,
-    )
-    parser.add_argument(
-        "--enclave-log-level",
-        help="Runtime enclave log level",
+        "--log-level",
+        help="Runtime log level",
         default=default_log_level,
         choices=log_level_choices,
     )
@@ -136,7 +126,7 @@ def cli_args(
     parser.add_argument(
         "-p",
         "--package",
-        help="The enclave package to load (e.g., liblogging)",
+        help="The enclave package to load (e.g., logging)",
     )
     parser.add_argument(
         "--constitution",
@@ -150,6 +140,11 @@ def cli_args(
         help="Path to JSON file with JWT issuer definition",
         action="append",
         default=[],
+    )
+    parser.add_argument(
+        "--jwt-key-refresh-max-response-size",
+        help="Maximum response body size accepted when fetching JWT issuer OpenID metadata and JWKS",
+        default="1MB",
     )
     parser.add_argument(
         "-o",
@@ -185,12 +180,6 @@ def cli_args(
         help="Raft maximum timeout before primary sends updates",
         type=int,
         default=100,
-    )
-    parser.add_argument(
-        "--consensus",
-        help="Consensus",
-        default="CFT",
-        choices=("CFT",),
     )
     parser.add_argument(
         "--worker-threads",
@@ -272,16 +261,24 @@ def cli_args(
         default=1,
     )
     parser.add_argument(
-        "--initial-recovery-member-count",
-        help="Number of initial members that are handed recovery shares",
+        "--initial-recovery-participant-count",
+        help="Number of initial members that are handed partial recovery shares",
         type=int,
         default=int(os.getenv("INITIAL_MEMBER_COUNT", "3")),
+    )
+    parser.add_argument(
+        "--initial-recovery-owner-count",
+        help="Number of initial members that are handed full recovery shares",
+        type=int,
+        default=int(os.getenv("INITIAL_RECOVERY_OWNER_COUNT", "0")),
     )
     parser.add_argument(
         "--ledger-recovery-timeout",
         help="On recovery, maximum timeout (s) while reading the ledger",
         type=int,
-        default=30,
+        # _GLIBCXX_DEBUG significantly slows down ledger replay, so allow
+        # more time when running tests against a debug build.
+        default=120 if os.getenv("CCF_GLIBCXX_DEBUG") else 30,
     )
     parser.add_argument(
         "--ledger-chunk-bytes",
@@ -294,6 +291,18 @@ def cli_args(
         help="Number of transactions between two snapshots",
         type=int,
         default=10,
+    )
+    parser.add_argument(
+        "--snapshot-min-tx-interval",
+        help="Minimum number of transactions before a time-based snapshot can trigger",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--snapshot-time-interval",
+        help="Time interval after which a snapshot should be triggered (e.g. 30s, 5min)",
+        type=str,
+        default="0s",
     )
     parser.add_argument(
         "--max-open-sessions",
@@ -397,11 +406,7 @@ def cli_args(
         help="Servers used to retrieve attestation report endorsement certificates (AMD SEV-SNP only)",
         action="append",
         # ACI default
-        default=(
-            ["THIM:$Fabric_NodeIPOrFQDN:2377"]
-            if os.getenv("DEFAULT_ENCLAVE_PLATFORM") == "snp"
-            else []
-        ),
+        default=(["THIM:$Fabric_NodeIPOrFQDN:2377"]),
     )
     parser.add_argument(
         "--forwarding-timeout-ms",
@@ -443,7 +448,7 @@ def cli_args(
             args.library_dir = args.binary_dir
 
     if not args.package and args.js_app_bundle:
-        args.package = "libjs_generic"
+        args.package = "js_generic"
 
     if accept_unknown:
         return args, unknown_args

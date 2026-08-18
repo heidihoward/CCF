@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
-#include "ccf/ds/logger.h"
+#include "ds/internal_logger.h"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -12,7 +12,7 @@ TEST_CASE("Test custom log format")
   std::string test_log_file = "./test_json_logger.txt";
   remove(test_log_file.c_str());
   ccf::logger::config::add_json_console_logger();
-  ccf::logger::config::level() = LoggerLevel::DEBUG;
+  ccf::logger::config::level() = ccf::LoggerLevel::DEBUG;
   std::string log_msg_dbg = "log_msg_dbg";
   std::string log_msg_trace = "log_msg_trace";
 

@@ -1,12 +1,15 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import os
-import json
 import dataclasses
-from typing import Optional, Union
+import json
+import os
+import subprocess
+
+from loguru import logger as LOG
 
 BENCHER_FILE = "bencher.json"
+METADATA_KEY = "__metadata"
 
 # See https://bencher.dev/docs/reference/bencher-metric-format/
 
@@ -14,8 +17,8 @@ BENCHER_FILE = "bencher.json"
 @dataclasses.dataclass
 class Value:
     value: float
-    high_value: Optional[float] = None
-    low_value: Optional[float] = None
+    high_value: float | None = None
+    low_value: float | None = None
 
 
 @dataclasses.dataclass
@@ -25,8 +28,8 @@ class Latency:
     def __init__(
         self,
         value: float,
-        high_value: Optional[float] = None,
-        low_value: Optional[float] = None,
+        high_value: float | None = None,
+        low_value: float | None = None,
     ):
         self.latency = Value(value, high_value, low_value)
 
@@ -38,8 +41,8 @@ class Throughput:
     def __init__(
         self,
         value: float,
-        high_value: Optional[float] = None,
-        low_value: Optional[float] = None,
+        high_value: float | None = None,
+        low_value: float | None = None,
     ):
         self.throughput = Value(value, high_value, low_value)
 
@@ -51,8 +54,8 @@ class Memory:
     def __init__(
         self,
         value: float,
-        high_value: Optional[float] = None,
-        low_value: Optional[float] = None,
+        high_value: float | None = None,
+        low_value: float | None = None,
     ):
         self.memory = Value(value, high_value, low_value)
 
@@ -64,10 +67,40 @@ class Rate:
     def __init__(
         self,
         value: float,
-        high_value: Optional[float] = None,
-        low_value: Optional[float] = None,
+        high_value: float | None = None,
+        low_value: float | None = None,
     ):
         self.rate = Value(value, high_value, low_value)
+
+
+def get_commit() -> str | None:
+    commit = os.environ.get("GITHUB_SHA")
+    if commit:
+        return commit
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    return result.stdout.strip() or None
+
+
+def get_metadata() -> dict:
+    metadata = {
+        "commit": get_commit(),
+        "repository": os.environ.get("GITHUB_REPOSITORY"),
+        "server_url": os.environ.get("GITHUB_SERVER_URL"),
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "run_number": os.environ.get("GITHUB_RUN_NUMBER"),
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+    }
+    return {key: value for key, value in metadata.items() if value}
 
 
 class Bencher:
@@ -76,7 +109,26 @@ class Bencher:
             with open(BENCHER_FILE, "w+") as bf:
                 json.dump({}, bf)
 
-    def set(self, key: str, metric: Union[Latency, Throughput, Memory]):
+        metadata = get_metadata()
+        if metadata:
+            with open(BENCHER_FILE, "r") as bf:
+                data = json.load(bf)
+            data[METADATA_KEY] = metadata
+            with open(BENCHER_FILE, "w") as bf:
+                json.dump(data, bf, indent=4)
+
+    def set_memory(self, key: str, proc_stats: dict):
+        LOG.info(
+            f"Memory: RSS={proc_stats['current_rss']}, "
+            f"Peak RSS={proc_stats['peak_rss']}, "
+            f"Virtual={proc_stats['virtual_size']}"
+        )
+        self.set(
+            key,
+            Memory(proc_stats["current_rss"], high_value=proc_stats["peak_rss"]),
+        )
+
+    def set(self, key: str, metric: Latency | Throughput | Memory):
         with open(BENCHER_FILE, "r") as bf:
             data = json.load(bf)
         metric_val = dataclasses.asdict(metric)

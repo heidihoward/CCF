@@ -1,60 +1,68 @@
-Documents the various GitHub Actions workflows, the role they fulfil and 3rd party dependencies if any.
+Documents the various GitHub Actions workflows, the role they fulfill and 3rd party (i.e. outside of https://github.com/actions/) dependencies if any.
 
-# Backport
+# Maintained
 
-Attempts to auto-open backport PRs from main to LTS branch(es) whenever possible. This works well in the absence of conflicts, typically early on during the life of an LTS, and less well later. The alternatives are running the backport tool manually, or cherry picking commits.
-Triggered when the label `auto-backport` is applied to a PR, along with the `X.*-todo` label to set the target branch.
+## Bencher
 
-File: `backport.yml`
-3rd party dependencies: `sorenlouv/backport-github-action@main`
+Builds and runs CCF performance tests, both end to end and micro-benchmarks. Results are stored as artifacts and summarized in the workflow run against an EWMA baseline with a seven-run half-life.
+Triggered on every commit on `main`, twice daily on week days, and manually, but not on PR builds because the setup required to build from forks is complex and fragile in terms of security, and the increase in pool usage would be substantial.
 
-# Bencher
-
-Builds and runs CCF performance tests, both end to end and micro-benchmarks. Results are posted to bencher.dev, and [plotted to make regressions obvious](https://bencher.dev/console/projects/ccf/plots).
-Triggered on every commit on `main`, but not on PR builds because the setup required to build from forks is complex and fragile in terms of security, and the increase in pool usage would be substantial.
+Tests are run on two different testbeds for comparison: gha-vmss-d16av6-ci (d16av6 VMs) and gha-c-aci-ci (C-ACI with 16 cores and 32Gb RAM).
 
 File: `bencher.yml`
-3rd party dependencies: `bencherdev/bencher@main`
+3rd party dependencies: None
 
-# Continuous Integration Containers GHCR
+## Bencher A/B
 
-Produces the build images used by nearly all other actions, particularly CI and release from 5.0.0-rc0 onwards. Complete images are attested and published to GHCR.
-Triggered on label creation (`build/*`).
+Builds and runs CCF performance tests on the PR branch, then renders radar charts comparing up to five recent branch runs against the recent trend on `main`. Two nested shaded blue bands show the shared seven-run-half-life EWMA baseline +/- 1 and +/- 2 standard deviations of the latest `main` runs. Both branch and `main` histories are restored from cumulative perf artifacts, and the orange branch lines progress from the faintest oldest run to the strongest latest run. Triggered on PRs that have the label `bench-ab`.
 
-File: `ci-containers-ghcr.yml`
-3rd party dependencies:
+File: `bencher-ab.yml`
+3rd party dependencies: None
 
-- `docker/login-action@v3`
-- `docker/metadata-action@v5`
-- `docker/build-push-action@v6`
+## Copilot Setup Steps
+
+Sets up dependencies for the Copilot coding agent. Triggered when the workflow or setup script changes, and manually.
+
+File: `copilot-setup-steps.yml`
+3rd party dependencies: None
 
 # Continuous Integration
 
-Main continuous integration job. Builds CCF for all target platforms, runs unit, end to end and partition tests Virtual. Run on every commit, including PRs from forks, gates merging. Also runs once a week, regardless of commits.
+Main continuous integration job. Builds CCF for all target platforms, runs unit, end to end and partition tests. Runs on PRs, merge queue runs, manually, and once a week, regardless of commits.
 
 File: `ci.yml`
 3rd party dependencies: None
 
+# Coverage
+
+Builds CCF with coverage enabled, runs unit and end to end tests, and uploads HTML coverage reports. Triggered on every commit on `main`, twice daily on week days, and manually.
+
+File: `coverage.yml`
+3rd party dependencies: None
+
 # Long Tests
 
-Secondary continuous integration job. Runs more expensive, longer tests, such as tests against ASAN builds, fuzzing etc.
+Secondary continuous integration job. Runs more expensive, longer tests, such as tests against ASAN and TSAN builds, extended fuzzing etc.
 
-- Runs daily.
-- Can be manually run on a PR by setting `run-long-test` label.
+- Runs daily on week days.
+- Can be manually run on a PR by setting `run-long-test` label, or via workflow dispatch.
 
 File: `long-test.yml`
 3rd party dependencies: None
 
 # CodeQL analysis
 
-Builds CCF with CodeQL, and runs the security-extended checks. Triggered on PRs that affect ".github/workflows/codeql-analysis.yml", and once a week on main.
+Builds CCF with CodeQL, and runs the security-extended checks. Triggered on PRs that affect ".github/workflows/codeql-analysis.yml", on pushes to main, once a week on schedule, and manually.
 
 File: `codeql-analysis.yml`
-3rd party dependencies: None
+3rd party dependencies:
+
+- `github/codeql-action/init@v4`
+- `github/codeql-action/analyze@v4`
 
 # Continuous Verification
 
-Runs quick verification jobs: trace validation, simulation and short model checking configurations. Triggered on PRs that affect tla/ or src/consensus and weekly on main.
+Runs quick verification jobs: trace validation, simulation and short model checking configurations. Triggered on PRs that affect tla/, src/consensus, tests/raft_scenarios, or the workflow itself, weekly, and manually.
 
 File: `ci-verification.yml`
 3rd party dependencies: None
@@ -71,21 +79,17 @@ File: `long-verification.yml`
 
 # Release
 
-Produces CCF release artefacts from 5.0.0-rc0 onwards, for all languages and platforms. Triggered on tags matching "ccf-5.\*". The output of the job is a draft release, which needs to be published manually. Publishing triggers the downstream jobs listed below.
+Produces CCF reference release artifacts for all languages and platforms. Triggered on tags matching `ccf-[67].*`, and manually with an optional dry run. The output of a non-dry-run job is a draft release, which needs to be published manually. Publishing triggers the downstream jobs listed below.
 
 File: `release.yml`
 3rd party dependencies: None
 
-# Containers GHCR
+# Release Attestation
 
-Produces reference release images from 5.0.0-rc0 onwards. Complete images are attested and published to GHCR. Triggered on release publishing.
+Generate signed build provenance attestations for release artifacts. Triggered on release publishing.
 
-File: `containers-ghcr.yml`
-3rd party dependencies:
-
-- `docker/login-action@v3`
-- `docker/metadata-action@v5`
-- `docker/build-push-action@v6`
+File: `release-attestation.yml`
+3rd party dependencies: None
 
 # NPM
 
@@ -99,7 +103,9 @@ File: `npm.yml`
 Publishes ccf Python package from a GitHub release to PyPI. Triggered on release publishing.
 
 File: `pypi.yml`
-3rd party dependencies: None
+3rd party dependencies:
+
+- `pypa/gh-action-pypi-publish@v1.14.0`
 
 # Documentation
 
@@ -107,11 +113,3 @@ Builds and publishes documentation to GitHub Pages. Triggered on pushes to main,
 
 File: `doc.yml`
 3rd party dependencies: None
-
-# Deprecated
-
-The following pipelines are still here to support 4.x, but will be removed when it reaches EOL.
-
-## Release containers ACR/MCR
-
-File: `containers.yml`

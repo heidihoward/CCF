@@ -3,6 +3,8 @@
 
 #include "ccf/endpoint.h"
 
+#include "ds/internal_logger.h"
+
 namespace ccf::endpoints
 {
   Endpoint& Endpoint::set_openapi_hidden(bool hidden)
@@ -11,12 +13,42 @@ namespace ccf::endpoints
     return *this;
   }
 
+  Endpoint& Endpoint::require_operator_feature(OperatorFeature feature)
+  {
+    const auto first_required_feature = required_operator_features.empty();
+    required_operator_features.insert(feature);
+    if (!first_required_feature)
+    {
+      return *this;
+    }
+
+    schema_builders.emplace_back(
+      [](nlohmann::json& document, const Endpoint& endpoint) {
+        const auto http_verb = endpoint.dispatch.verb.get_http_method();
+        if (!http_verb.has_value())
+        {
+          return;
+        }
+
+        auto& path_operation = ds::openapi::path_operation(
+          ds::openapi::path(document, endpoint.full_uri_path),
+          http_verb.value());
+        auto& responses = ds::openapi::responses(path_operation);
+        if (!responses.contains(std::to_string(HTTP_STATUS_NOT_FOUND)))
+        {
+          ds::openapi::response(
+            path_operation,
+            HTTP_STATUS_NOT_FOUND,
+            "The required operator feature is not enabled on this interface.");
+        }
+      });
+    return *this;
+  }
+
   Endpoint& Endpoint::set_params_schema(const nlohmann::json& j)
   {
-    params_schema = j;
-
-    schema_builders.push_back(
-      [](nlohmann::json& document, const Endpoint& endpoint) {
+    schema_builders.emplace_back(
+      [j](nlohmann::json& document, const Endpoint& endpoint) {
         const auto http_verb = endpoint.dispatch.verb.get_http_method();
         if (!http_verb.has_value())
         {
@@ -28,8 +60,7 @@ namespace ccf::endpoints
         auto& rb = request_body(path_operation(
           ds::openapi::path(document, endpoint.full_uri_path),
           http_verb.value()));
-        schema(media_type(rb, http::headervalues::contenttype::JSON)) =
-          endpoint.params_schema;
+        schema(media_type(rb, http::headervalues::contenttype::JSON)) = j;
       });
 
     return *this;
@@ -38,11 +69,10 @@ namespace ccf::endpoints
   Endpoint& Endpoint::set_result_schema(
     const nlohmann::json& j, std::optional<http_status> status)
   {
-    result_schema = j;
-    success_status = status.value_or(HTTP_STATUS_OK);
+    const auto response_status = status.value_or(HTTP_STATUS_OK);
 
-    schema_builders.push_back(
-      [j](nlohmann::json& document, const Endpoint& endpoint) {
+    schema_builders.emplace_back(
+      [j, response_status](nlohmann::json& document, const Endpoint& endpoint) {
         const auto http_verb = endpoint.dispatch.verb.get_http_method();
         if (!http_verb.has_value())
         {
@@ -54,10 +84,9 @@ namespace ccf::endpoints
           path_operation(
             ds::openapi::path(document, endpoint.full_uri_path),
             http_verb.value()),
-          endpoint.success_status);
+          response_status);
 
-        schema(media_type(r, http::headervalues::contenttype::JSON)) =
-          endpoint.result_schema;
+        schema(media_type(r, http::headervalues::contenttype::JSON)) = j;
       });
 
     return *this;
@@ -85,6 +114,13 @@ namespace ccf::endpoints
   Endpoint& Endpoint::set_redirection_strategy(RedirectionStrategy rs)
   {
     properties.redirection_strategy = rs;
+    return *this;
+  }
+
+  Endpoint& Endpoint::set_locally_committed_function(
+    const LocallyCommittedEndpointFunction& lcf)
+  {
+    locally_committed_func = lcf;
     return *this;
   }
 
@@ -128,17 +164,14 @@ namespace ccf::endpoints
       LOG_FATAL_FMT("{}", msg);
       throw std::logic_error(msg);
     }
-    else
-    {
-      installer->install(*this);
-    }
+    installer->install(*this);
   }
 
   void to_json(nlohmann::json& j, const InterpreterReusePolicy& grp)
   {
     switch (grp.kind)
     {
-      case InterpreterReusePolicy::KeyBased:
+      case InterpreterReusePolicy::Kind::KeyBased:
       {
         j = nlohmann::json::object();
         j["key"] = grp.key;
@@ -153,19 +186,22 @@ namespace ccf::endpoints
       const auto key_it = j.find("key");
       if (key_it != j.end())
       {
-        grp.kind = InterpreterReusePolicy::KeyBased;
+        grp.kind = InterpreterReusePolicy::Kind::KeyBased;
         grp.key = key_it->get<std::string>();
       }
     }
   }
 
-  std::string schema_name(const InterpreterReusePolicy*)
+  std::string schema_name(const InterpreterReusePolicy* policy)
   {
+    (void)policy;
     return "InterpreterReusePolicy";
   }
 
-  void fill_json_schema(nlohmann::json& schema, const InterpreterReusePolicy*)
+  void fill_json_schema(
+    nlohmann::json& schema, const InterpreterReusePolicy* policy)
   {
+    (void)policy;
     auto one_of = nlohmann::json::array();
 
     {

@@ -3,7 +3,7 @@ Cryptography API
 
 For convenience, CCF provides access to commonly used cryptographic primitives to applications.
 
-.. note:: This page describes the C++ API. For the API for TypeScript/JavaScript applications, see :typedoc:module:`ccf-app/crypto`.
+.. note:: This page describes the C++ API. For the API for TypeScript/JavaScript applications, see :typedoc-module:`ccf-app/crypto` .
 
 Hashing
 -------
@@ -11,7 +11,7 @@ Hashing
 .. doxygenfunction:: ccf::crypto::sha256(const std::vector<uint8_t> &data)
   :project: CCF
 
-.. doxygenfunction:: ccf::crypto::hmac(MDType, const std::vector<uint8_t>&, const std::vector<uint8_t>&)
+.. doxygenfunction:: ccf::crypto::hmac(MDType, const std::span<const uint8_t>&, const std::span<const uint8_t>&)
   :project: CCF
 
 .. doxygenClass:: ccf::crypto::HashProvider
@@ -25,16 +25,16 @@ Hashing
 Asymmetric Keys
 -----------------------
 
-CCF supports EC and RSA keys; public keys are held in (RSA)PublicKey objects and
-private keys in (RSA)KeyPair objects. (RSA)KeyPairs automatically generate random
-keys when constructed via :cpp:func:`KeyPairPtr ccf::crypto::make_key_pair(CurveID)` or
+CCF supports EC and RSA keys; public keys are held in [RSA|EC]PublicKey objects and
+private keys in [RSA|EC]KeyPair objects. [RSA|EC]KeyPair automatically generate random
+keys when constructed via :cpp:func:`ECKeyPairPtr ccf::crypto::make_ec_key_pair(CurveID)` or
 :cpp:func:`RSAKeyPairPtr ccf::crypto::make_rsa_key_pair(size_t, size_t)`.
 
-.. doxygenclass:: ccf::crypto::PublicKey
+.. doxygenclass:: ccf::crypto::ECPublicKey
   :project: CCF
   :members:
 
-.. doxygenclass:: ccf::crypto::KeyPair
+.. doxygenclass:: ccf::crypto::ECKeyPair
   :project: CCF
   :members:
 
@@ -49,10 +49,10 @@ keys when constructed via :cpp:func:`KeyPairPtr ccf::crypto::make_key_pair(Curve
 .. doxygenenum:: ccf::crypto::CurveID
   :project: CCF
 
-.. doxygenfunction:: ccf::crypto::make_key_pair(CurveID)
+.. doxygenfunction:: ccf::crypto::make_ec_key_pair(CurveID)
   :project: CCF
 
-.. doxygenfunction:: ccf::crypto::make_key_pair(const Pem&)
+.. doxygenfunction:: ccf::crypto::make_ec_key_pair(const Pem&)
   :project: CCF
 
 .. doxygenfunction:: ccf::crypto::make_rsa_key_pair(size_t, size_t)
@@ -62,12 +62,6 @@ Symmetric Keys
 --------------------
 
 Currently, only AES-GCM is supported for symmetric encryption. New keys are generated via :cpp:func:`ccf::crypto::Entropy::random`
-
-.. doxygenfunction:: ccf::crypto::aes_gcm_encrypt
-  :project: CCF
-
-.. doxygenfunction:: ccf::crypto::aes_gcm_decrypt
-  :project: CCF
 
 .. doxygenclass:: ccf::crypto::Entropy
   :project: CCF

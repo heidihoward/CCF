@@ -15,14 +15,6 @@
 
 using namespace std;
 
-std::unique_ptr<threading::ThreadMessaging>
-  threading::ThreadMessaging::singleton = nullptr;
-
-namespace threading
-{
-  std::map<std::thread::id, uint16_t> thread_ids;
-}
-
 constexpr auto shash = ccf::ds::fnv_1a<size_t>;
 
 int main(int argc, char** argv)
@@ -44,9 +36,7 @@ int main(int argc, char** argv)
 #else
   ccf::logger::config::add_text_console_logger();
 #endif
-  ccf::logger::config::level() = LoggerLevel::DEBUG;
-
-  threading::ThreadMessaging::init(1);
+  ccf::logger::config::level() = ccf::LoggerLevel::DEBUG;
 
   const std::string filename = argv[1];
 
@@ -92,6 +82,26 @@ int main(int argc, char** argv)
 
     switch (shash(in))
     {
+      case shash("pre_vote_enabled"):
+      {
+        assert(items.size() == 2);
+        if (items[1] == "true")
+        {
+          driver->set_pre_vote_enabled(true);
+        }
+        else if (items[1] == "false")
+        {
+          driver->set_pre_vote_enabled(false);
+        }
+        else
+        {
+          throw std::runtime_error(fmt::format(
+            "pre_vote_enabled value must be true or false on line "
+            "{}",
+            lineno));
+        }
+        break;
+      }
       case shash("start_node"):
         assert(items.size() == 2);
         driver->create_start_node(items[1], lineno);
@@ -275,6 +285,20 @@ int main(int argc, char** argv)
         assert(items.size() == 4);
         driver->assert_detail(items[1], items[2], items[3], false, lineno);
         break;
+      case shash("assert_config"):
+        assert(items.size() >= 3);
+        driver->assert_config(
+          items[1], items[2], {std::next(items.begin(), 3), items.end()});
+        break;
+      case shash("assert_absent_config"):
+        assert(items.size() == 3);
+        driver->assert_absent_config(items[1], items[2]);
+        break;
+      case shash("assert_last_txid"):
+        assert(items.size() == 3);
+        skip_invariants = true;
+        driver->assert_last_txid(items[1], items[2]);
+        break;
       case shash("replicate_new_configuration"):
         assert(items.size() >= 3);
         items.erase(items.begin());
@@ -288,6 +312,10 @@ int main(int argc, char** argv)
       case shash("loop_until_sync"):
         assert(items.size() == 1);
         driver->loop_until_sync(lineno);
+        break;
+      case shash("nominate_successor"):
+        assert(items.size() == 2);
+        driver->nominate_successor(items[1], lineno);
         break;
       case shash(""):
         // Ignore empty lines

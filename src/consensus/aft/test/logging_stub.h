@@ -12,6 +12,9 @@
 
 namespace aft
 {
+  constexpr size_t ADDITIONAL_METADATA_SIZE = sizeof(bool) /* committable */ +
+    sizeof(aft::Term) + sizeof(ccf::kv::Version);
+
   class LedgerStubProxy
   {
   protected:
@@ -24,6 +27,8 @@ namespace aft
     uint64_t skip_count = 0;
 
     LedgerStubProxy(const ccf::NodeId& id) : _id(id) {}
+
+    virtual ~LedgerStubProxy() = default;
 
     virtual void init(Index, Index) {}
 
@@ -42,17 +47,15 @@ namespace aft
       // (to mirror the deserialisation in LoggingStubStore::ExecutionWrapper).
       // We also size-prefix, so in a buffer of multiple of these messages we
       // can extract each with get_entry
-      const size_t idx = ledger.size() + 1;
+      [[maybe_unused]] const size_t idx = ledger.size() + 1;
       assert(idx == index);
       auto additional_size =
-        sizeof(size_t) + sizeof(bool) + sizeof(term) + sizeof(index);
+        sizeof(size_t) /* size-prefix */ + ADDITIONAL_METADATA_SIZE;
       std::vector<uint8_t> combined(additional_size);
       {
         uint8_t* data = combined.data();
         serialized::write(
-          data,
-          additional_size,
-          (sizeof(bool) + sizeof(term) + sizeof(index) + original.size()));
+          data, additional_size, (ADDITIONAL_METADATA_SIZE + original.size()));
         serialized::write(data, additional_size, globally_committable);
         serialized::write(data, additional_size, term);
         serialized::write(data, additional_size, index);
@@ -98,8 +101,8 @@ namespace aft
         // Remove the View and Index that were written during put_entry
         data->erase(
           data->begin(),
-          data->begin() + sizeof(size_t) + sizeof(ccf::kv::Term) +
-            sizeof(ccf::kv::Version));
+          data->begin() + sizeof(size_t) /* size prefix */ +
+            ADDITIONAL_METADATA_SIZE);
       }
 
       return data;
@@ -232,7 +235,7 @@ namespace aft
     void initialize(
       const ccf::NodeId& self_id,
       const ccf::crypto::Pem& service_cert,
-      ccf::crypto::KeyPairPtr node_kp,
+      ccf::crypto::ECKeyPairPtr node_kp,
       const std::optional<ccf::crypto::Pem>& node_cert = std::nullopt) override
     {}
 
@@ -303,7 +306,6 @@ namespace aft
     void call(ccf::kv::ConfigurableConsensus* consensus) override
     {
       auto configuration = consensus->get_latest_configuration_unsafe();
-      std::unordered_set<ccf::NodeId> retired_nodes;
       std::list<Configuration::Nodes::const_iterator> itrs;
 
       // Remove and track retired nodes
@@ -311,7 +313,6 @@ namespace aft
       {
         if (new_configuration.find(it->first) == new_configuration.end())
         {
-          retired_nodes.emplace(it->first);
           itrs.push_back(it);
         }
       }
@@ -326,7 +327,7 @@ namespace aft
         configuration[node_id] = {};
       }
 
-      consensus->add_configuration(version, configuration, {}, retired_nodes);
+      consensus->add_configuration(version, configuration);
     }
   };
 
@@ -342,6 +343,8 @@ namespace aft
   public:
     LoggingStubStore(ccf::NodeId id) : _id(id) {}
 
+    virtual ~LoggingStubStore() = default;
+
     virtual void set_set_retired_committed_hook(
       RCHook set_retired_committed_hook_)
     {
@@ -350,7 +353,7 @@ namespace aft
 
     virtual void compact(Index i) {}
 
-    virtual void rollback(const ccf::kv::TxID& tx_id, Term t) {}
+    virtual void rollback(const ccf::TxID& tx_id, Term t) {}
 
     virtual void initialise_term(Term t) {}
 
@@ -374,7 +377,7 @@ namespace aft
     public:
       ExecutionWrapper(
         const std::vector<uint8_t>& data_,
-        const std::optional<ccf::kv::TxID>& expected_txid,
+        const std::optional<ccf::TxID>& expected_txid,
         ccf::kv::ConsensusHookPtrs&& hooks_) :
         hooks(std::move(hooks_))
       {
@@ -391,7 +394,7 @@ namespace aft
 
         if (expected_txid.has_value())
         {
-          if (term != expected_txid->term || index != expected_txid->version)
+          if (term != expected_txid->view || index != expected_txid->seqno)
           {
             result = ccf::kv::ApplyResult::FAIL;
           }
@@ -453,19 +456,19 @@ namespace aft
     virtual std::unique_ptr<ccf::kv::AbstractExecutionWrapper> deserialize(
       const std::vector<uint8_t>& data,
       bool public_only = false,
-      const std::optional<ccf::kv::TxID>& expected_txid = std::nullopt)
+      const std::optional<ccf::TxID>& expected_txid = std::nullopt)
     {
       ccf::kv::ConsensusHookPtrs hooks = {};
       return std::make_unique<ExecutionWrapper>(
         data, expected_txid, std::move(hooks));
     }
 
-    bool flag_enabled(ccf::kv::AbstractStore::Flag)
+    bool flag_enabled(ccf::kv::AbstractStore::StoreFlag)
     {
       return false;
     }
 
-    void unset_flag(ccf::kv::AbstractStore::Flag) {}
+    void unset_flag(ccf::kv::AbstractStore::StoreFlag) {}
   };
 
   class LoggingStubStoreConfig : public LoggingStubStore
@@ -505,26 +508,26 @@ namespace aft
         retired_committed_entries.end());
     }
 
-    virtual void rollback(const ccf::kv::TxID& tx_id, Term t) override
+    virtual void rollback(const ccf::TxID& tx_id, Term t) override
     {
       retired_committed_entries.erase(
         std::remove_if(
           retired_committed_entries.begin(),
           retired_committed_entries.end(),
-          [tx_id](const auto& entry) { return entry.first > tx_id.version; }),
+          [tx_id](const auto& entry) { return entry.first > tx_id.seqno; }),
         retired_committed_entries.end());
     }
 
     virtual std::unique_ptr<ccf::kv::AbstractExecutionWrapper> deserialize(
       const std::vector<uint8_t>& data,
       bool public_only = false,
-      const std::optional<ccf::kv::TxID>& expected_txid = std::nullopt) override
+      const std::optional<ccf::TxID>& expected_txid = std::nullopt) override
     {
       // Set reconfiguration hook if there are any new nodes
       // Read wrapping term and version
       auto data_ = data.data();
       auto size = data.size();
-      const auto committable = serialized::read<bool>(data_, size);
+      serialized::read<bool>(data_, size);
       serialized::read<aft::Term>(data_, size);
       auto version = serialized::read<ccf::kv::Version>(data_, size);
       ReplicatedData r = nlohmann::json::parse(std::span{data_, size});
@@ -549,25 +552,4 @@ namespace aft
     }
   };
 
-  class StubSnapshotter
-  {
-  public:
-    void update(Index, bool) {}
-
-    void set_last_snapshot_idx(Index idx) {}
-
-    void commit(Index, bool) {}
-
-    void rollback(Index) {}
-
-    void record_serialised_tree(Index version, const std::vector<uint8_t>& tree)
-    {}
-
-    void record_signature(
-      Index,
-      const std::vector<uint8_t>&,
-      const ccf::NodeId&,
-      const ccf::crypto::Pem&)
-    {}
-  };
 }

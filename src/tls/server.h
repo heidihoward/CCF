@@ -13,19 +13,23 @@ namespace tls
   };
 
   static int alpn_select_cb(
-    SSL* ssl,
+    SSL* /*ssl*/,
     const unsigned char** out,
     unsigned char* outlen,
     const unsigned char* in,
     unsigned int inlen,
     void* arg)
   {
-    auto protos = (AlpnProtocols*)arg;
+    auto* protos = static_cast<AlpnProtocols*>(arg);
 
     if (
       SSL_select_next_proto(
-        (unsigned char**)out, outlen, protos->data, protos->size, in, inlen) !=
-      OPENSSL_NPN_NEGOTIATED)
+        const_cast<unsigned char**>(out),
+        outlen,
+        protos->data,
+        protos->size,
+        in,
+        inlen) != OPENSSL_NPN_NEGOTIATED)
     {
       return SSL_TLSEXT_ERR_NOACK;
     }
@@ -43,7 +47,7 @@ namespace tls
       Context(false),
       cert(cert_)
     {
-      cert->use(ssl, cfg);
+      cert->configure_context(cfg);
 
       // Configure protocols negotiated by ALPN
       // See https://nghttp2.org/documentation/tutorial-server.html and use of
@@ -63,6 +67,8 @@ namespace tls
           alpn_protos_data, sizeof(alpn_protos_data)};
         SSL_CTX_set_alpn_select_cb(cfg, alpn_select_cb, &alpn_protos);
       }
+
+      create_ssl();
     }
   };
 }

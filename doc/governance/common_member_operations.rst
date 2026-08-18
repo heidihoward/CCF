@@ -25,7 +25,7 @@ The operator can establish if it is safe to remove a node by calling :http:GET:`
 Updating Code Version
 ---------------------
 
-For new nodes to be able to join the network, the version of the code they run (as specified by ``enclave.file``) should be first trusted by the consortium of members.
+For new nodes to be able to join the network, the version of the code they run should be first trusted by the consortium of members.
 
 The specifics of how to manage code updates depends on the :doc:`platform <../operations/platforms/index>` being run.
 
@@ -115,7 +115,7 @@ Updating Recovery Threshold
 
 To protect the ledger secrets required to recover an existing service, CCF requires :ref:`members to submit their recovery shares <governance/accept_recovery:Submitting Recovery Shares>`.
 
-.. note:: The initial value of the recovery threshold is set via the ``start.service_configuration.recovery_threshold`` configuration entry when starting the first node in a new service. If this value is unspecified, it is set to the initial number of consortium members.
+.. note:: The initial value of the recovery threshold is set via the ``command.start.service_configuration.recovery_threshold`` configuration entry when starting the first node in a new service. If this value is unspecified, it is set to the number of initial consortium members with a public encryption key. If the consortium contains only recovery owners, it defaults to 1.
 
 The number of member shares required to restore the private ledger (``recovery_threshold``) is part of the service configuration and can be updated by members via the usual propose and vote process.
 
@@ -135,6 +135,14 @@ The number of member shares required to restore the private ledger (``recovery_t
 
 .. note:: The new recovery threshold has to be in the range between 1 and the current number of active recovery members.
 
+Recovery FAQ
+------------
+
+Can recovery members be changed during recovery?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No. While a service is recovering, members that have share encryption keys cannot be added, removed, or activated, and the recovery threshold cannot be changed. The at-recovery ledger secrets cannot be rekeyed, so changing the set of recovery members at this point would not have the effect operators usually expect. Complete the recovery first, then change recovery membership or threshold as needed.
+
 Renewing Node Certificate
 -------------------------
 
@@ -142,7 +150,7 @@ Renewing Node Certificate
 
 To renew the soon-to-be-expired certificate of a node, members should issue a ``set_node_certificate_validity`` proposal, specifying the date at which the validity period of the renewed certificate should start (``valid_from``), as well as its validity period in days (``validity_period_days`` -- optional).
 
-- The ``valid_from`` date/time argument accepts time points in ASN.1 UTCTime format (``"YYMMDDhhmmssZ"``) or ISO 8601 format (``"YYYY-MM-DD HH:MM:SS.ssssss+HH:MM"``), with optional fractional seconds and timezone offset. For details see :ccf_repo:`src/ds/x509_time_fmt.h`.
+- The ``valid_from`` date/time argument accepts time points in ASN.1 UTCTime format (``"YYMMDDhhmmssZ"``) or ISO 8601 format (``"YYYY-MM-DD HH:MM:SS.ssssss+HH:MM"``), with optional fractional seconds and timezone offset. For details see :ccf_repo:`include/ccf/ds/x509_time_fmt.h`.
 - If set, the ``validity_period_days`` should be less than the service-wide maximum validity period configured by operators. If omitted, the ``validity_period_days`` defaults to the service-wide maximum validity period configured by operators (see :ref:`operations/certificates:Node Certificates`).
 - Both Service-endorsed and self-signed node certificates are renewed by this proposal.
 
@@ -156,7 +164,7 @@ A sample proposal is:
             {
                 "name": "set_node_certificate_validity",
                 "args": {
-                    "node_id": "86c0ccfab4b869abbc779937c51158c9dd2a130d58323643a3119e83b33dcf5c"
+                    "node_id": "86c0ccfab4b869abbc779937c51158c9dd2a130d58323643a3119e83b33dcf5c",
                     "valid_from": "220101143018Z",
                     "validity_period_days": 365
                 }

@@ -1,16 +1,16 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import time
 import http
 import statistics
+import time
+
+import infra.bencher
 import infra.e2e_args
 import infra.network
 import suite.test_requirements as reqs
 from infra.log_capture import flush_info
 from infra.tx_status import TxStatus
-import infra.bencher
-
 from loguru import logger as LOG
 
 
@@ -52,7 +52,7 @@ class Stats:
 
     def display(self, print_fn):
         print_fn(f"{self.label} ({len(self.ns)} entries)")
-        keylen = max(len(k) for k in self.stats.keys())
+        keylen = max(len(k) for k in self.stats)
         valuelen = max(len(f"{v:.2f}") for v in self.stats.values())
 
         for k, v in self.stats.items():
@@ -79,7 +79,7 @@ def measure_commit_latency(args, sig_interval=100):
 
     times = []
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
@@ -143,7 +143,7 @@ def run(args):
 
 if __name__ == "__main__":
     args = infra.e2e_args.cli_args()
-    args.package = "samples/apps/logging/liblogging"
+    args.package = "samples/apps/logging/logging"
     args.nodes = infra.e2e_args.min_nodes(args, f=0)
 
     run(args)

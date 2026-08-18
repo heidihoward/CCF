@@ -50,11 +50,7 @@ namespace ccf::crypto
 
   std::ostream& operator<<(std::ostream& os, const ccf::crypto::Sha256Hash& h)
   {
-    for (unsigned i = 0; i < ccf::crypto::Sha256Hash::SIZE; i++)
-    {
-      os << std::hex << static_cast<int>(h.h[i]);
-    }
-
+    os << h.hex_str();
     return os;
   }
 
@@ -105,13 +101,15 @@ namespace ccf::crypto
     }
   }
 
-  std::string schema_name(const Sha256Hash*)
+  std::string schema_name(const Sha256Hash* hash)
   {
+    (void)hash;
     return "Sha256Digest";
   }
 
-  void fill_json_schema(nlohmann::json& schema, const Sha256Hash*)
+  void fill_json_schema(nlohmann::json& schema, const Sha256Hash* hash)
   {
+    (void)hash;
     schema["type"] = "string";
 
     // According to the spec, "format is an open value, so you can use any

@@ -18,23 +18,14 @@
 #include <queue>
 #include <random>
 
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
-namespace ccf::enclavetime
+void sleep_to_reinitiate()
 {
-  std::atomic<long long>* host_time_us = nullptr;
-  std::atomic<std::chrono::microseconds> last_value(
-    std::chrono::microseconds(0));
+  std::this_thread::sleep_for(
+    2 * ccf::Channel::min_gap_between_initiation_attempts());
 }
-
-namespace ccf
-{
-  std::chrono::microseconds Channel::min_gap_between_initiation_attempts(0);
-}
-
-std::unique_ptr<threading::ThreadMessaging>
-  threading::ThreadMessaging::singleton = nullptr;
 
 class IORingbuffersFixture
 {
@@ -79,17 +70,18 @@ static std::pair<std::string, size_t> make_validity_pair(bool expired)
   if (expired)
   {
     return std::make_pair(
-      ::ds::to_x509_time_string(now - std::chrono::days(2 * validity_days)),
+      ccf::ds::to_x509_time_string(now - std::chrono::days(2 * validity_days)),
       validity_days);
   }
   else
   {
-    return std::make_pair(::ds::to_x509_time_string(now - 24h), validity_days);
+    return std::make_pair(
+      ccf::ds::to_x509_time_string(now - 24h), validity_days);
   }
 }
 
 static ccf::crypto::Pem generate_self_signed_cert(
-  const ccf::crypto::KeyPairPtr& kp,
+  const ccf::crypto::ECKeyPairPtr& kp,
   const std::string& name,
   bool expired = false)
 {
@@ -100,9 +92,9 @@ static ccf::crypto::Pem generate_self_signed_cert(
 }
 
 static ccf::crypto::Pem generate_endorsed_cert(
-  const ccf::crypto::KeyPairPtr& kp,
+  const ccf::crypto::ECKeyPairPtr& kp,
   const std::string& name,
-  const ccf::crypto::KeyPairPtr& issuer_kp,
+  const ccf::crypto::ECKeyPairPtr& issuer_kp,
   const ccf::crypto::Pem& issuer_cert,
   bool expired = false)
 {
@@ -139,11 +131,10 @@ struct NodeOutboundMsg
   {
     auto r = data();
     static_assert(sizeof(ChannelMsg) == 8);
-    size_t hdr_size = sizeof(ChannelMsg);
-    ChannelMsg channel_msg_type =
-      serialized::read<ChannelMsg>(r.data(), hdr_size);
-    auto data = std::vector<uint8_t>(r.begin() + sizeof(ChannelMsg), r.end());
-    return data;
+    auto d = r.data();
+    auto s = r.size();
+    serialized::skip(d, s, sizeof(ChannelMsg));
+    return std::vector<uint8_t>(d, s);
   }
 };
 
@@ -227,22 +218,20 @@ NodeOutboundMsg<MsgType> get_first(
   auto outbound_msgs = read_outbound_msgs<MsgType>(circuit);
   REQUIRE(outbound_msgs.size() >= 1);
   auto msg = outbound_msgs[0];
-  const auto* data_ = msg.payload.data();
-  auto size_ = msg.payload.size();
   REQUIRE(msg.type == msg_type);
   return msg;
 }
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Client/Server key exchange")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel1_cert =
     generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel2_cert =
     generate_endorsed_cert(channel2_kp, "CN=Node2", network_kp, service_cert);
 
@@ -266,6 +255,7 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Client/Server key exchange")
     // Queue 2 messages on channel1
     REQUIRE(channels1.send_authenticated(
       nid2, NodeMsgType::consensus_msg, msg.begin(), msg.size()));
+    sleep_to_reinitiate();
     REQUIRE(channels1.send_authenticated(
       nid2, NodeMsgType::consensus_msg, msg.begin(), msg.size()));
   }
@@ -445,14 +435,14 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Client/Server key exchange")
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Replay and out-of-order")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel1_cert =
     generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel2_cert =
     generate_endorsed_cert(channel2_kp, "CN=Node2", network_kp, service_cert);
 
@@ -621,10 +611,10 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Replay and out-of-order")
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Host connections")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel_cert =
     generate_endorsed_cert(channel_kp, "CN=Node", network_kp, service_cert);
 
@@ -670,14 +660,14 @@ static std::vector<NodeOutboundMsg<MsgType>> get_all_msgs(
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Concurrent key exchange init")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel1_cert =
     generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel2_cert =
     generate_endorsed_cert(channel2_kp, "CN=Node1", network_kp, service_cert);
 
@@ -795,16 +785,16 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Full NodeToNode test")
   {
     LOG_DEBUG_FMT("Iteration: {}", i++);
 
-    auto network_kp = ccf::crypto::make_key_pair(curves.network);
+    auto network_kp = ccf::crypto::make_ec_key_pair(curves.network);
     auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
     auto ni1 = std::string("N1");
-    auto channel1_kp = ccf::crypto::make_key_pair(curves.node_1);
+    auto channel1_kp = ccf::crypto::make_ec_key_pair(curves.node_1);
     auto channel1_cert =
       generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
     auto ni2 = std::string("N2");
-    auto channel2_kp = ccf::crypto::make_key_pair(curves.node_2);
+    auto channel2_kp = ccf::crypto::make_ec_key_pair(curves.node_2);
     auto channel2_cert =
       generate_endorsed_cert(channel2_kp, "CN=Node2", network_kp, service_cert);
 
@@ -830,7 +820,7 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Full NodeToNode test")
       size_t desired_rollovers = 5;
       size_t actual_rollovers = 0;
 
-      for (size_t i = 0; i < message_limit * desired_rollovers; i++)
+      for (size_t j = 0; j < message_limit * desired_rollovers; j++)
       {
         if (rand() % 2 == 0)
         {
@@ -846,17 +836,17 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Full NodeToNode test")
         auto msgs = get_all_msgs({&eio1, &eio2});
         do
         {
-          for (auto msg : msgs)
+          for (auto m : msgs)
           {
-            auto& n2n = (msg.from == ni2) ? n2n1 : n2n2;
+            auto& n2n = (m.from == ni2) ? n2n1 : n2n2;
 
-            switch (msg.type)
+            switch (m.type)
             {
               case NodeMsgType::channel_msg:
               {
-                n2n.recv_channel_message(msg.from, msg.data());
+                n2n.recv_channel_message(m.from, m.data());
 
-                auto d = msg.data();
+                auto d = m.data();
                 const uint8_t* data = d.data();
                 size_t sz = d.size();
                 auto type = serialized::read<ChannelMsg>(data, sz);
@@ -866,14 +856,15 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Full NodeToNode test")
               }
               case NodeMsgType::consensus_msg:
               {
-                auto hdr = msg.authenticated_hdr;
-                const auto* data = msg.payload.data();
-                auto size = msg.payload.size();
+                auto hdr = m.authenticated_hdr;
+                const auto* data = m.payload.data();
+                auto size = m.payload.size();
 
                 REQUIRE(n2n.recv_authenticated(
-                  msg.from, {hdr.data(), hdr.size()}, data, size));
+                  m.from, {hdr.data(), hdr.size()}, data, size));
                 break;
               }
+              case NodeMsgType::forwarded_msg:
               default:
                 REQUIRE(false);
             }
@@ -890,14 +881,14 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Full NodeToNode test")
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Interrupted key exchange")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel1_cert =
     generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel2_cert =
     generate_endorsed_cert(channel2_kp, "CN=Node1", network_kp, service_cert);
 
@@ -1041,14 +1032,14 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Stuttering handshake")
   MsgType aad;
   aad.fill(0x10);
 
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel1_cert =
     generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel2_cert =
     generate_endorsed_cert(channel2_kp, "CN=Node1", network_kp, service_cert);
 
@@ -1068,6 +1059,7 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Stuttering handshake")
     nid2, NodeMsgType::forwarded_msg, {aad.begin(), aad.size()}, msg_body));
 
   INFO("Send a second request, triggering a second handshake");
+  sleep_to_reinitiate();
   REQUIRE(channels1.send_encrypted(
     nid2, NodeMsgType::forwarded_msg, {aad.begin(), aad.size()}, msg_body));
 
@@ -1114,9 +1106,9 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Stuttering handshake")
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Expired certs")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
 
   auto service_cert = generate_self_signed_cert(network_kp, "CN=MyNetwork");
   auto channel1_cert =
@@ -1173,14 +1165,14 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Expired certs")
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Robust key exchange")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel1_cert =
     generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel2_cert =
     generate_endorsed_cert(channel2_kp, "CN=Node1", network_kp, service_cert);
 
@@ -1207,8 +1199,10 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Robust key exchange")
 
     channels1.send_encrypted(
       nid2, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
+    sleep_to_reinitiate();
     channels1.send_encrypted(
       nid3, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
+    sleep_to_reinitiate();
     channels1.send_encrypted(
       nid2, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
 
@@ -1224,8 +1218,10 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Robust key exchange")
     channels1.close_channel(nid3);
     channels1.send_encrypted(
       nid2, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
+    sleep_to_reinitiate();
     channels1.send_encrypted(
       nid3, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
+    sleep_to_reinitiate();
     channels1.send_encrypted(
       nid2, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
 
@@ -1241,8 +1237,10 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Robust key exchange")
 
     channels2.send_encrypted(
       nid1, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
+    sleep_to_reinitiate();
     channels2.send_encrypted(
       nid1, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
+    sleep_to_reinitiate();
     channels2.send_encrypted(
       nid3, NodeMsgType::consensus_msg, {aad.data(), aad.size()}, payload);
 
@@ -1402,58 +1400,53 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Robust key exchange")
 }
 
 // Run separate threads simulating each node, sending many messages in both
-// direction. Goal is that the message stream is uninterrupted, despite multiple
-// key rotation exchanges happening during the sequence
+// direction. Goal is that the message stream is largely uninterrupted, despite
+// multiple key rotation exchanges happening during the sequence
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Key rotation")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  MsgType aad;
-  aad.fill(0x42);
+  using SendQueue = std::queue<std::vector<uint8_t>>;
 
-  struct QueueWithLock
-  {
-    std::mutex lock;
-    std::vector<std::pair<ccf::NodeId, std::vector<uint8_t>>> to_send;
-  };
-
-  using ReceivedMessages = std::vector<std::vector<uint8_t>>;
+  using ReceivedMessages = std::vector<std::optional<std::vector<uint8_t>>>;
 
   static constexpr auto message_limit = 40;
+  static constexpr auto messages_each = 5 * message_limit;
 
-  std::atomic<bool> finished = false;
-  auto run_channel = [&](
-                       ccf::NodeId my_node_id,
-                       ringbuffer::Circuit& source_buffer,
-                       ringbuffer::AbstractWriterFactory& writer_factory,
-                       QueueWithLock& send_queue,
-                       ReceivedMessages& received_results) {
-    auto kp = ccf::crypto::make_key_pair(default_curve);
-    auto cert = generate_endorsed_cert(
-      kp, fmt::format("CN={}", my_node_id), network_kp, service_cert);
+  std::atomic<size_t> finished_reading = 0;
+  std::atomic<bool> workers_stop = false;
 
-    auto channels = NodeToNodeChannelManager(writer_factory);
-    channels.initialize(my_node_id, service_cert, kp, cert);
-    channels.set_message_limit(message_limit);
+  struct TmpChannel
+  {
+    ccf::NodeId my_node_id;
+    ccf::NodeId peer_node_id;
+    ringbuffer::Circuit& source_buffer;
+    ringbuffer::NonBlockingWriterFactory& nbwf;
+    NodeToNodeChannelManager& channels;
+    SendQueue& send_queue;
 
-    while (!finished)
+    ReceivedMessages received_results;
+
+    TmpChannel(
+      ccf::NodeId my_node_id_,
+      ccf::NodeId peer_node_id_,
+      ringbuffer::Circuit& source_buffer_,
+      ringbuffer::NonBlockingWriterFactory& nbwf_,
+      NodeToNodeChannelManager& channels_,
+      SendQueue& send_queue_) :
+      my_node_id(my_node_id_),
+      peer_node_id(peer_node_id_),
+      source_buffer(source_buffer_),
+      nbwf(nbwf_),
+      channels(channels_),
+      send_queue(send_queue_)
+    {}
+
+    void process(std::atomic<size_t>& signal_when_done, bool wrap_it_up = false)
     {
-      {
-        // Send any new messages added to your work queue
-        std::lock_guard<std::mutex> guard(send_queue.lock);
-        for (auto& queued_msg : send_queue.to_send)
-        {
-          auto peer_id = queued_msg.first;
-          auto& msg_body = queued_msg.second;
-          REQUIRE(channels.send_encrypted(
-            peer_id,
-            NodeMsgType::forwarded_msg,
-            {aad.begin(), aad.size()},
-            msg_body));
-        }
-        send_queue.to_send.clear();
-      }
+      MsgType aad;
+      aad.fill(0x42);
 
       // Read and process all messages from peer
       auto msgs = read_outbound_msgs<MsgType>(source_buffer);
@@ -1468,14 +1461,31 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Key rotation")
             break;
           }
 
+          case consensus_msg:
+          {
+            break;
+          }
+
           case forwarded_msg:
           {
-            auto decrypted = channels.recv_encrypted(
-              msg.from,
-              {msg.authenticated_hdr.data(), msg.authenticated_hdr.size()},
-              msg.payload.data(),
-              msg.payload.size());
-            received_results.emplace_back(decrypted);
+            try
+            {
+              auto decrypted = channels.recv_encrypted(
+                msg.from,
+                {msg.authenticated_hdr.data(), msg.authenticated_hdr.size()},
+                msg.payload.data(),
+                msg.payload.size());
+              received_results.emplace_back(decrypted);
+            }
+            catch (const ccf::NodeToNode::DroppedMessageException& e)
+            {
+              received_results.emplace_back(std::nullopt);
+            }
+
+            if (received_results.size() == messages_each)
+            {
+              ++signal_when_done;
+            }
             break;
           }
 
@@ -1486,121 +1496,192 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Key rotation")
         }
       }
 
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      // Send some messages from start of your work queue
+      while (!send_queue.empty())
+      {
+        // Sometimes randomly give up on sending any more
+        if (!wrap_it_up && rand() % 3 == 0)
+        {
+          break;
+        }
+
+        if (channels.send_encrypted(
+              peer_node_id,
+              NodeMsgType::forwarded_msg,
+              {aad.begin(), aad.size()},
+              send_queue.front()))
+        {
+          send_queue.pop();
+        }
+        else
+        {
+          break;
+        }
+      }
+
+      if (wrap_it_up || rand() % 5 == 0)
+      {
+        // Occasionally send a dummy consensus msg to flush the pipes.
+        // Forwarded messages may be queued until something else comes along
+        // to push them, which in a real system is periodic consensus traffic
+        std::vector<uint8_t> dummy_consensus_msg;
+        dummy_consensus_msg.push_back(0x12);
+        channels.send_authenticated(
+          peer_node_id,
+          ccf::NodeMsgType::consensus_msg,
+          dummy_consensus_msg.data(),
+          dummy_consensus_msg.size());
+
+        if (!channels.channel_open(peer_node_id))
+        {
+          sleep_to_reinitiate();
+        }
+      }
+
+      LOG_INFO_FMT(
+        "{} (sent {}, received {}, goal is {})",
+        my_node_id,
+        messages_each - send_queue.size(),
+        received_results.size(),
+        messages_each);
+
+      nbwf.flush_all_outbound();
     }
   };
 
-  QueueWithLock sent_by_1;
-  ringbuffer::NonBlockingWriterFactory nbwf1(wf1);
-  ReceivedMessages received_by_1;
-  ReceivedMessages expected_received_by_1;
-  std::thread channels1(
-    run_channel,
-    std::ref(nid1),
-    std::ref(eio2),
-    std::ref(nbwf1),
-    std::ref(sent_by_1),
-    std::ref(received_by_1));
+  auto run_channel = [&](TmpChannel& tc) {
+    do
+    {
+      tc.process(finished_reading);
 
-  QueueWithLock sent_by_2;
+      std::this_thread::yield();
+    } while (!workers_stop.load());
+  };
+
+  SendQueue to_send_from_1;
+  ringbuffer::NonBlockingWriterFactory nbwf1(wf1);
+  ReceivedMessages expected_received_by_1;
+
+  SendQueue to_send_from_2;
   ringbuffer::NonBlockingWriterFactory nbwf2(wf2);
-  ReceivedMessages received_by_2;
   ReceivedMessages expected_received_by_2;
-  std::thread channels2(
-    run_channel,
-    std::ref(nid2),
-    std::ref(eio1),
-    std::ref(nbwf2),
-    std::ref(sent_by_2),
-    std::ref(received_by_2));
 
   // Submit a randomly generated workload
-  for (auto i = 0; i < 5 * message_limit; ++i)
+  for (auto i = 0; i < 2 * messages_each; ++i)
   {
-    ccf::NodeId peer_nid;
-    QueueWithLock* send_queue;
-    ReceivedMessages* expected_results;
-    if (rand() % 2 == 0)
+    std::vector<uint8_t> msg_body(rand() % 20);
+    for (auto& n : msg_body)
     {
-      peer_nid = nid2;
-      send_queue = &sent_by_1;
-      expected_results = &expected_received_by_2;
+      n = rand();
+    }
+
+    if (i < messages_each)
+    {
+      to_send_from_1.emplace(msg_body);
+      expected_received_by_2.emplace_back(msg_body);
     }
     else
     {
-      peer_nid = nid1;
-      send_queue = &sent_by_2;
-      expected_results = &expected_received_by_1;
+      to_send_from_2.emplace(msg_body);
+      expected_received_by_1.emplace_back(msg_body);
     }
-
-    {
-      std::lock_guard<std::mutex> guard(send_queue->lock);
-      std::vector<uint8_t> msg_body(rand() % 20);
-      for (auto& n : msg_body)
-      {
-        n = rand();
-      }
-      send_queue->to_send.emplace_back(std::make_pair(peer_nid, msg_body));
-      expected_results->emplace_back(msg_body);
-    }
-
-    // If we do not sleep here, we submit many messages at once, resulting in a
-    // node's pending send queue filling up and a failure result when it calls
-    // `send_encrypted`. A real application should handle this error code, and
-    // set parameters so it is extremely rare. Here we simply sleep so that the
-    // sends happen one-at-a-time.
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
 
-  // Wait for channel threads to fully catch up.
-  constexpr int wait_finish_attempts = 100;
-  for (int attempt = 0; attempt < wait_finish_attempts; attempt++)
+  auto kp1 = ccf::crypto::make_ec_key_pair(default_curve);
+  NodeToNodeChannelManager channels1(nbwf1);
+  channels1.initialize(
+    nid1,
+    service_cert,
+    kp1,
+    generate_endorsed_cert(
+      kp1, fmt::format("CN={}", nid1), network_kp, service_cert));
+  channels1.set_message_limit(message_limit);
+  TmpChannel tc1(nid1, nid2, eio2, nbwf1, channels1, to_send_from_1);
+
+  auto kp2 = ccf::crypto::make_ec_key_pair(default_curve);
+  NodeToNodeChannelManager channels2(nbwf2);
+  channels2.initialize(
+    nid2,
+    service_cert,
+    kp2,
+    generate_endorsed_cert(
+      kp2, fmt::format("CN={}", nid2), network_kp, service_cert));
+  TmpChannel tc2(nid2, nid1, eio1, nbwf2, channels2, to_send_from_2);
+
+  std::thread thread1(run_channel, std::ref(tc1));
+  std::thread thread2(run_channel, std::ref(tc2));
+
+  // Run in parallel threads for a while
+  std::chrono::milliseconds elapsed(0);
+  const std::chrono::milliseconds timeout(500);
+
+  while (finished_reading.load() < 2 && elapsed < timeout)
   {
-    bool skip_waiting{true};
+    constexpr auto sleep_time = std::chrono::milliseconds(10);
+    std::this_thread::sleep_for(sleep_time);
+    elapsed += sleep_time;
+  }
+
+  LOG_INFO_FMT("Exited main loop");
+
+  workers_stop.store(true);
+
+  thread1.join();
+  thread2.join();
+
+  // Run a few more iterations manually interleaved, simulating a synchronous
+  // period, to reach quiescence
+  static constexpr size_t worst_case = 2 * messages_each;
+  for (size_t i = 0; i < worst_case; ++i)
+  {
+    LOG_INFO_FMT("Catchup loop #{}/{}", i, worst_case);
+    tc1.process(finished_reading, true);
+    tc2.process(finished_reading, true);
+    nbwf1.flush_all_outbound();
+    nbwf2.flush_all_outbound();
+
+    if (
+      to_send_from_1.empty() && to_send_from_2.empty() &&
+      finished_reading.load() == 2)
     {
-      std::lock_guard<std::mutex> guard(sent_by_1.lock);
-      skip_waiting &= sent_by_1.to_send.empty();
-    }
-    {
-      std::lock_guard<std::mutex> guard(sent_by_2.lock);
-      skip_waiting &= sent_by_2.to_send.empty();
-    }
-    if (skip_waiting)
-    {
+      LOG_INFO_FMT("Early out after {}/{} iterations\n", i, worst_case);
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
-  finished.store(true);
-
-  channels1.join();
-  channels2.join();
-
-  {
-    std::lock_guard<std::mutex> guard(sent_by_1.lock);
-    REQUIRE(sent_by_1.to_send.empty());
-  }
-  {
-    std::lock_guard<std::mutex> guard(sent_by_2.lock);
-    REQUIRE(sent_by_2.to_send.empty());
-  }
+  REQUIRE(to_send_from_1.empty());
+  REQUIRE(to_send_from_2.empty());
 
   // Validate results
-  REQUIRE(received_by_1 == expected_received_by_1);
-  REQUIRE(received_by_2 == expected_received_by_2);
+  auto equal_modulo_holes =
+    [](const ReceivedMessages& actual, const ReceivedMessages& expected) {
+      REQUIRE(actual.size() == expected.size());
+      REQUIRE(actual.size() == messages_each);
+      size_t i = 0;
+      for (const auto& msg_opt : actual)
+      {
+        if (msg_opt.has_value())
+        {
+          REQUIRE(msg_opt == expected[i]);
+        }
+        ++i;
+      }
+    };
+
+  equal_modulo_holes(tc1.received_results, expected_received_by_1);
+  equal_modulo_holes(tc2.received_results, expected_received_by_2);
 }
 
 TEST_CASE_FIXTURE(IORingbuffersFixture, "Timeout idle channels")
 {
-  auto network_kp = ccf::crypto::make_key_pair(default_curve);
+  auto network_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto service_cert = generate_self_signed_cert(network_kp, "CN=Network");
 
-  auto channel1_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel1_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel1_cert =
     generate_endorsed_cert(channel1_kp, "CN=Node1", network_kp, service_cert);
 
-  auto channel2_kp = ccf::crypto::make_key_pair(default_curve);
+  auto channel2_kp = ccf::crypto::make_ec_key_pair(default_curve);
   auto channel2_cert =
     generate_endorsed_cert(channel2_kp, "CN=Node2", network_kp, service_cert);
 
@@ -1658,25 +1739,26 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Timeout idle channels")
       nid2, NodeMsgType::consensus_msg, msg.begin(), msg.size()));
 
     auto msgs = read_outbound_msgs<MsgType>(eio1);
-    for (const auto& msg : msgs)
+    for (const auto& m : msgs)
     {
-      switch (msg.type)
+      switch (m.type)
       {
         case NodeMsgType::channel_msg:
         {
-          channels2.recv_channel_message(msg.from, msg.data());
+          channels2.recv_channel_message(m.from, m.data());
           break;
         }
         case NodeMsgType::consensus_msg:
         {
-          auto hdr = msg.authenticated_hdr;
-          const auto* data = msg.payload.data();
-          auto size = msg.payload.size();
+          auto hdr = m.authenticated_hdr;
+          const auto* data = m.payload.data();
+          auto size = m.payload.size();
 
           REQUIRE(channels2.recv_authenticated(
-            msg.from, {hdr.data(), hdr.size()}, data, size));
+            m.from, {hdr.data(), hdr.size()}, data, size));
           break;
         }
+        case NodeMsgType::forwarded_msg:
         default:
         {
           REQUIRE(false);
@@ -1694,15 +1776,17 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Timeout idle channels")
       }
       else
       {
-        for (const auto& msg : msgs)
+        for (const auto& m : msgs)
         {
-          switch (msg.type)
+          switch (m.type)
           {
             case NodeMsgType::channel_msg:
             {
-              channels1.recv_channel_message(msg.from, msg.data());
+              channels1.recv_channel_message(m.from, m.data());
               break;
             }
+            case NodeMsgType::consensus_msg:
+            case NodeMsgType::forwarded_msg:
             default:
             {
               REQUIRE(false);
@@ -1736,4 +1820,19 @@ TEST_CASE_FIXTURE(IORingbuffersFixture, "Timeout idle channels")
     channels2.tick(not_quite_idle);
     REQUIRE_FALSE(channels2.have_channel(nid1));
   }
+}
+
+int main(int argc, char** argv)
+{
+  // We regularly sleep to re-initiate during this test, so reduce this value to
+  // reduce total test run-time
+  Channel::min_gap_between_initiation_attempts() =
+    std::chrono::microseconds(5'000);
+
+  doctest::Context context;
+  context.applyCommandLine(argc, argv);
+  int res = context.run();
+  if (context.shouldExit())
+    return res;
+  return res;
 }

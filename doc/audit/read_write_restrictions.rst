@@ -49,7 +49,6 @@ CCF ensures that governance audit is possible offline from a ledger, by consider
 - Governance code must never read from private tables. Doing so might make decisions which could not be reproduced from the ledger by an auditor (ie. without access to ledger secrets).
 - Governance code must never read from application tables. Doing so might produce dependencies on data which was not signed by a member.
 - Governance code running pre-approval must only have read access to tables, and never write.
-- Governance code should not write to application tables, which could be modified further outside of governance.
 - Application code must not modify governance tables, as it could do so without constitution approval.
 
 .. note:: 
@@ -75,9 +74,9 @@ The possible access permissions are elaborated in the table below:
     +==========================+============+============+============+============+============+============+
     | Pre-approval governance  | Read-only  | None       | Read-only  | None       | None       | None       |
     +--------------------------+------------+------------+------------+------------+------------+------------+
-    | Post-approval governance | Read-only  | None       | Writeable  | None       | None       | None       |
+    | Post-approval governance | Read-only  | None       | Read/Write | None       | Write-Only | None       |
     +--------------------------+------------+------------+------------+------------+------------+------------+
-    | Application              | Read-only  | None       | Read-only  | None       | Writeable  | Writeable  |
+    | Application              | Read-only  | None       | Read-only  | None       | Read/Write | Read/Write |
     +--------------------------+------------+------------+------------+------------+------------+------------+
 
 Any violation of these restrictions (eg - calling ``set`` on a `Read-only` table, or ``has`` on a `None` table) results in an exception being thrown.

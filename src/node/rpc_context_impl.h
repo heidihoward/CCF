@@ -3,12 +3,12 @@
 #pragma once
 
 #include "ccf/claims_digest.h"
-#include "ccf/research/grpc_status.h"
+#include "ccf/endpoint_context.h"
 #include "ccf/rpc_context.h"
 
 namespace ccf
 {
-  enum class HttpVersion
+  enum class HttpVersion : uint8_t
   {
     HTTP1 = 0,
     HTTP2
@@ -34,74 +34,67 @@ namespace ccf
       http_version(v)
     {}
 
-    std::shared_ptr<SessionContext> get_session_context() const override
+    [[nodiscard]] std::shared_ptr<SessionContext> get_session_context()
+      const override
     {
       return session;
     }
 
-    virtual void set_user_data(std::shared_ptr<void> data) override
+    void set_user_data(std::shared_ptr<void> data) override
     {
       user_data = data;
     }
 
-    virtual void* get_user_data() const override
+    [[nodiscard]] void* get_user_data() const override
     {
       return user_data.get();
     }
 
     ccf::ClaimsDigest claims = ccf::empty_claims();
+    // NOLINTBEGIN(performance-move-const-arg)
     void set_claims_digest(ccf::ClaimsDigest::Digest&& digest) override
     {
       claims.set(std::move(digest));
     }
+    // NOLINTEND(performance-move-const-arg)
 
-    ccf::PathParams path_params = {};
-    virtual const ccf::PathParams& get_request_path_params() override
+    ccf::PathParams path_params;
+    const ccf::PathParams& get_request_path_params() override
     {
       return path_params;
     }
 
-    ccf::PathParams decoded_path_params = {};
-    virtual const ccf::PathParams& get_decoded_request_path_params() override
+    ccf::PathParams decoded_path_params;
+    const ccf::PathParams& get_decoded_request_path_params() override
     {
       return decoded_path_params;
     }
 
-    HttpVersion get_http_version() const
+    [[nodiscard]] HttpVersion get_http_version() const
     {
       return http_version;
     }
 
-    virtual void set_error(
-      http_status status,
+    void set_error(
+      ccf::http_status status,
       const std::string& code,
       std::string&& msg,
       const std::vector<nlohmann::json>& details = {}) override
     {
-      auto content_type = get_request_header(ccf::http::headers::CONTENT_TYPE);
-      if (
-        content_type.has_value() &&
-        content_type.value() == http::headervalues::contenttype::GRPC)
-      {
-        set_grpc_error(http_status_to_grpc(status), std::move(msg));
-      }
-      else
-      {
-        nlohmann::json body = ccf::ODataErrorResponse{
-          ccf::ODataError{code, std::move(msg), details}};
-        set_response_json(body, status);
-      }
+      nlohmann::json body =
+        ccf::ODataErrorResponse{ccf::ODataError{code, std::move(msg), details}};
+      set_response_json(body, status);
     }
 
     void set_error(ccf::ErrorDetails&& error) override
     {
       nlohmann::json body = ccf::ODataErrorResponse{
-        ccf::ODataError{std::move(error.code), std::move(error.msg)}};
+        ccf::ODataError{std::move(error.code), std::move(error.msg), {}}};
       set_response_json(body, error.status);
     }
 
     void set_response_json(
-      const nlohmann::json& body, http_status status) override
+      const nlohmann::json& body, ccf::http_status status) override
     {
       // Set error_handler to replace, to avoid throwing if the error message
       // contains non-UTF8 characters. Other args are default values
@@ -114,28 +107,31 @@ namespace ccf
         http::headervalues::contenttype::JSON);
     }
 
-    void set_grpc_error(grpc_status grpc_status, std::string&& msg)
-    {
-      if (http_version != HttpVersion::HTTP2)
-      {
-        throw std::logic_error("Cannot set gRPC error on non-HTTP/2 interface");
-      }
+    ccf::endpoints::ConsensusCommittedEndpointFunction
+      consensus_committed_func = nullptr;
 
-      set_response_status(HTTP_STATUS_OK);
-      set_response_header(
-        ccf::http::headers::CONTENT_TYPE,
-        http::headervalues::contenttype::GRPC);
-      set_response_trailer(grpc::make_status_trailer(grpc_status));
-      set_response_trailer(grpc::make_message_trailer(msg));
+    void set_consensus_committed_function(
+      ccf::endpoints::ConsensusCommittedEndpointFunction func) override
+    {
+      consensus_committed_func = std::move(func);
     }
 
     bool response_is_pending = false;
     bool terminate_session = false;
 
-    virtual void set_tx_id(const ccf::TxID& tx_id) = 0;
-    virtual bool should_apply_writes() const = 0;
+    struct RespondOnCommitInfo
+    {
+      ccf::TxID tx_id;
+      ccf::endpoints::ConsensusCommittedEndpointFunction committed_func;
+      ccf::crypto::Sha256Hash write_set_digest;
+      std::string commit_evidence;
+      ccf::ClaimsDigest claims_digest;
+    };
+    std::optional<RespondOnCommitInfo> respond_on_commit = std::nullopt;
+
+    [[nodiscard]] virtual bool should_apply_writes() const = 0;
     virtual void reset_response() = 0;
-    virtual std::vector<uint8_t> serialise_response() const = 0;
+    [[nodiscard]] virtual std::vector<uint8_t> serialise_response() const = 0;
     virtual const std::vector<uint8_t>& get_serialised_request() = 0;
   };
 }

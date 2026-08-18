@@ -3,74 +3,87 @@
 #pragma once
 
 #define FMT_HEADER_ONLY
+#include <exception>
 #include <regex>
 #include <set>
 #include <string>
 
-namespace ccf
+namespace ccf::http
 {
-  namespace http
+  /** Exception thrown when the Matcher encounters an invalid ETag header. */
+  class MatcherError : public std::exception
   {
-    /** Utility class to resolve If-Match and If-None-Match as described
-     * in https://www.rfc-editor.org/rfc/rfc9110#field.if-match
-     */
-    class Matcher
+  private:
+    std::string msg;
+
+  public:
+    MatcherError(std::string msg_) : msg(std::move(msg_)) {}
+
+    [[nodiscard]] const char* what() const noexcept override
     {
-    private:
-      /// If-Match header is present and has the value "*"
-      bool any_value = false;
-      /// If-Match header is present and has specific etag values
-      std::set<std::string> if_etags;
+      return msg.c_str();
+    }
+  };
 
-    public:
-      /** Construct a Matcher from a match header
-       *
-       * Note: Weak tags are not supported.
-       */
-      Matcher(const std::string& match_header)
+  /** Utility class to resolve If-Match and If-None-Match as described
+   * in https://www.rfc-editor.org/rfc/rfc9110#field.if-match
+   */
+  class Matcher
+  {
+  private:
+    /// If-Match header is present and has the value "*"
+    bool any_value = false;
+    /// If-Match header is present and has specific etag values
+    std::set<std::string> if_etags;
+
+  public:
+    /** Construct a Matcher from a match header
+     *
+     * Note: Weak tags are not supported.
+     */
+    Matcher(const std::string& match_header)
+    {
+      if (match_header == "*")
       {
-        if (match_header == "*")
-        {
-          any_value = true;
-          return;
-        }
-
-        std::regex etag_rx("\\\"([0-9a-f]+)\\\",?\\s*");
-        auto etags_begin = std::sregex_iterator(
-          match_header.begin(), match_header.end(), etag_rx);
-        auto etags_end = std::sregex_iterator();
-        ssize_t last_matched = 0;
-
-        for (std::sregex_iterator i = etags_begin; i != etags_end; ++i)
-        {
-          if (i->position() != last_matched)
-          {
-            throw std::runtime_error("Invalid If-Match header");
-          }
-          std::smatch match = *i;
-          if_etags.insert(match[1].str());
-          last_matched = match.position() + match.length();
-        }
-
-        ssize_t last_index_in_header = match_header.size();
-
-        if (last_matched != last_index_in_header || if_etags.empty())
-        {
-          throw std::runtime_error("Invalid If-Match header");
-        }
+        any_value = true;
+        return;
       }
 
-      /// Check if a given ETag matches the If-Match/If-None-Match header
-      bool matches(const std::string& etag) const
+      std::regex etag_rx(R"(\"([^\"]+)\",?\s*)");
+      auto etags_begin =
+        std::sregex_iterator(match_header.begin(), match_header.end(), etag_rx);
+      auto etags_end = std::sregex_iterator();
+      ssize_t last_matched = 0;
+
+      for (std::sregex_iterator i = etags_begin; i != etags_end; ++i)
       {
-        return any_value || if_etags.contains(etag);
+        if (i->position() != last_matched)
+        {
+          throw MatcherError("Invalid If-Match header");
+        }
+        const std::smatch& match = *i;
+        if_etags.insert(match[1].str());
+        last_matched = match.position() + match.length();
       }
 
-      /// Check if the header will match any ETag (*)
-      bool is_any() const
+      ssize_t last_index_in_header = match_header.size();
+
+      if (last_matched != last_index_in_header || if_etags.empty())
       {
-        return any_value;
+        throw MatcherError("Invalid If-Match header");
       }
-    };
-  }
+    }
+
+    /// Check if a given ETag matches the If-Match/If-None-Match header
+    [[nodiscard]] bool matches(const std::string& etag) const
+    {
+      return any_value || if_etags.contains(etag);
+    }
+
+    /// Check if the header will match any ETag (*)
+    [[nodiscard]] bool is_any() const
+    {
+      return any_value;
+    }
+  };
 }

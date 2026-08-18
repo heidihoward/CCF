@@ -2,8 +2,8 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/crypto/openssl/openssl_wrappers.h"
 #include "ccf/crypto/pem.h"
-#include "crypto/openssl/openssl_wrappers.h"
 
 #include <exception>
 
@@ -23,7 +23,8 @@ namespace tls
       {
         Unique_BIO bio(ca_string.data(), ca_string.size());
         Unique_X509 ca;
-        if (!(ca = Unique_X509(bio, true)))
+        ca = Unique_X509(bio, true);
+        if (ca == nullptr)
         {
           throw std::runtime_error(
             "Could not parse CA: " + error_string(ERR_get_error()));
@@ -48,11 +49,20 @@ namespace tls
       }
     }
 
+    CA(const std::vector<ccf::crypto::Pem>& ca_pems, bool partial_ok_ = false) :
+      partial_ok(partial_ok_)
+    {
+      for (const auto& ca_pem : ca_pems)
+      {
+        append_cert(ca_pem.str());
+      }
+    }
+
     ~CA() = default;
 
-    void use(SSL_CTX* ssl_ctx)
+    void configure_trusted_cert_store(SSL_CTX* ssl_ctx) const
     {
-      X509_STORE* store = X509_STORE_new();
+      Unique_X509_STORE store;
       if (partial_ok)
       {
         CHECK1(X509_STORE_set_flags(store, X509_V_FLAG_PARTIAL_CHAIN));
@@ -61,7 +71,7 @@ namespace tls
       {
         CHECK1(X509_STORE_add_cert(store, ca));
       }
-      SSL_CTX_set_cert_store(ssl_ctx, store);
+      SSL_CTX_set_cert_store(ssl_ctx, store.release());
     }
   };
 }

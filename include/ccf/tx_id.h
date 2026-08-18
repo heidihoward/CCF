@@ -18,7 +18,7 @@ namespace ccf
   /** Transactions occur within a fixed View. Each View generally spans a range
    * of transactions, though empty Views are also possible. The View is advanced
    * by the consensus protocol during election of a new leader, and a single
-   * leader is assigned in each View.  *View* and *Term* are synonymous.
+   * leader is assigned in each View.
    */
   using View = uint64_t;
 
@@ -45,14 +45,14 @@ namespace ccf
     View view = VIEW_UNKNOWN;
     SeqNo seqno = SEQNO_UNKNOWN;
 
-    std::string to_str() const
+    [[nodiscard]] std::string to_str() const
     {
       return std::to_string(view) + "." + std::to_string(seqno);
     }
 
     static std::optional<TxID> from_str(const std::string_view& sv)
     {
-      const auto separator_idx = sv.find(".");
+      const auto separator_idx = sv.find('.');
       if (separator_idx == std::string_view::npos)
       {
         return std::nullopt;
@@ -116,12 +116,14 @@ namespace ccf
     tx_id = opt.value();
   }
 
-  inline std::string schema_name(const TxID*)
+  inline std::string schema_name(
+    [[maybe_unused]] const TxID* transaction_id_type)
   {
     return "TransactionId";
   }
 
-  inline void fill_json_schema(nlohmann::json& schema, const TxID*)
+  inline void fill_json_schema(
+    nlohmann::json& schema, [[maybe_unused]] const TxID* transaction_id_type)
   {
     schema["type"] = "string";
     schema["pattern"] = "^[0-9]+\\.[0-9]+$";

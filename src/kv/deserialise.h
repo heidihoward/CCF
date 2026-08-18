@@ -3,7 +3,9 @@
 #pragma once
 
 #include "apply_changes.h"
+#include "ds/internal_logger.h"
 #include "kv/committable_tx.h"
+#include "kv/ledger_chunker_interface.h"
 #include "kv_types.h"
 #include "service/tables/shares.h"
 #include "service/tables/signatures.h"
@@ -16,11 +18,14 @@ namespace ccf::kv
   class ExecutionWrapperStore
   {
   public:
+    virtual ~ExecutionWrapperStore() = default;
+
     virtual bool fill_maps(
       const std::vector<uint8_t>& data,
       bool public_only,
       ccf::kv::Version& v,
       ccf::kv::Term& view,
+      ccf::kv::EntryFlags& entry_flags,
       ccf::kv::OrderedChanges& changes,
       ccf::kv::MapCollection& new_maps,
       ccf::ClaimsDigest& claims_digest,
@@ -41,15 +46,17 @@ namespace ccf::kv
   private:
     ExecutionWrapperStore* store;
     std::shared_ptr<TxHistory> history;
+    std::shared_ptr<ILedgerChunker> chunker;
     const std::vector<uint8_t> data;
     bool public_only;
-    ccf::kv::Version version;
-    Term term;
+    ccf::kv::Version version{0};
+    Term term{0};
+    EntryFlags entry_flags{0};
     OrderedChanges changes;
     MapCollection new_maps;
     ccf::kv::ConsensusHookPtrs hooks;
     ccf::ClaimsDigest claims_digest;
-    std::optional<ccf::crypto::Sha256Hash> commit_evidence_digest = {};
+    std::optional<ccf::crypto::Sha256Hash> commit_evidence_digest;
 
     const std::optional<TxID> expected_txid;
 
@@ -57,11 +64,13 @@ namespace ccf::kv
     CFTExecutionWrapper(
       ExecutionWrapperStore* store_,
       std::shared_ptr<TxHistory> history_,
+      std::shared_ptr<ILedgerChunker> chunker_,
       const std::vector<uint8_t>& data_,
       bool public_only_,
       const std::optional<TxID>& expected_txid_) :
       store(store_),
-      history(history_),
+      history(std::move(history_)),
+      chunker(std::move(chunker_)),
       data(data_),
       public_only(public_only_),
       expected_txid(expected_txid_)
@@ -85,6 +94,7 @@ namespace ccf::kv
             public_only,
             version,
             term,
+            entry_flags,
             changes,
             new_maps,
             claims_digest,
@@ -96,12 +106,12 @@ namespace ccf::kv
 
       if (expected_txid.has_value())
       {
-        if (term != expected_txid->term || version != expected_txid->version)
+        if (term != expected_txid->view || version != expected_txid->seqno)
         {
           LOG_FAIL_FMT(
             "TxID mismatch during deserialisation. Expected {}.{}, got {}.{}",
-            expected_txid->term,
-            expected_txid->version,
+            expected_txid->view,
+            expected_txid->seqno,
             term,
             version);
           return ApplyResult::FAIL;
@@ -120,23 +130,24 @@ namespace ccf::kv
       }
       auto success = ApplyResult::PASS;
 
-      auto search = changes.find(ccf::Tables::SIGNATURES);
-      if (search != changes.end())
+      const bool signature_in =
+        (changes.find(ccf::Tables::SIGNATURES) != changes.end());
+      const bool cose_signature_in =
+        (changes.find(ccf::Tables::COSE_SIGNATURES) != changes.end());
+
+      if (signature_in || cose_signature_in)
       {
+        const bool merkle_tree_in =
+          changes.find(ccf::Tables::SERIALISED_MERKLE_TREE) != changes.end();
         switch (changes.size())
         {
           case 2:
-            if (
-              changes.find(ccf::Tables::SERIALISED_MERKLE_TREE) !=
-              changes.end())
+            if (merkle_tree_in && (cose_signature_in != signature_in))
             {
               break;
             }
           case 3:
-            if (
-              changes.find(ccf::Tables::SERIALISED_MERKLE_TREE) !=
-                changes.end() &&
-              changes.find(ccf::Tables::COSE_SIGNATURES) != changes.end())
+            if (merkle_tree_in && cose_signature_in && signature_in)
             {
               break;
             }
@@ -148,7 +159,7 @@ namespace ccf::kv
 
         if (history)
         {
-          if (!history->verify_root_signatures())
+          if (!history->verify_root_signatures(version))
           {
             LOG_FAIL_FMT("Failed to deserialise");
             LOG_DEBUG_FMT(
@@ -159,7 +170,7 @@ namespace ccf::kv
         success = ApplyResult::PASS_SIGNATURE;
       }
 
-      search = changes.find(ccf::Tables::ENCRYPTED_PAST_LEDGER_SECRET);
+      auto search = changes.find(ccf::Tables::ENCRYPTED_PAST_LEDGER_SECRET);
       if (search != changes.end())
       {
         success = ApplyResult::PASS_ENCRYPTED_PAST_LEDGER_SECRET;
@@ -170,6 +181,22 @@ namespace ccf::kv
         history->append_entry(
           ccf::entry_leaf(data, commit_evidence_digest, claims_digest));
       }
+
+      if (chunker)
+      {
+        chunker->append_entry_size(data.size());
+
+        if ((entry_flags & ccf::kv::EntryFlags::FORCE_LEDGER_CHUNK_BEFORE) != 0)
+        {
+          chunker->produced_chunk_at(version - 1);
+        }
+
+        if ((entry_flags & ccf::kv::EntryFlags::FORCE_LEDGER_CHUNK_AFTER) != 0)
+        {
+          chunker->produced_chunk_at(version);
+        }
+      }
+
       return success;
     }
 

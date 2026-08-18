@@ -33,16 +33,15 @@ namespace ccf::js
         {
           return KVAccessPermissions::READ_WRITE;
         }
-        else if (
+
+        if (
           execution_context == TxAccess::APP_RO &&
           namespace_of_table == ccf::kv::AccessCategory::APPLICATION)
         {
           return KVAccessPermissions::READ_ONLY;
         }
-        else
-        {
-          return KVAccessPermissions::ILLEGAL;
-        }
+
+        return KVAccessPermissions::ILLEGAL;
       }
 
       case (ccf::kv::SecurityDomain::PUBLIC):
@@ -60,10 +59,8 @@ namespace ccf::js
             {
               return KVAccessPermissions::READ_WRITE;
             }
-            else
-            {
-              return KVAccessPermissions::READ_ONLY;
-            }
+
+            return KVAccessPermissions::READ_ONLY;
           }
 
           case ccf::kv::AccessCategory::APPLICATION:
@@ -78,7 +75,11 @@ namespace ccf::js
               {
                 return KVAccessPermissions::READ_ONLY;
               }
-              default:
+              case (TxAccess::GOV_RW):
+              {
+                return KVAccessPermissions::WRITE_ONLY;
+              }
+              case (TxAccess::GOV_RO):
               {
                 return KVAccessPermissions::ILLEGAL;
               }
@@ -99,9 +100,10 @@ namespace ccf::js
   {
     char const* table_kind = permission == KVAccessPermissions::READ_ONLY ?
       "read-only" :
-      "inaccessible";
+      (permission == KVAccessPermissions::WRITE_ONLY ? "write-only" :
+                                                       "inaccessible");
 
-    char const* exec_context = "unknown";
+    char const* exec_context = nullptr;
     switch (access)
     {
       case (TxAccess::APP_RW):
@@ -122,6 +124,11 @@ namespace ccf::js
       case (TxAccess::GOV_RW):
       {
         exec_context = "read-write governance";
+        break;
+      }
+      default:
+      {
+        exec_context = "unknown";
         break;
       }
     }

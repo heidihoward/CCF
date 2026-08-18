@@ -1,20 +1,20 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import time
 import os
+import random
 import subprocess
+import time
+from contextlib import contextmanager
+from enum import Enum, auto
+from shutil import copyfileobj
+
 import matplotlib.pyplot as plt
 import pandas as pd
-from shutil import copyfileobj
-from enum import Enum, auto
-import infra.concurrency
-import random
-from contextlib import contextmanager
-
-
 from loguru import logger as LOG
 
+import infra.concurrency
+import infra.interfaces
 
 # Interval (s) at which the network is polled to find out
 # when the load client should be restarted
@@ -51,7 +51,9 @@ class LoadStrategy(Enum):
 
 
 def make_target_host(target_node):
-    return f"https://{target_node.get_public_rpc_host()}:{target_node.get_public_rpc_port()}"
+    return "https://" + infra.interfaces.make_address(
+        target_node.get_public_rpc_host(), target_node.get_public_rpc_port()
+    )
 
 
 class LoadClient:
@@ -267,7 +269,6 @@ class ServiceLoad(infra.concurrency.StoppableThread):
             except Exception as e:
                 LOG.warning(f"Error finding nodes: {e}")
             time.sleep(NETWORK_POLL_INTERVAL_S)
-        return
 
 
 @contextmanager

@@ -38,15 +38,13 @@ Operator-facing API
 
 As defined under :ref:`operations/operator_rpc_api:Operator RPC API`.
 
-This is the API used to monitor the network topology, memory usage, endpoint metrics etc. The intention is to keep this API compatible without explicit versioning, by making sure that all changes are strict additions (i.e. new fields, new arguments with default values that behave identically to the old call).
-Fields/input arguments will never be modified/deleted unless exceptionally and explicitly notified in advance to users.
+This is the API used to monitor the network topology, endpoint metrics etc. The intention is to keep this API compatible without explicit versioning, by making additive changes where possible (i.e. new fields, new arguments with default values that behave identically to the old call).
+Fields, input arguments, and endpoints are not expected to be modified or removed in normal releases. Any such change must be explicitly notified to users in advance through the deprecation/release notes process, and removals should only occur in a major release.
 
 Member-facing API
 ~~~~~~~~~~~~~~~~~
 
-As defined under :ref:`governance/member_rpc_api:Member RPC API`, versioned as of CCF 5.0.0.
-
-The older, unversioned API will be dropped in 6.0.0.
+As defined under :ref:`governance/member_rpc_api:Member RPC API`.
 
 Operations compatibility
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -61,8 +59,8 @@ Operations compatibility
 
     The ``compatibility_report.json`` file, available `for every release <https://github.com/microsoft/CCF/releases>`_ indicates which other release(s) this release is compatible with.
 
-    - The ``live_compatibility`` section indicates which version this release can be upgraded from/upgrade to (see :doc:`/operations/code_upgrade`).
-    - The ``data_compatibility`` section indicates which version this release can recover from (using the ledger and snapshots) (see :doc:`/operations/recovery`).
+    - The ``live compatibility`` section indicates which version this release can be upgraded from/upgrade to (see :doc:`/operations/code_upgrade`).
+    - The ``data compatibility`` section indicates which version this release can recover from (using the ledger and snapshots) (see :doc:`/operations/recovery`).
 
     Note that if a version is not listed in the report, it does not necessarily mean that it is not compatible with the release. The report simply indicates that a suite of tests were run with a specific version to guarantee compatibility with this one.
 
@@ -71,7 +69,7 @@ Support policy
 
 In addition to the latest release, CCF aims to provide security patches and bugfixes for one long term support release. These releases are guaranteed to be API-stable, but not ABI-stable. Applications will need to rebuild to pick up updates, but will not need to change their code.
 
-From 2.0.0 onwards, LTS patches will be released no more frequently than monthly, with an exception for critical fixes. LTS patches will pick up third-party dependency patches systematically, as long as they have been out for more than 14 days at the time of the release, again with an exception for critical fixes.
+LTS patches will be released no more frequently than monthly, with an exception for critical fixes. LTS patches will pick up third-party dependency patches systematically, as long as they have been out for more than 14 days at the time of the release, again with an exception for critical fixes.
 
 A long term support release (LTS) will be supported for at least a year starting from its release date.
 
@@ -89,23 +87,9 @@ Support calendar
    * - Major Release
      - First Release Date
      - End of Support Date
-   * - 1.0
-     - April 30, 2021
-     - June 30, 2022
-   * - 2.0
-     - May 17, 2022
-     - June 1, 2023
-   * - 3.0
-     - November 24, 2022
-     - November 24, 2023
-   * - 4.0
-     - May 2, 2023
-     - Oct 25, 2024
-   * - 5.0
-     - Jul 17, 2024
-     - \-
-
-.. toctree::
-   :maxdepth: 2
-
-   migration_4_x_to_5_0
+   * - 6.0
+     - March 28, 2025
+     - August 21, 2026
+   * - 7.0
+     - April 21, 2026
+     - TBD

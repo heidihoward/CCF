@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
@@ -5,15 +6,14 @@ import argparse
 import re
 import sys
 import subprocess
+import tomllib
 
-MICROSOFT_ARTIFACT_REGISTRY_NAME = "mcr.microsoft.com"
-MICROSOFT_ARTIFACT_REGISTRY_PREFIX = "product"
-CCF_APP_IMAGE_PREFIX = "ccf/app"
-CCF_MCR_IMAGES = {
-    "App Development": f"{CCF_APP_IMAGE_PREFIX}/dev",
-    "C++ Runtime": f"{CCF_APP_IMAGE_PREFIX}/run",
-    "TypeScript/JavaScript Runtime": f"{CCF_APP_IMAGE_PREFIX}/run-js",
-}
+
+# Utility function that can convert a git/CCF version
+# (e.g. 7.0.0-dev10) into a Python version (e.g. 7.0.0.dev10) for comparison with the version in pyproject.toml.
+def git_to_python_version(git_version):
+    python_version = git_version.replace("-", ".", 1)
+    return python_version
 
 
 def main():
@@ -42,12 +42,6 @@ def main():
         action="store_true",
     )
     parser.add_argument(
-        "--append-mcr-images",
-        help="If true, automatically append MCR images URLs to release notes",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
         "--describe-path-changes",
         help="If true, add a note whenever the given path has changes between releases.",
         action="append",
@@ -68,15 +62,11 @@ def main():
     release_notes = {}
     links_found = []
 
-    # Check that pyproject.toml is up to date
-    # Once we have upgraded to Python 3.11, we can use tomllib to parse pyproject.toml
-    pyproject_version = None
-    with open("python/pyproject.toml") as pyproject:
-        for line in pyproject:
-            if line.startswith("version"):
-                _, version = line.split("=")
-                pyproject_version = version.strip().strip('"')
-    assert pyproject_version is not None, "Could not find version in pyproject.toml"
+    version_in_pyproject = None
+    with open("python/pyproject.toml", "rb") as pyproject:
+        config = tomllib.load(pyproject)
+        version_in_pyproject = config.get("project", {}).get("version")
+    assert version_in_pyproject is not None, "Could not find version in pyproject.toml"
 
     # Parse file, bucketing lines into each version's release notes
     current_release_notes = None
@@ -87,8 +77,8 @@ def main():
                 current_release_notes = []
                 if not release_notes:
                     assert (
-                        log_version == pyproject_version
-                    ), f"First version in CHANGELOG must match version in pyproject.toml: {pyproject_version}"
+                        git_to_python_version(log_version) == version_in_pyproject
+                    ), f"First version in CHANGELOG ({log_version}) must match version in pyproject.toml ({version_in_pyproject})"
                 release_notes[log_version] = current_release_notes
             elif match := link_definition.match(line):
                 link_version = match.group(1)
@@ -162,17 +152,6 @@ def main():
                         print(
                             f"\n- **Note**: This release include changes to `{path}`, which may be viewed [here](https://github.com/Microsoft/CCF/compare/{prev_version}...{git_version}#files_bucket)"
                         )
-
-            if args.append_mcr_images:
-                print("\n**MCR Docker Images:** ", end="")
-                print(
-                    ", ".join(
-                        [
-                            f"[{desc}](https://{MICROSOFT_ARTIFACT_REGISTRY_NAME}/{MICROSOFT_ARTIFACT_REGISTRY_PREFIX}/{name}/tags)"
-                            for desc, name in CCF_MCR_IMAGES.items()
-                        ]
-                    )
-                )
 
         else:
             print("CHANGELOG is valid!")

@@ -3,7 +3,10 @@
 
 #include "ccf/js/extensions/console.h"
 
+#include "ccf/ds/logger.h"
 #include "ccf/js/core/context.h"
+#include "ds/internal_logger.h"
+#include "js/checks.h"
 #include "node/rpc/gov_logging.h"
 
 #include <quickjs/quickjs.h>
@@ -15,9 +18,10 @@ namespace ccf::js::extensions
     std::optional<std::stringstream> stringify_args(
       JSContext* ctx, int argc, JSValueConst* argv)
     {
-      js::core::Context& jsctx = *(js::core::Context*)JS_GetContextOpaque(ctx);
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
 
-      int i;
+      int i = 0;
       std::optional<std::string> str;
       std::stringstream ss;
 
@@ -27,7 +31,7 @@ namespace ccf::js::extensions
         {
           ss << ' ';
         }
-        if (!JS_IsError(ctx, argv[i]) && JS_IsObject(argv[i]))
+        if ((JS_IsError(ctx, argv[i]) == 0) && (JS_IsObject(argv[i]) != 0))
         {
           auto rval = jsctx.json_stringify(jsctx.wrap(argv[i]));
           str = jsctx.to_str(rval);
@@ -53,7 +57,8 @@ namespace ccf::js::extensions
         return ccf::js::core::constants::Exception;
       }
 
-      js::core::Context& jsctx = *(js::core::Context*)JS_GetContextOpaque(ctx);
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
       ConsoleExtension::log_info_with_tag(jsctx.access, ss->str());
       return ccf::js::core::constants::Undefined;
     }
@@ -66,7 +71,8 @@ namespace ccf::js::extensions
         return ccf::js::core::constants::Exception;
       }
 
-      js::core::Context& jsctx = *(js::core::Context*)JS_GetContextOpaque(ctx);
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
       switch (jsctx.access)
       {
         case (js::TxAccess::APP_RO):
@@ -100,7 +106,8 @@ namespace ccf::js::extensions
         return ccf::js::core::constants::Exception;
       }
 
-      js::core::Context& jsctx = *(js::core::Context*)JS_GetContextOpaque(ctx);
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
       switch (jsctx.access)
       {
         case (js::TxAccess::APP_RO):
@@ -126,14 +133,18 @@ namespace ccf::js::extensions
       return ccf::js::core::constants::Undefined;
     }
 
-    static js::core::JSWrappedValue create_console_obj(js::core::Context& jsctx)
+    js::core::JSWrappedValue create_console_obj(js::core::Context& jsctx)
     {
       auto console = jsctx.new_obj();
 
-      console.set("log", jsctx.new_c_function(js_info, "log", 1));
-      console.set("info", jsctx.new_c_function(js_info, "info", 1));
-      console.set("warn", jsctx.new_c_function(js_fail, "warn", 1));
-      console.set("error", jsctx.new_c_function(js_fatal, "error", 1));
+      JS_CHECK_OR_THROW(
+        console.set("log", jsctx.new_c_function(js_info, "log", 1)));
+      JS_CHECK_OR_THROW(
+        console.set("info", jsctx.new_c_function(js_info, "info", 1)));
+      JS_CHECK_OR_THROW(
+        console.set("warn", jsctx.new_c_function(js_fail, "warn", 1)));
+      JS_CHECK_OR_THROW(
+        console.set("error", jsctx.new_c_function(js_fatal, "error", 1)));
 
       return console;
     }
@@ -142,7 +153,7 @@ namespace ccf::js::extensions
   void ConsoleExtension::install(js::core::Context& ctx)
   {
     auto global_obj = ctx.get_global_obj();
-    global_obj.set("console", create_console_obj(ctx));
+    JS_CHECK_OR_THROW(global_obj.set("console", create_console_obj(ctx)));
   }
 
   void ConsoleExtension::log_info_with_tag(

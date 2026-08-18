@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 
+#include "ccf/ds/x509_time_fmt.h"
 #include "ccf/indexing/strategies/seqnos_by_key_bucketed.h"
 #include "ccf/indexing/strategies/seqnos_by_key_in_memory.h"
 #include "consensus/aft/raft.h"
@@ -17,11 +18,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
-// Transitively see a header that tries to use ThreadMessaging, so need to
-// create static singleton
-std::unique_ptr<threading::ThreadMessaging>
-  threading::ThreadMessaging::singleton = nullptr;
-
 using IndexA = ccf::indexing::strategies::SeqnosByKey_InMemory<decltype(map_a)>;
 using LazyIndexA = ccf::indexing::LazyStrategy<IndexA>;
 
@@ -30,7 +26,7 @@ using IndexB = ccf::indexing::strategies::SeqnosByKey_InMemory<decltype(map_b)>;
 constexpr size_t certificate_validity_period_days = 365;
 using namespace std::literals;
 auto valid_from =
-  ::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
+  ccf::ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
 auto valid_to = ccf::crypto::compute_cert_valid_to_string(
   valid_from, certificate_validity_period_days);
 
@@ -189,8 +185,6 @@ TEST_CASE("basic indexing" * doctest::test_suite("indexing"))
   REQUIRE(indexer.install_strategy(index_a));
   REQUIRE_FALSE(indexer.install_strategy(index_a));
 
-  static constexpr auto num_transactions =
-    ccf::indexing::Indexer::MAX_REQUESTABLE * 3;
   ExpectedSeqNos seqnos_hello, seqnos_saluton, seqnos_1, seqnos_2;
   REQUIRE(create_transactions(
     kv_store,
@@ -231,8 +225,7 @@ TEST_CASE("basic indexing" * doctest::test_suite("indexing"))
   REQUIRE(indexer.install_strategy(index_b));
   REQUIRE_FALSE(indexer.install_strategy(index_b));
 
-  auto current_ = kv_store.current_txid();
-  ccf::TxID current{current_.term, current_.version};
+  ccf::TxID current = kv_store.current_txid();
   REQUIRE(index_a->get_indexed_watermark() == current);
   REQUIRE(index_b->get_indexed_watermark() == ccf::TxID());
 
@@ -280,7 +273,6 @@ aft::LedgerStubProxy* add_raft_consensus(
 {
   using TRaft = aft::Aft<aft::LedgerStubProxy>;
   using AllCommittableRaftConsensus = AllCommittableWrapper<TRaft>;
-  using ms = std::chrono::milliseconds;
   const std::string node_id = "Node 0";
   const ccf::consensus::Configuration settings{{"20ms"}, {"100ms"}};
   auto consensus = std::make_shared<AllCommittableRaftConsensus>(
@@ -342,7 +334,7 @@ TEST_CASE_TEMPLATE(
     auto member_public_encryption_keys = tx.rw<ccf::MemberPublicEncryptionKeys>(
       ccf::Tables::MEMBER_ENCRYPTION_PUBLIC_KEYS);
 
-    auto kp = ccf::crypto::make_key_pair();
+    auto kp = ccf::crypto::make_ec_key_pair();
     auto cert = kp->self_sign("CN=member", valid_from, valid_to);
     auto member_id =
       ccf::crypto::Sha256Hash(ccf::crypto::cert_pem_to_der(cert)).hex_str();
@@ -451,9 +443,21 @@ TEST_CASE_TEMPLATE(
 }
 
 using namespace std::chrono_literals;
-const auto max_multithread_run_time = 100s;
+// Generous bound: under Debug + _GLIBCXX_DEBUG this test can be ~10x slower
+// than Release. The watchdog only exists to catch true deadlocks.
+const auto max_multithread_run_time = 1500s;
+
+// _GLIBCXX_DEBUG makes container ops on the indexing/cache pipeline so slow
+// that the indexer cannot catch up to the writer in a reasonable time. The
+// test exercises the same code paths with fewer iterations.
+#ifdef _GLIBCXX_DEBUG
+constexpr size_t multithread_tx_count = 100;
+#else
+constexpr size_t multithread_tx_count = 1'000;
+#endif
 
 // Uses the real classes, and access + update them concurrently
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE(
   "multi-threaded indexing - in memory" * doctest::test_suite("indexing"))
 {
@@ -493,7 +497,7 @@ TEST_CASE(
     auto member_public_encryption_keys = tx.rw<ccf::MemberPublicEncryptionKeys>(
       ccf::Tables::MEMBER_ENCRYPTION_PUBLIC_KEYS);
 
-    auto kp = ccf::crypto::make_key_pair();
+    auto kp = ccf::crypto::make_ec_key_pair();
     auto cert = kp->self_sign("CN=member", valid_from, valid_to);
     auto member_id =
       ccf::crypto::Sha256Hash(ccf::crypto::cert_pem_to_der(cert)).hex_str();
@@ -510,9 +514,8 @@ TEST_CASE(
   std::atomic<size_t> writes_to_42 = 0;
 
   auto tx_advancer = [&]() {
-    ccf::crypto::openssl_sha256_init();
     size_t i = 0;
-    while (i < 1'000)
+    while (i < multithread_tx_count)
     {
       auto tx = kv_store.create_tx();
       tx.wo(map_a)->put(fmt::format("hello"), fmt::format("Value {}", i));
@@ -532,7 +535,6 @@ TEST_CASE(
       ++i;
       std::this_thread::yield();
     }
-    ccf::crypto::openssl_sha256_shutdown();
     finished = true;
   };
 
@@ -572,7 +574,6 @@ TEST_CASE(
   std::atomic<bool> work_done = false;
 
   std::thread index_ticker([&]() {
-    ccf::crypto::openssl_sha256_init();
     while (!work_done)
     {
       size_t post_work_done_loops = 0;
@@ -626,7 +627,6 @@ TEST_CASE(
         std::this_thread::yield();
       }
     }
-    ccf::crypto::openssl_sha256_shutdown();
   });
 
   std::vector<std::thread> threads;
@@ -783,7 +783,7 @@ TEST_CASE(
     auto member_public_encryption_keys = tx.rw<ccf::MemberPublicEncryptionKeys>(
       ccf::Tables::MEMBER_ENCRYPTION_PUBLIC_KEYS);
 
-    auto kp = ccf::crypto::make_key_pair();
+    auto kp = ccf::crypto::make_ec_key_pair();
     auto cert = kp->self_sign("CN=member", valid_from, valid_to);
     auto member_id =
       ccf::crypto::Sha256Hash(ccf::crypto::cert_pem_to_der(cert)).hex_str();
@@ -800,10 +800,9 @@ TEST_CASE(
   std::atomic<size_t> writes_to_42 = 0;
 
   auto tx_advancer = [&]() {
-    ccf::crypto::openssl_sha256_init();
     size_t i = 0;
     constexpr auto tx_count =
-#if NDEBUG
+#ifndef NDEBUG
       1'000;
 #else
       100;
@@ -830,12 +829,10 @@ TEST_CASE(
       std::this_thread::yield();
     }
     all_submitted = true;
-    ccf::crypto::openssl_sha256_shutdown();
   };
 
   auto get_all =
     [&](const std::string& key) -> std::optional<ccf::SeqNoCollection> {
-    ccf::crypto::openssl_sha256_init();
     const auto max_range = index_a->max_requestable_range();
     auto range_start = 0;
 
@@ -843,7 +840,7 @@ TEST_CASE(
 
     while (true)
     {
-      const auto end_seqno = kv_store.get_txid().seqno;
+      const auto end_seqno = kv_store.current_txid().seqno;
       const auto range_end = std::min(end_seqno, range_start + max_range);
 
       auto results =
@@ -867,7 +864,6 @@ TEST_CASE(
 
       if (range_end == end_seqno)
       {
-        ccf::crypto::openssl_sha256_shutdown();
         return all_results;
       }
       else
@@ -875,7 +871,6 @@ TEST_CASE(
         range_start = range_end + 1;
       }
     }
-    ccf::crypto::openssl_sha256_shutdown();
   };
 
   auto fetch_index_a = [&]() {
@@ -932,7 +927,6 @@ TEST_CASE(
   });
 
   std::thread index_ticker([&]() {
-    ccf::crypto::openssl_sha256_init();
     while (!work_done)
     {
       while (indexer.update_strategies(step_time, kv_store.current_txid()))
@@ -940,7 +934,6 @@ TEST_CASE(
         std::this_thread::yield();
       }
     }
-    ccf::crypto::openssl_sha256_shutdown();
   });
 
   std::thread watchdog([&]() {
@@ -968,11 +961,9 @@ TEST_CASE(
 
 int main(int argc, char** argv)
 {
-  ccf::crypto::openssl_sha256_init();
   doctest::Context context;
   context.applyCommandLine(argc, argv);
   int res = context.run();
-  ccf::crypto::openssl_sha256_shutdown();
   if (context.shouldExit())
     return res;
   return res;

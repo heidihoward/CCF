@@ -14,7 +14,7 @@
 namespace ccf::crypto
 {
   // SNIPPET_START: supported_curves
-  enum class CurveID
+  enum class CurveID : uint8_t
   {
     /// No curve
     NONE = 0,
@@ -22,11 +22,11 @@ namespace ccf::crypto
     SECP384R1,
     /// The SECP256R1 curve
     SECP256R1,
-    /// The SECP256K1 curve
-    SECP256K1,
     /// The CURVE25519 curve
     CURVE25519,
-    X25519
+    X25519,
+    /// The SECP521R1 curve
+    SECP521R1
   };
 
   DECLARE_JSON_ENUM(
@@ -34,9 +34,9 @@ namespace ccf::crypto
     {{CurveID::NONE, "None"},
      {CurveID::SECP384R1, "Secp384R1"},
      {CurveID::SECP256R1, "Secp256R1"},
-     {CurveID::SECP256K1, "Secp256K1"},
      {CurveID::CURVE25519, "Curve25519"},
-     {CurveID::X25519, "X25519"}});
+     {CurveID::X25519, "X25519"},
+     {CurveID::SECP521R1, "Secp521R1"}});
 
   static constexpr CurveID service_identity_curve_choice = CurveID::SECP384R1;
   // SNIPPET_END: supported_curves
@@ -46,15 +46,21 @@ namespace ccf::crypto
   {
     switch (ec)
     {
+      case CurveID::NONE:
+      case CurveID::CURVE25519:
+      case CurveID::X25519:
+      {
+        throw std::logic_error(fmt::format("Invalid ECDSA curve: {}", ec));
+      }
       case CurveID::SECP384R1:
         return MDType::SHA384;
       case CurveID::SECP256R1:
         return MDType::SHA256;
-      case CurveID::SECP256K1:
-        return MDType::SHA256;
+      case CurveID::SECP521R1:
+        return MDType::SHA512;
       default:
       {
-        throw std::logic_error(fmt::format("Unhandled CurveID: {}", ec));
+        throw std::logic_error(fmt::format("Unhandled CurveId: {}", ec));
       }
     }
   }

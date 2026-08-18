@@ -23,11 +23,11 @@ namespace ccf::historical
     ccf::TxID transaction_id;
 
     State(
-      const ccf::kv::ReadOnlyStorePtr& store_,
-      const TxReceiptImplPtr& receipt_,
+      ccf::kv::ReadOnlyStorePtr store_,
+      TxReceiptImplPtr receipt_,
       const ccf::TxID& transaction_id_) :
-      store(store_),
-      receipt(receipt_),
+      store(std::move(store_)),
+      receipt(std::move(receipt_)),
       transaction_id(transaction_id_)
     {}
 
@@ -66,7 +66,7 @@ namespace ccf::historical
   class AbstractStateCache : public ccf::AbstractNodeSubSystem
   {
   public:
-    virtual ~AbstractStateCache() = default;
+    ~AbstractStateCache() override = default;
 
     static char const* get_subsystem_name()
     {
@@ -196,5 +196,9 @@ namespace ccf::historical
      * more aggressively than waiting for the states to expire.
      */
     virtual bool drop_cached_states(RequestHandle handle) = 0;
+
+    /** Get the estimated size in bytes of all cached stores.
+     */
+    virtual size_t get_estimated_store_cache_size() = 0;
   };
 }

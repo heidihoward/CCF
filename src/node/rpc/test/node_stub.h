@@ -3,11 +3,13 @@
 #pragma once
 
 #include "ccf/historical_queries_interface.h"
-#include "ccf/node/host_processes_interface.h"
 #include "kv/test/stub_consensus.h"
+#include "node/recovery_decision_protocol.h"
 #include "node/rpc/gov_effects_interface.h"
 #include "node/rpc/node_interface.h"
 #include "node/rpc/node_operation_interface.h"
+
+#include <stdexcept>
 
 namespace ccf
 {
@@ -15,6 +17,7 @@ namespace ccf
   {
   public:
     bool is_public = false;
+    ccf::COSESignaturesConfig cose_signatures_config = {};
 
     ExtendedState state() override
     {
@@ -66,6 +69,11 @@ namespace ccf
       return true;
     }
 
+    std::optional<ccf::NodeId> get_primary() override
+    {
+      return ccf::kv::test::PrimaryNodeId;
+    }
+
     ccf::kv::Version get_last_recovered_signed_idx() override
     {
       return ccf::kv::NoVersion;
@@ -85,7 +93,10 @@ namespace ccf
       ccf::kv::ReadOnlyTx& tx,
       const QuoteInfo& quote_info,
       const std::vector<uint8_t>& expected_node_public_key_der,
-      pal::PlatformAttestationMeasurement& measurement) override
+      pal::PlatformAttestationMeasurement& measurement,
+      const std::optional<std::vector<uint8_t>>& code_transparent_statement,
+      std::shared_ptr<NetworkIdentitySubsystemInterface>
+        network_identity_subsystem) override
     {
       return QuoteVerificationResult::Verified;
     }
@@ -100,10 +111,24 @@ namespace ccf
       throw std::logic_error("Unimplemented");
     }
 
+    void trigger_snapshot(ccf::kv::Tx& /*tx*/) override {}
+
     ccf::crypto::Pem get_self_signed_node_certificate() override
     {
       return {};
     }
+
+    const ccf::COSESignaturesConfig& get_cose_signatures_config() override
+    {
+      return cose_signatures_config;
+    }
+
+    RecoveryDecisionProtocolSubsystem& recovery_decision_protocol() override
+    {
+      throw std::logic_error("Unimplemented");
+    }
+
+    void shuffle_sealed_shares(ccf::kv::Tx& /*tx*/) override {}
   };
 
   class StubGovernanceEffects : public ccf::AbstractGovernanceEffects
@@ -134,21 +159,7 @@ namespace ccf
       return;
     }
 
-    void trigger_acme_refresh(
-      ccf::kv::Tx& tx,
-      const std::optional<std::vector<std::string>>& interfaces =
-        std::nullopt) override
-    {
-      return;
-    }
-  };
-
-  class StubHostProcesses : public ccf::AbstractHostProcesses
-  {
-  public:
-    void trigger_host_process_launch(
-      const std::vector<std::string>& args,
-      const std::vector<uint8_t>& input) override
+    void shuffle_sealed_shares(ccf::kv::Tx& /*tx*/) override
     {
       return;
     }
@@ -161,7 +172,7 @@ namespace ccf
       historical::ExpiryDuration seconds_until_expiry)
     {}
 
-    void set_soft_cache_limit(historical::CacheSize cache_limit){};
+    void set_soft_cache_limit(historical::CacheSize cache_limit) {}
 
     void track_deletes_on_missing_keys(bool track) {}
 
@@ -259,6 +270,11 @@ namespace ccf
     {
       return true;
     }
+
+    size_t get_estimated_store_cache_size()
+    {
+      return 0;
+    }
   };
 
   struct StubNodeContext : public ccf::AbstractNodeContext
@@ -266,7 +282,6 @@ namespace ccf
   public:
     std::shared_ptr<StubNodeOperation> node_operation = nullptr;
     std::shared_ptr<StubGovernanceEffects> gov_effects = nullptr;
-    std::shared_ptr<StubHostProcesses> host_processes = nullptr;
     std::shared_ptr<StubNodeStateCache> cache = nullptr;
 
     StubNodeContext()
@@ -276,9 +291,6 @@ namespace ccf
 
       gov_effects = std::make_shared<StubGovernanceEffects>();
       install_subsystem(gov_effects);
-
-      host_processes = std::make_shared<StubHostProcesses>();
-      install_subsystem(host_processes);
 
       cache = std::make_shared<StubNodeStateCache>();
       install_subsystem(cache);

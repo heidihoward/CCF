@@ -1,26 +1,26 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import copy
 import getpass
-import time
-import http
 import logging
+import os
+import re
+import sys
+import threading
+import time
 from random import seed
+from typing import ClassVar
+
+import better_exceptions
+from loguru import logger as LOG
+
+import infra.bencher
 import infra.jwt_issuer
 import infra.network
 import infra.proc
 import infra.remote_client
-import threading
-import copy
-from typing import List
-import sys
-import better_exceptions
-import re
-import infra.bencher
-
-from loguru import logger as LOG
 
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
-logging.getLogger("paramiko").setLevel(logging.WARNING)
 
 
 def minimum_number_of_local_nodes(args):
@@ -46,11 +46,7 @@ def filter_nodes(primary, backups, filter_type):
 
 
 def configure_remote_client(args, client_id, client_host, node, command_args):
-    if client_host == "localhost":
-        client_host = infra.net.expand_localhost()
-        remote_impl = infra.remote.LocalRemote
-    else:
-        remote_impl = infra.remote.SSHRemote
+    client_host = infra.net.expand_localhost()
     try:
         remote_client = infra.remote_client.CCFRemoteClient(
             "client_" + str(client_id),
@@ -62,12 +58,11 @@ def configure_remote_client(args, client_id, client_host, node, command_args):
             args.label,
             args.config,
             command_args,
-            remote_impl,
         )
         remote_client.setup()
         return remote_client
     except Exception:
-        LOG.exception("Failed to start client {}".format(client_host))
+        LOG.exception(f"Failed to start client {client_host}")
         raise
 
 
@@ -77,16 +72,16 @@ def run(get_command, args):
 
     hosts = args.nodes
     if not hosts:
-        hosts = ["local://localhost"] * minimum_number_of_local_nodes(args)
+        hosts = infra.e2e_args.nodes(args, minimum_number_of_local_nodes(args))
 
     args.initial_user_count = 3
-    args.sig_ms_interval = 1000  # Set to cchost default value
-    args.ledger_chunk_bytes = "5MB"  # Set to cchost default value
+    args.sig_ms_interval = 1000  # Set to node default value
+    args.ledger_chunk_bytes = "5MB"  # Set to node default value
 
-    LOG.info("Starting nodes on {}".format(hosts))
+    LOG.info(f"Starting nodes on {hosts}")
 
     with infra.network.network(
-        hosts, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        hosts, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         primary, backups = network.find_nodes()
@@ -139,7 +134,7 @@ def run(get_command, args):
                 while True:
                     stop_waiting = True
                     for i, remote_client in enumerate(clients):
-                        done = remote_client.check_done()
+                        done = remote_client.check_done(timeout=0)
                         # all the clients need to be done
                         LOG.info(
                             f"Client {i} has {'completed' if done else 'not completed'} running ({time.time() - start_time:>{format_width}.2f}s / {hard_stop_timeout}s)"
@@ -154,26 +149,22 @@ def run(get_command, args):
 
                     time.sleep(5)
 
+                perf_label = args.perf_label
+
                 for remote_client in clients:
                     perf_result = remote_client.get_result()
                     LOG.success(f"{args.label}/{remote_client.name}: {perf_result}")
                     bf = infra.bencher.Bencher()
-                    bf.set(args.perf_label, infra.bencher.Throughput(perf_result))
+                    bf.set(
+                        perf_label,
+                        infra.bencher.Throughput(perf_result),
+                    )
 
                 primary, _ = network.find_primary()
-                with primary.client() as nc:
-                    r = nc.get("/node/memory")
-                    assert r.status_code == http.HTTPStatus.OK.value
-
-                    results = r.body.json()
-                    current_value = results["current_allocated_heap_size"]
-                    peak_value = results["peak_allocated_heap_size"]
-
+                mem = infra.proc.get_proc_memory_stats(primary.remote.remote.proc.pid)
+                if mem is not None:
                     bf = infra.bencher.Bencher()
-                    bf.set(
-                        args.perf_label,
-                        infra.bencher.Memory(current_value, high_value=peak_value),
-                    )
+                    bf.set_memory(perf_label, mem)
 
                 for remote_client in clients:
                     remote_client.stop()
@@ -189,7 +180,7 @@ FAILURES = []
 
 
 def log_exception(args: threading.ExceptHookArgs):
-    description = f"Failure in {args.thread.name}: {repr(args.exc_value)}"
+    description = f"Failure in {args.thread.name}: {args.exc_value!r}"
     FAILURES.append(description)
     LOG.error(
         description
@@ -206,7 +197,14 @@ threading.excepthook = log_exception
 
 
 class ConcurrentRunner:
-    threads: List[threading.Thread] = []
+    threads: ClassVar[list[threading.Thread]] = []
+
+    # Env var to filter sub-tests by exact name match. Value is a
+    # '|'-separated list, e.g. CR_FILTER="testname1|testname2". When set,
+    # only sub-tests whose name fully matches one of the entries are added.
+    _test_filter: ClassVar[list[str] | None] = (
+        os.environ["CR_FILTER"].split("|") if os.environ.get("CR_FILTER") else None
+    )
 
     def __init__(self, add_options=None) -> None:
         def add(parser):
@@ -228,6 +226,8 @@ class ConcurrentRunner:
         self.args = infra.e2e_args.cli_args(add=add)
 
     def add(self, prefix, target, **args_overrides):
+        if self._test_filter is not None and prefix not in self._test_filter:
+            return
         args_ = copy.deepcopy(self.args)
         for k, v in args_overrides.items():
             setattr(args_, k, v)
@@ -238,8 +238,10 @@ class ConcurrentRunner:
         config = {
             "handlers": [
                 {
-                    "sink": sys.stderr,
-                    "format": "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <red>{{{thread.name}}}</red> <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+                    "sink": sys.stdout,
+                    "format": lambda record: infra.e2e_args.format_log_record(
+                        record, include_thread=True
+                    ),
                 }
             ]
         }
@@ -259,6 +261,24 @@ class ConcurrentRunner:
 
         if not max_concurrent:
             max_concurrent = len(self.threads)
+
+        if os.getenv("TSAN_OPTIONS"):
+            cores_count = len(os.sched_getaffinity(0))
+            avg_nodes_per_network = 3
+            safety_factor = 0.5
+            max_concurrent = int(safety_factor * cores_count / avg_nodes_per_network)
+            assert max_concurrent > 0
+
+        if os.getenv("CCF_GLIBCXX_DEBUG"):
+            # _GLIBCXX_DEBUG checks make every container op significantly
+            # slower, so a Debug build cannot sustain as many concurrent
+            # networks. Cap concurrency to avoid CPU starvation that
+            # manifests as spurious leadership elections / session loss.
+            cores_count = len(os.sched_getaffinity(0))
+            avg_nodes_per_network = 3
+            safety_factor = 0.5
+            debug_cap = max(1, int(safety_factor * cores_count / avg_nodes_per_network))
+            max_concurrent = min(max_concurrent, debug_cap)
 
         thread_groups = [
             self.threads[i : i + max_concurrent]

@@ -28,8 +28,11 @@ function hexStrToBuf(hexStr) {
 
   for (let i = 0; i < hexStr.length; i += 2) {
     const octet = hexStr.slice(i, i + 2);
-    if (octet.length != 2 || octet.match(/[G-Z\s]/i)) {
-      throw new Error("Hex string invalid");
+    if (octet.length != 2) {
+      throw new Error("Hex string invalid: length must be multiple of 2");
+    }
+    if (octet.match(/[G-Z\s]/i)) {
+      throw new Error(`Hex string invalid: Non-hex character ${octet}`);
     }
     result.push(parseInt(octet, 16));
   }
@@ -73,12 +76,159 @@ function checkBounds(value, low, high, field) {
   }
 }
 
-function checkLength(value, min, max, field) {
+function checkArrayLength(value, min, max, field) {
+  checkType(value, "array", field);
   if (min !== null && value.length < min) {
     throw new Error(`${field} must be an array of minimum ${min} elements`);
   }
   if (max !== null && value.length > max) {
     throw new Error(`${field} must be an array of maximum ${max} elements`);
+  }
+}
+
+function checkArrayBufferLength(value, min, max, field) {
+  if (min !== null && value.length < min) {
+    throw new Error(`${field} must be an array of minimum ${min} elements`);
+  }
+  if (max !== null && value.length > max) {
+    throw new Error(`${field} must be an array of maximum ${max} elements`);
+  }
+}
+
+function checkBase64Url(value, field) {
+  checkType(value, "string", field);
+  if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) {
+    throw new Error(`${field} must be base64url encoded`);
+  }
+}
+
+function base64UrlByteLength(value, field) {
+  checkBase64Url(value, field);
+  return Math.floor(value.length / 4) * 3 + [0, 0, 1, 2][value.length % 4];
+}
+
+function splitX509CertBundle(value) {
+  // Match complete PEM certificates with both BEGIN and END markers.
+  // This ensures we only extract valid PEM blocks and reject malformed input.
+  const pemPattern =
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+  const certs = value.match(pemPattern);
+
+  if (!certs || certs.length === 0) {
+    throw new Error("No valid PEM certificates found in bundle");
+  }
+
+  // Verify the input contains only certificates and whitespace.
+  // Use a single-pass approach: replace all matched certificates with empty string
+  // using the global regex, then check if only whitespace remains.
+  const remaining = value.replace(pemPattern, "");
+
+  if (remaining.trim() !== "") {
+    throw new Error(
+      "Certificate bundle contains invalid content between certificates",
+    );
+  }
+
+  return certs;
+}
+
+function checkX509CACertBundle(value, field) {
+  checkX509CertBundle(value, field);
+  // isValidX509RootCACert(pem) is backed by a C++ function that checks both
+  // X509_check_ca (CA:TRUE or self-signed x509v1) and EXFLAG_SS (self-signed).
+  // Every certificate in the bundle must be a root (self-signed) CA; intermediate
+  // CAs are rejected even when their signing root is also present in the bundle.
+  for (const [i, cert] of splitX509CertBundle(value).entries()) {
+    if (!ccf.crypto.isValidX509RootCACert(cert)) {
+      throw new Error(
+        `${field}[${i}] must be a self-signed (root) CA certificate`,
+      );
+    }
+  }
+}
+
+function checkRsaPublicKey(jwk, field) {
+  checkType(jwk.n, "string", `${field}.n`);
+  checkType(jwk.e, "string", `${field}.e`);
+  checkBase64Url(jwk.e, `${field}.e`);
+  // RFC 7518 section 6.3.1.1 requires `n` to be the unsigned big-endian modulus with
+  // no leading zero octets. Under that encoding a 2048-bit modulus is exactly
+  // 256 octets, so anything shorter is conclusively below 2048 bits and the
+  // key is too weak. Encoded length is a sufficient (and cheap) proxy here;
+  // the precise bit length is not exposed to JS, but pubRsaJwkToPem below
+  // catches any structurally-invalid modulus.
+  if (base64UrlByteLength(jwk.n, `${field}.n`) < 256) {
+    throw new Error(`${field}.n must be at least 2048 bits`);
+  }
+  try {
+    ccf.crypto.pubRsaJwkToPem({
+      kty: "RSA",
+      kid: jwk.kid,
+      n: jwk.n,
+      e: jwk.e,
+    });
+  } catch (e) {
+    throw new Error(`${field} must be a valid RSA public key`);
+  }
+}
+
+function checkEcPublicKey(jwk, field) {
+  checkType(jwk.x, "string", `${field}.x`);
+  checkType(jwk.y, "string", `${field}.y`);
+  checkType(jwk.crv, "string", `${field}.crv`);
+  checkEnum(jwk.crv, ["P-256", "P-384", "P-521"], `${field}.crv`);
+  const coordinateLengths = { "P-256": 32, "P-384": 48, "P-521": 66 };
+  const coordinateLength = coordinateLengths[jwk.crv];
+  if (base64UrlByteLength(jwk.x, `${field}.x`) !== coordinateLength) {
+    throw new Error(`${field}.x must be ${coordinateLength} bytes`);
+  }
+  if (base64UrlByteLength(jwk.y, `${field}.y`) !== coordinateLength) {
+    throw new Error(`${field}.y must be ${coordinateLength} bytes`);
+  }
+  try {
+    ccf.crypto.pubJwkToPem({
+      kty: "EC",
+      kid: jwk.kid,
+      crv: jwk.crv,
+      x: jwk.x,
+      y: jwk.y,
+    });
+  } catch (e) {
+    throw new Error(`${field} must be a valid EC public key`);
+  }
+}
+
+const cpuid_length_bytes = 4;
+function checkValidCpuid(value, field) {
+  checkType(value, "string", field);
+  if (value !== value.toLowerCase()) {
+    throw new Error(`${field} must be a lowercase hex string: ${value}`);
+  }
+
+  // This will throw if the string contains non-hex characters
+  const buffer = hexStrToBuf(value);
+  const length = buffer.byteLength;
+  if (length != cpuid_length_bytes) {
+    throw new Error(
+      `${field} must convert to exactly ${cpuid_length_bytes} bytes`,
+    );
+  }
+}
+
+const tcb_version_length_bytes = 8;
+function checkValidTcbVersionHex(value, field) {
+  checkType(value, "string", field);
+  if (value !== value.toLowerCase()) {
+    throw new Error(`${field} must be a lowercase hex string: ${value}`);
+  }
+
+  // This will throw if the string contains non-hex characters
+  const buffer = hexStrToBuf(value);
+  const length = buffer.byteLength;
+  if (length != tcb_version_length_bytes) {
+    throw new Error(
+      `${field} must convert to exactly ${tcb_version_length_bytes} bytes`,
+    );
   }
 }
 
@@ -124,21 +274,134 @@ function getActiveRecoveryMembersCount() {
   return activeRecoveryMembersCount;
 }
 
+function getServiceStatus() {
+  const rawService =
+    ccf.kv["public:ccf.gov.service.info"].get(getSingletonKvKey());
+  if (rawService === undefined) {
+    throw new Error("Service information could not be found");
+  }
+
+  return ccf.bufToJsonCompatible(rawService).status;
+}
+
+function isServiceRecovering() {
+  const serviceStatus = getServiceStatus();
+  return (
+    serviceStatus === "Recovering" ||
+    serviceStatus === "WaitingForRecoveryShares"
+  );
+}
+
+function checkRecoveryMemberChange(memberId, hasInputEncryptionKey) {
+  if (!isServiceRecovering()) {
+    return;
+  }
+
+  if (
+    hasInputEncryptionKey ||
+    ccf.kv["public:ccf.gov.members.encryption_public_keys"].has(memberId)
+  ) {
+    throw new Error("Cannot change recovery members during recovery");
+  }
+}
+
+function checkRecoverySharesChange() {
+  if (isServiceRecovering()) {
+    throw new Error(
+      "Cannot change the recovery threshold, refresh recovery shares, or rekey the ledger during recovery",
+    );
+  }
+}
+
 function checkJwks(value, field) {
   checkType(value, "object", field);
   checkType(value.keys, "array", `${field}.keys`);
+  const kids = new Set();
   for (const [i, jwk] of value.keys.entries()) {
+    const keyField = `${field}.keys[${i}]`;
     checkType(jwk.kid, "string", `${field}.keys[${i}].kid`);
+    if (kids.has(jwk.kid)) {
+      throw new Error(`${field}.keys[${i}].kid must be unique`);
+    }
+    kids.add(jwk.kid);
     checkType(jwk.kty, "string", `${field}.keys[${i}].kty`);
-    checkType(jwk.x5c, "array", `${field}.keys[${i}].x5c`);
-    checkLength(jwk.x5c, 1, null, `${field}.keys[${i}].x5c`);
-    for (const [j, b64der] of jwk.x5c.entries()) {
-      checkType(b64der, "string", `${field}.keys[${i}].x5c[${j}]`);
-      const pem =
+    checkEnum(jwk.kty, ["RSA", "EC"], `${field}.keys[${i}].kty`);
+    if (jwk.use !== undefined) {
+      checkType(jwk.use, "string", `${keyField}.use`);
+      checkEnum(jwk.use, ["sig"], `${keyField}.use`);
+    }
+    if (jwk.alg !== undefined) {
+      checkType(jwk.alg, "string", `${keyField}.alg`);
+      let allowedAlg;
+      if (jwk.kty === "RSA") {
+        allowedAlg = ["RS256"];
+      } else {
+        // Per RFC 7518 section 3.4, EC alg is determined by the curve. When
+        // only x5c is supplied, crv may not be present on the JWK; in that
+        // case allow any of the supported ES* algorithms and rely on the cert
+        // to bind alg to curve.
+        const ecAlgByCrv = {
+          "P-256": "ES256",
+          "P-384": "ES384",
+          "P-521": "ES512",
+        };
+        allowedAlg =
+          jwk.crv && ecAlgByCrv[jwk.crv]
+            ? [ecAlgByCrv[jwk.crv]]
+            : Object.values(ecAlgByCrv);
+      }
+      checkEnum(jwk.alg, allowedAlg, `${keyField}.alg`);
+    }
+    if (jwk.x5c) {
+      checkArrayLength(jwk.x5c, 1, null, `${field}.keys[${i}].x5c`);
+      let certBundle = "";
+      for (const [j, b64der] of jwk.x5c.entries()) {
+        checkType(b64der, "string", `${field}.keys[${i}].x5c[${j}]`);
+        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64der)) {
+          throw new Error(
+            `${field}.keys[${i}].x5c[${j}] must be base64 encoded`,
+          );
+        }
+        const pem =
+          "-----BEGIN CERTIFICATE-----\n" +
+          b64der +
+          "\n-----END CERTIFICATE-----";
+        checkX509CertBundle(pem, `${field}.keys[${i}].x5c[${j}]`);
+        certBundle += pem;
+      }
+      const trustedRoot =
         "-----BEGIN CERTIFICATE-----\n" +
-        b64der +
+        jwk.x5c[jwk.x5c.length - 1] +
         "\n-----END CERTIFICATE-----";
-      checkX509CertBundle(pem, `${field}.keys[${i}].x5c[${j}]`);
+      if (!ccf.crypto.isValidX509CertChain(certBundle, trustedRoot)) {
+        throw new Error(`${field}.keys[${i}].x5c must chain to its root`);
+      }
+      if (jwk.n !== undefined || jwk.e !== undefined) {
+        if (jwk.kty !== "RSA") {
+          throw new Error(`${field}.keys[${i}].kty must be RSA for n/e keys`);
+        }
+        checkRsaPublicKey(jwk, keyField);
+      }
+      if (jwk.x !== undefined || jwk.y !== undefined || jwk.crv !== undefined) {
+        if (jwk.kty !== "EC") {
+          throw new Error(`${field}.keys[${i}].kty must be EC for x/y keys`);
+        }
+        checkEcPublicKey(jwk, keyField);
+      }
+    } else if (jwk.n && jwk.e) {
+      if (jwk.kty !== "RSA") {
+        throw new Error(`${field}.keys[${i}].kty must be RSA for n/e keys`);
+      }
+      checkRsaPublicKey(jwk, keyField);
+    } else if (jwk.x && jwk.y) {
+      if (jwk.kty !== "EC") {
+        throw new Error(`${field}.keys[${i}].kty must be EC for x/y keys`);
+      }
+      checkEcPublicKey(jwk, keyField);
+    } else {
+      throw new Error(
+        "JWK must contain either x5c, or n/e for RSA key type, or x/y/crv for EC key type",
+      );
     }
   }
 }
@@ -255,19 +518,16 @@ function checkRecoveryThreshold(config, new_config) {
     return;
   }
 
-  const service_info = "public:ccf.gov.service.info";
-  const rawService = ccf.kv[service_info].get(getSingletonKvKey());
-  if (rawService === undefined) {
-    throw new Error("Service information could not be found");
-  }
+  const serviceStatus = getServiceStatus();
 
-  const service = ccf.bufToJsonCompatible(rawService);
-
-  if (service.status === "WaitingForRecoveryShares") {
+  if (
+    serviceStatus === "Recovering" ||
+    serviceStatus === "WaitingForRecoveryShares"
+  ) {
     throw new Error(
-      `Cannot set recovery threshold if service is ${service.status}`,
+      `Cannot set recovery threshold if service is ${serviceStatus}`,
     );
-  } else if (service.status === "Open") {
+  } else if (serviceStatus === "Open") {
     let activeRecoveryMembersCount = getActiveRecoveryMembersCount();
     if (new_config.recovery_threshold > activeRecoveryMembersCount) {
       throw new Error(
@@ -281,12 +541,10 @@ function checkReconfigurationType(config, new_config) {
   const from = config.reconfiguration_type;
   const to = new_config.reconfiguration_type;
   if (from !== to && to !== undefined) {
-    if (
-      !(
-        (from === undefined || from === "OneTransaction") &&
-        to === "TwoTransaction"
-      )
-    ) {
+    if (!(
+      (from === undefined || from === "OneTransaction") &&
+      to === "TwoTransaction"
+    )) {
       throw new Error(
         `Cannot change reconfiguration type from ${from} to ${to}.`,
       );
@@ -340,7 +598,8 @@ const actions = new Map([
     "set_constitution",
     new Action(
       function (args) {
-        checkType(args.constitution, "string");
+        checkType(args.constitution, "string", "constitution");
+        ccf.gov.validateConstitution(args.constitution);
       },
       function (args, proposalId) {
         ccf.kv["public:ccf.gov.constitution"].set(
@@ -359,16 +618,49 @@ const actions = new Map([
       function (args) {
         checkX509CertBundle(args.cert, "cert");
         checkType(args.member_data, "object?", "member_data");
-        // Also check that public encryption key is well formed, if it exists
+        const recovery_role = args.recovery_role;
+        if (recovery_role !== undefined) {
+          checkEnum(
+            recovery_role,
+            ["NonParticipant", "Participant", "Owner"],
+            "recovery_role",
+          );
+        }
 
-        // Check if member exists
-        // if not, check there is no enc pub key
-        // if it does, check it doesn't have an enc pub key in ledger
+        if (
+          args.encryption_pub_key == null &&
+          args.recovery_role !== null &&
+          args.recovery_role !== undefined
+        ) {
+          throw new Error(
+            "Cannot specify a recovery_role value when encryption_pub_key is not specified",
+          );
+        }
+        if (
+          args.encryption_pub_key !== null &&
+          args.encryption_pub_key !== undefined
+        ) {
+          checkRsaPublicKey(
+            ccf.crypto.pubRsaPemToJwk(args.encryption_pub_key),
+            "encryption_pub_key",
+          );
+        }
+
+        checkRecoveryMemberChange(
+          ccf.strToBuf(ccf.pemToId(args.cert)),
+          args.encryption_pub_key !== null &&
+            args.encryption_pub_key !== undefined,
+        );
       },
 
       function (args) {
         const memberId = ccf.pemToId(args.cert);
         const rawMemberId = ccf.strToBuf(memberId);
+        checkRecoveryMemberChange(
+          rawMemberId,
+          args.encryption_pub_key !== null &&
+            args.encryption_pub_key !== undefined,
+        );
 
         ccf.kv["public:ccf.gov.members.certs"].set(
           rawMemberId,
@@ -388,6 +680,7 @@ const actions = new Map([
 
         let member_info = {};
         member_info.member_data = args.member_data;
+        member_info.recovery_role = args.recovery_role;
         member_info.status = "Accepted";
         ccf.kv["public:ccf.gov.members.info"].set(
           rawMemberId,
@@ -415,9 +708,11 @@ const actions = new Map([
     new Action(
       function (args) {
         checkEntityId(args.member_id, "member_id");
+        checkRecoveryMemberChange(ccf.strToBuf(args.member_id), false);
       },
       function (args) {
         const rawMemberId = ccf.strToBuf(args.member_id);
+        checkRecoveryMemberChange(rawMemberId, false);
         const rawMemberInfo =
           ccf.kv["public:ccf.gov.members.info"].get(rawMemberId);
         if (rawMemberInfo === undefined) {
@@ -562,8 +857,10 @@ const actions = new Map([
       function (args) {
         checkType(args.recovery_threshold, "integer", "threshold");
         checkBounds(args.recovery_threshold, 1, 254, "threshold");
+        checkRecoverySharesChange();
       },
       function (args) {
+        checkRecoverySharesChange();
         updateServiceConfig(args);
       },
     ),
@@ -573,8 +870,10 @@ const actions = new Map([
     new Action(
       function (args) {
         checkNone(args);
+        checkRecoverySharesChange();
       },
       function (args) {
+        checkRecoverySharesChange();
         ccf.node.triggerRecoverySharesRefresh();
       },
     ),
@@ -584,9 +883,11 @@ const actions = new Map([
     new Action(
       function (args) {
         checkNone(args);
+        checkRecoverySharesChange();
       },
 
       function (args) {
+        checkRecoverySharesChange();
         ccf.node.triggerLedgerRekey();
       },
     ),
@@ -853,7 +1154,7 @@ const actions = new Map([
     new Action(
       function (args) {
         checkType(args.name, "string", "name");
-        checkX509CertBundle(args.cert_bundle, "cert_bundle");
+        checkX509CACertBundle(args.cert_bundle, "cert_bundle");
       },
       function (args) {
         const name = args.name;
@@ -888,26 +1189,22 @@ const actions = new Map([
         if (args.jwks) {
           checkJwks(args.jwks, "jwks");
         }
+        let url;
+        try {
+          url = parseUrl(args.issuer);
+        } catch (e) {
+          throw new Error("issuer must be a URL");
+        }
+        if (url.scheme != "https" || !url.authority) {
+          throw new Error("issuer must be a URL starting with https://");
+        }
+        if (url.query || url.fragment) {
+          throw new Error("issuer must be a URL without query/fragment");
+        }
         if (args.auto_refresh) {
           if (!args.ca_cert_bundle_name) {
             throw new Error(
               "ca_cert_bundle_name is missing but required if auto_refresh is true",
-            );
-          }
-          let url;
-          try {
-            url = parseUrl(args.issuer);
-          } catch (e) {
-            throw new Error("issuer must be a URL if auto_refresh is true");
-          }
-          if (url.scheme != "https") {
-            throw new Error(
-              "issuer must be a URL starting with https:// if auto_refresh is true",
-            );
-          }
-          if (url.query || url.fragment) {
-            throw new Error(
-              "issuer must be a URL without query/fragment if auto_refresh is true",
             );
           }
         }
@@ -976,22 +1273,6 @@ const actions = new Map([
     ),
   ],
   [
-    "add_node_code",
-    new Action(
-      function (args) {
-        checkType(args.code_id, "string", "code_id");
-      },
-      function (args, proposalId) {
-        const codeId = ccf.strToBuf(args.code_id);
-        const ALLOWED = ccf.jsonCompatibleToBuf("AllowedToJoin");
-        ccf.kv["public:ccf.gov.nodes.code_ids"].set(codeId, ALLOWED);
-
-        // Adding a new allowed code ID changes the semantics of any other open proposals, so invalidate them to avoid confusion or malicious vote modification
-        invalidateOtherOpenProposals(proposalId);
-      },
-    ),
-  ],
-  [
     "add_snp_measurement",
     new Action(
       function (args) {
@@ -1037,19 +1318,6 @@ const actions = new Map([
     ),
   ],
   [
-    "add_executor_node_code",
-    new Action(
-      function (args) {
-        checkType(args.executor_code_id, "string", "executor_code_id");
-      },
-      function (args) {
-        const codeId = ccf.strToBuf(args.executor_code_id);
-        const ALLOWED = ccf.jsonCompatibleToBuf("AllowedToExecute");
-        ccf.kv["public:ccf.gov.nodes.executor_code_ids"].set(codeId, ALLOWED);
-      },
-    ),
-  ],
-  [
     "add_snp_host_data",
     new Action(
       function (args) {
@@ -1077,6 +1345,54 @@ const actions = new Map([
         );
 
         // Adding a new allowed host data changes the semantics of any other open proposals, so invalidate them to avoid confusion or malicious vote modification
+        invalidateOtherOpenProposals(proposalId);
+      },
+    ),
+  ],
+  [
+    "set_snp_minimum_tcb_version",
+    new Action(
+      function (args) {
+        checkValidCpuid(args.cpuid, "cpuid");
+
+        checkType(args.tcb_version, "object", "tcb_version");
+        checkType(
+          args.tcb_version?.boot_loader,
+          "number",
+          "tcb_version.boot_loader",
+        );
+        checkType(args.tcb_version?.tee, "number", "tcb_version.tee");
+        checkType(args.tcb_version?.snp, "number", "tcb_version.snp");
+        checkType(
+          args.tcb_version?.microcode,
+          "number",
+          "tcb_version.microcode",
+        );
+      },
+      function (args, proposalId) {
+        ccf.kv["public:ccf.gov.nodes.snp.tcb_versions"].set(
+          ccf.strToBuf(args.cpuid),
+          ccf.jsonCompatibleToBuf(args.tcb_version),
+        );
+
+        invalidateOtherOpenProposals(proposalId);
+      },
+    ),
+  ],
+  [
+    "set_snp_minimum_tcb_version_hex",
+    new Action(
+      function (args) {
+        checkValidCpuid(args.cpuid, "cpuid");
+        checkValidTcbVersionHex(args.tcb_version, "tcb_version");
+      },
+      function (args, proposalId) {
+        let tcb_policy = ccf.tcbHexToPolicy(args.cpuid, args.tcb_version);
+        ccf.kv["public:ccf.gov.nodes.snp.tcb_versions"].set(
+          ccf.strToBuf(args.cpuid),
+          ccf.jsonCompatibleToBuf(tcb_policy),
+        );
+
         invalidateOtherOpenProposals(proposalId);
       },
     ),
@@ -1132,6 +1448,22 @@ const actions = new Map([
             ccf.strToBuf(args.did),
             ccf.jsonCompatibleToBuf(uvme),
           );
+        }
+      },
+    ),
+  ],
+  [
+    "remove_snp_minimum_tcb_version",
+    new Action(
+      function (args) {
+        checkValidCpuid(args.cpuid, "cpuid");
+      },
+      function (args) {
+        const cpuid = ccf.strToBuf(args.cpuid);
+        if (ccf.kv["public:ccf.gov.nodes.snp.tcb_versions"].has(cpuid)) {
+          ccf.kv["public:ccf.gov.nodes.snp.tcb_versions"].delete(cpuid);
+        } else {
+          throw new Error(`CPUID ${args.cpuid} not found`);
         }
       },
     ),
@@ -1197,6 +1529,9 @@ const actions = new Map([
             ccf.strToBuf(args.node_id),
             ccf.jsonCompatibleToBuf(nodeInfo),
           );
+          if (ccf.node.shuffleSealedShares !== undefined) {
+            ccf.node.shuffleSealedShares();
+          }
 
           // Also generate and record service-endorsed node certificate from node CSR
           if (nodeInfo.certificate_signing_request !== undefined) {
@@ -1226,30 +1561,6 @@ const actions = new Map([
             );
           }
         }
-      },
-    ),
-  ],
-  [
-    "remove_node_code",
-    new Action(
-      function (args) {
-        checkType(args.code_id, "string", "code_id");
-      },
-      function (args) {
-        const codeId = ccf.strToBuf(args.code_id);
-        ccf.kv["public:ccf.gov.nodes.code_ids"].delete(codeId);
-      },
-    ),
-  ],
-  [
-    "remove_executor_node_code",
-    new Action(
-      function (args) {
-        checkType(args.executor_code_id, "string", "executor_code_id");
-      },
-      function (args) {
-        const codeId = ccf.strToBuf(args.executor_code_id);
-        ccf.kv["public:ccf.gov.nodes.executor_code_ids"].delete(codeId);
       },
     ),
   ],
@@ -1446,21 +1757,6 @@ const actions = new Map([
     ),
   ],
   [
-    "trigger_acme_refresh",
-    new Action(
-      function (args) {
-        checkType(
-          args.interfaces,
-          "array?",
-          "interfaces to refresh the certificates for",
-        );
-      },
-      function (args, proposalId) {
-        ccf.node.triggerACMERefresh(args.interfaces);
-      },
-    ),
-  ],
-  [
     "assert_service_identity",
     new Action(
       function (args) {
@@ -1476,6 +1772,58 @@ const actions = new Map([
         }
       },
       function (args) {},
+    ),
+  ],
+  [
+    "cleanup_legacy_jwt_records",
+    new Action(
+      function (args) {
+        checkType(
+          args.ensure_new_records_exist,
+          "boolean?",
+          "ensure_new_records_exist",
+        );
+      },
+      function (args) {
+        if (
+          args.ensure_new_records_exist &&
+          ccf.kv["public:ccf.gov.jwt.public_signing_keys_metadata_v2"].size ===
+            0
+        ) {
+          throw new Error("No new JWT public signing keys records found");
+        }
+
+        ccf.kv["public:ccf.gov.jwt.public_signing_keys"].clear();
+        ccf.kv["public:ccf.gov.jwt.public_signing_keys_metadata"].clear();
+        ccf.kv["public:ccf.gov.jwt.public_signing_key_issuer"].clear();
+      },
+    ),
+  ],
+  [
+    "set_node_join_policy",
+    new Action(
+      function (args) {
+        checkType(args.policy, "string", "policy");
+      },
+      function (args, proposalId) {
+        const codeUpdatePolicyTable =
+          ccf.kv["public:ccf.gov.nodes.node_join_policy"];
+        codeUpdatePolicyTable.set(
+          getSingletonKvKey(),
+          ccf.strToBuf(args.policy),
+        );
+      },
+    ),
+  ],
+  [
+    "remove_node_join_policy",
+    new Action(
+      function (args) {},
+      function (args, proposalId) {
+        const codeUpdatePolicyTable =
+          ccf.kv["public:ccf.gov.nodes.node_join_policy"];
+        codeUpdatePolicyTable.delete(getSingletonKvKey());
+      },
     ),
   ],
 ]);

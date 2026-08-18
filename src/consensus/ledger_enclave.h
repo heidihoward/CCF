@@ -2,8 +2,8 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ccf_assert.h"
 #include "consensus/ledger_enclave_types.h"
+#include "ds/ccf_assert.h"
 #include "ds/serialized.h"
 #include "kv/kv_types.h"
 #include "kv/serialised_entry_format.h"
@@ -13,8 +13,6 @@ namespace consensus
   class LedgerEnclave
   {
   public:
-    static constexpr size_t FRAME_SIZE = sizeof(uint32_t);
-
     /**
      * Retrieve a single entry, advancing offset to the next entry.
      *
@@ -73,8 +71,8 @@ namespace consensus
       const uint8_t* data,
       size_t size,
       bool globally_committable,
-      ccf::kv::Term term,
-      ccf::kv::Version index)
+      [[maybe_unused]] ccf::kv::Term term,
+      [[maybe_unused]] ccf::kv::Version index)
     {
       serializer::ByteRange byte_range = {data, size};
       RINGBUFFER_WRITE_MESSAGE(

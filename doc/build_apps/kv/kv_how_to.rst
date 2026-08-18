@@ -69,23 +69,23 @@ Once a :cpp:class:`ccf::kv::MapHandle` on a specific :cpp:type:`ccf::kv::Map` ha
 .. code-block:: cpp
 
     // Writing to a handle
-    map1_handle1->put("key1", "value1");
+    map1_handle->put("key1", "value1");
 
     // Reading presence of a key
     bool has_key_1 = map1_handle->has("key1");
     assert(has_key_1);
 
     // Reading a value
-    std::optional<std::string> read_val = map1_handle1->get("key1");
+    std::optional<std::string> read_val = map1_handle->get("key1");
     assert(read_val.has_value());
     assert(read_val.value() == "value1");
 
     // Deleting a key
-    map1_handle1->remove("key1");
+    map1_handle->remove("key1");
 
     // Reading a deleted/non-existent key
-    assert(!map_handle1->has("key1"));
-    read_val = map1_handle1->get("key1");
+    assert(!map1_handle->has("key1"));
+    read_val = map1_handle->get("key1");
     assert(!read_val.has_value());
 
 Read/Write safety
@@ -122,7 +122,7 @@ Note that, as in the sample above, it is possible to acquire different kinds of 
 Removing a key
 --------------
 
-If a Key-Value pair was written to a :cpp:type:`ccf::kv::Map` by a previous :cpp:class:`ccf::kv::Tx`, it is possible to delete this key. Because of the append-only nature of the KV, this Key-Value pair is not actually removed from the :cpp:type:`ccf::kv::Map` but instead explicitly marked as deleted in the version that the deleting :cpp:class:`ccf::kv::Tx` is applied at.
+If a Key-Value pair was written to a :cpp:type:`ccf::kv::Map` by a previous :cpp:class:`ccf::kv::Tx`, it is possible to delete this key.
 
 .. code-block:: cpp
 
@@ -149,14 +149,14 @@ The :cpp:func:`ccf::kv::MapHandle::get_globally_committed` member function retur
     auto handle = tx.rw(map_priv);
 
     // "key1" has not yet been globally committed
-    auto v = handle.get_globally_committed("key1");
+    auto v = handle->get_globally_committed("key1");
     assert(v.has_value() == false);
 
 .. code-block:: cpp
 
     // Meanwhile, the CCF network globally commits the transaction in which "key1" was written
-    auto v1 = handle.get_globally_committed("key1"); // v1.has_value() == "value1"
-    assert(v.value() == "value1");
+    auto v1 = handle->get_globally_committed("key1"); // v1.has_value() == "value1"
+    assert(v1.value() == "value1");
 
 ----------
 

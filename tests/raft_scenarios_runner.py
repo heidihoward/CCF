@@ -1,14 +1,15 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 import argparse
-import sys
-import os
 import json
-from subprocess import Popen, PIPE
-from raft_scenarios_gen import generate_scenarios
-from contextlib import contextmanager
+import os
+import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from heapq import merge
+from subprocess import PIPE, Popen
+
+from raft_scenarios_gen import generate_scenarios
 
 
 @contextmanager
@@ -27,7 +28,7 @@ def write_error_report(errors=None):
         scenario_len = max(len("Scenario"), *(len(error[0]) for error in errors))
         stderr_len = max(len("stderr"), *(len(error[1]) for error in errors))
         print("???+ error \n")
-        fmt_s = "   | {{:<{}}} | {{:<{}}} |\n".format(scenario_len, stderr_len)
+        fmt_s = f"   | {{:<{scenario_len}}} | {{:<{stderr_len}}} |\n"
         print(fmt_s.format("Scenario", "stderr"))
         print(fmt_s.format("-" * scenario_len, "-" * stderr_len))
         for error in errors:
@@ -51,13 +52,12 @@ def preprocess_for_trace_validation(log):
     last_cmd = ""
     for line in log:
         entry = json.loads(line)
-        if "cmd" in entry:
+        if "cmd" in entry and len(entry["cmd"]) > 0:
             last_cmd = entry["cmd"]
             continue
         node = entry["msg"]["state"]["node_id"]
         entry["cmd"] = last_cmd
         entry["cmd_prefix"] = entry["cmd"].split(",")[0]
-        last_cmd = ""
         if initial_node is None:
             initial_node = node
         if entry["msg"]["function"] == "add_configuration":
@@ -68,6 +68,15 @@ def preprocess_for_trace_validation(log):
             ), removed
             entry["cmd"] = entry["cmd"] or removed["cmd"]
         log_by_node[node].append(entry)
+
+        # Collapse propose_vote->become_candidate to just propose_vote
+        if len(log_by_node[node]) >= 2 and [
+            e["msg"]["function"] for e in log_by_node[node][-2:]
+        ] == ["recv_propose_request_vote", "become_candidate"]:
+            bc = log_by_node[node].pop()
+            pr = log_by_node[node].pop()
+            assert bc["cmd"] == pr["cmd"], f"Command mismatch between {pr} and {bc}"
+            log_by_node[node].append(pr)
 
     def head():
         return log_by_node[initial_node].pop(0)
@@ -125,6 +134,13 @@ if __name__ == "__main__":
     parser.add_argument("driver", type=str, help="Path to raft_driver binary")
     parser.add_argument("--gen-scenarios", action="store_true")
     parser.add_argument("files", nargs="*", type=str, help="Path to scenario files")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        help="Output directory",
+        default=os.path.join("consensus"),
+    )
 
     args = parser.parse_args()
 
@@ -139,14 +155,12 @@ if __name__ == "__main__":
     ostream = sys.stdout
 
     # Create consensus-specific output directory
-    output_dir = os.path.join("consensus")
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(args.output, exist_ok=True)
 
     for scenario in files:
-        ostream.write("## {}\n\n".format(os.path.basename(scenario)))
-        with block(ostream, "steps", 3):
-            with open(scenario, "r", encoding="utf-8") as scen:
-                ostream.write(scen.read())
+        ostream.write(f"## {os.path.basename(scenario)}\n\n")
+        with block(ostream, "steps", 3), open(scenario, "r", encoding="utf-8") as scen:
+            ostream.write(scen.read())
         proc = Popen(
             [args.driver, os.path.realpath(scenario)],
             stdout=PIPE,
@@ -172,7 +186,7 @@ if __name__ == "__main__":
         ## Do not create an empty ndjson file if log is emtpy.
         if log:
             with open(
-                os.path.join(output_dir, f"{os.path.basename(scenario)}.ndjson"),
+                os.path.join(args.output, f"{os.path.basename(scenario)}.ndjson"),
                 "w",
                 encoding="utf-8",
             ) as f:

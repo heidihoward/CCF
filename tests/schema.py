@@ -1,32 +1,32 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import os
-import json
 import http
+import json
+import os
+
+import e2e_operations
+import e2e_tutorial
+import infra.checker
+import infra.e2e_args
 import infra.network
 import infra.proc
-import infra.e2e_args
-import infra.checker
-import openapi_spec_validator
-from packaging import version
-from infra.runner import ConcurrentRunner
 import nobuiltins
+import openapi_spec_validator
 import packaging.version
-import e2e_tutorial
-import e2e_operations
-
+from infra.runner import ConcurrentRunner
 from loguru import logger as LOG
+from packaging import version
 
 
 def run(args):
     os.makedirs(args.schema_dir, exist_ok=True)
 
     changed_files = []
-    old_schema = set(
+    old_schema = {
         dir_entry.path
         for dir_entry in os.scandir(args.schema_dir)
         if dir_entry.is_file()
-    )
+    }
 
     documents_valid = True
     all_methods = []
@@ -50,6 +50,7 @@ def run(args):
             pass
 
         with open(openapi_target_file, "a+", encoding="utf-8") as f:
+            prefix, ext = os.path.splitext(openapi_target_file)
             f.seek(0)
             previous = f.read().strip()
             if previous != formatted_schema:
@@ -81,7 +82,6 @@ def run(args):
                     LOG.error(
                         f"Found differences in {openapi_target_file}, but not overwriting as retrieved version is not newer ({fetched_version} <= {file_version})"
                     )
-                    prefix, ext = os.path.splitext(openapi_target_file)
                     alt_file = f"{prefix}_{fetched_version}{ext}"
                     LOG.error(f"Writing to {alt_file} for comparison")
                     with open(alt_file, "w", encoding="utf-8") as f2:
@@ -92,7 +92,7 @@ def run(args):
                         pass
                 changed_files.append(openapi_target_file)
             else:
-                LOG.debug("Schema matches in {}".format(openapi_target_file))
+                LOG.debug(f"Schema matches in {openapi_target_file}")
 
         try:
             openapi_spec_validator.validate_spec(response_body)
@@ -104,7 +104,7 @@ def run(args):
         return True
 
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes
+        args.nodes, args.binary_dir, args.debug_nodes
     ) as network:
         network.start_and_open(args)
         primary, _ = network.find_primary()
@@ -118,10 +118,6 @@ def run(args):
 
             LOG.info("node frontend")
             if not fetch_schema(client.get("/node/api"), "node_openapi.json"):
-                documents_valid = False
-
-            LOG.info("member frontend")
-            if not fetch_schema(client.get("/gov/api"), "gov_openapi.json"):
                 documents_valid = False
 
         with primary.api_versioned_client(
@@ -165,13 +161,12 @@ def run(args):
         for method in sorted(set(all_methods)):
             LOG.info(f"  {method}")
 
-    if made_changes or not documents_valid:
-        assert False
+    assert not (made_changes or not documents_valid)
 
 
 def run_nobuiltins(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         nobuiltins.test_nobuiltins_endpoints(network, args)
@@ -202,10 +197,9 @@ if __name__ == "__main__":
             default=None,
         )
         parser.add_argument(
-            "--config-file-1x",
-            help="Path to 1.x configuration file",
+            "--historical-testdata",
+            help="Historical ledger test data directory",
             type=str,
-            default=None,
         )
 
     cr = ConcurrentRunner(add)
@@ -213,21 +207,21 @@ if __name__ == "__main__":
     cr.add(
         "schema",
         run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.nodes(cr.args, 1),
     )
 
     cr.add(
         "nobuiltins",
         run_nobuiltins,
-        package="samples/apps/nobuiltins/libnobuiltins",
+        package="samples/apps/nobuiltins/nobuiltins",
         nodes=infra.e2e_args.min_nodes(cr.args, f=1),
     )
 
     cr.add(
         "tutorial",
         e2e_tutorial.run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=["local://127.0.0.1:8000"],
         initial_member_count=1,
     )
@@ -235,10 +229,27 @@ if __name__ == "__main__":
     cr.add(
         "operations",
         e2e_operations.run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.min_nodes(cr.args, f=0),
         initial_user_count=1,
         ledger_chunk_bytes="1B",  # Chunk ledger at every signature transaction
+    )
+
+    cr.add(
+        "download",
+        e2e_operations.run_ledger_chunk_download,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.max_nodes(cr.args, f=0),
+        initial_user_count=1,
+        ledger_chunk_bytes="1B",  # Chunk ledger at every signature transaction
+    )
+
+    cr.add(
+        "download-snapshot",
+        e2e_operations.run_backup_snapshot_download,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.max_nodes(cr.args, f=0),
+        initial_user_count=1,
     )
 
     cr.run()

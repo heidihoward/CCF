@@ -4,6 +4,7 @@
 #pragma once
 
 #include "ccf/ds/unit_strings.h"
+#include "ccf/pal/platform.h"
 #include "common/configuration.h"
 
 #include <optional>
@@ -11,31 +12,7 @@
 
 namespace host
 {
-  enum class EnclaveType
-  {
-    RELEASE,
-    DEBUG,
-    VIRTUAL // Deprecated (use EnclavePlatform instead)
-  };
-  DECLARE_JSON_ENUM(
-    EnclaveType,
-    {{EnclaveType::RELEASE, "Release"},
-     {EnclaveType::DEBUG, "Debug"},
-     {EnclaveType::VIRTUAL, "Virtual"}});
-
-  enum class EnclavePlatform
-  {
-    SGX,
-    SNP,
-    VIRTUAL,
-  };
-  DECLARE_JSON_ENUM(
-    EnclavePlatform,
-    {{EnclavePlatform::SGX, "SGX"},
-     {EnclavePlatform::SNP, "SNP"},
-     {EnclavePlatform::VIRTUAL, "Virtual"}});
-
-  enum class LogFormat
+  enum class LogFormat : uint8_t
   {
     TEXT,
     JSON
@@ -48,6 +25,7 @@ namespace host
     std::string certificate_file;
     std::optional<std::string> encryption_public_key_file = std::nullopt;
     std::optional<std::string> data_json_file = std::nullopt;
+    std::optional<ccf::MemberRecoveryRole> recovery_role = std::nullopt;
 
     bool operator==(const ParsedMemberInfo& other) const = default;
   };
@@ -55,21 +33,13 @@ namespace host
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(ParsedMemberInfo);
   DECLARE_JSON_REQUIRED_FIELDS(ParsedMemberInfo, certificate_file);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    ParsedMemberInfo, encryption_public_key_file, data_json_file);
+    ParsedMemberInfo,
+    encryption_public_key_file,
+    data_json_file,
+    recovery_role);
 
-  struct CCHostConfig : CCFConfig
+  struct HostConfig : public ccf::CCFConfig
   {
-    struct Enclave
-    {
-      std::string file;
-      EnclaveType type;
-      EnclavePlatform platform;
-
-      bool operator==(const Enclave&) const = default;
-    };
-    Enclave enclave = {};
-
-    // Other
     ccf::ds::TimeString tick_interval = {"10ms"};
     ccf::ds::TimeString slow_io_logging_threshold = {"10ms"};
     std::optional<std::string> node_client_interface = std::nullopt;
@@ -79,43 +49,23 @@ namespace host
     std::optional<std::string> node_data_json_file = std::nullopt;
     std::optional<std::string> service_data_json_file = std::nullopt;
     bool ignore_first_sigterm = false;
+    std::optional<ccf::SealingRecoveryConfig> sealing_recovery = std::nullopt;
 
     struct OutputFiles
     {
       std::string node_certificate_file = "nodecert.pem";
-      std::string pid_file = "cchost.pid";
+      std::string pid_file = "my_node.pid";
 
       // Addresses files
-      std::string node_to_node_address_file = "";
-      std::string rpc_addresses_file = "";
+      std::string node_to_node_address_file;
+      std::string rpc_addresses_file;
 
       bool operator==(const OutputFiles&) const = default;
     };
     OutputFiles output_files = {};
 
-    struct Ledger
-    {
-      std::string directory = "ledger";
-      std::vector<std::string> read_only_directories = {};
-      ccf::ds::SizeString chunk_size = {"5MB"};
-
-      bool operator==(const Ledger&) const = default;
-    };
-    Ledger ledger = {};
-
-    struct Snapshots
-    {
-      std::string directory = "snapshots";
-      size_t tx_count = 10'000;
-      std::optional<std::string> read_only_directory = std::nullopt;
-
-      bool operator==(const Snapshots&) const = default;
-    };
-    Snapshots snapshots = {};
-
     struct Logging
     {
-      LoggerLevel host_level = LoggerLevel::INFO;
       LogFormat format = LogFormat::TEXT;
 
       bool operator==(const Logging&) const = default;
@@ -139,11 +89,12 @@ namespace host
 
       struct Start
       {
-        std::vector<ParsedMemberInfo> members = {};
-        std::vector<std::string> constitution_files = {};
+        std::vector<ParsedMemberInfo> members;
+        std::vector<std::string> constitution_files;
         ccf::ServiceConfiguration service_configuration;
         size_t initial_service_certificate_validity_days = 1;
         std::string service_subject_name = "CN=CCF Service";
+        ccf::COSESignaturesConfig cose_signatures;
 
         bool operator==(const Start&) const = default;
       };
@@ -154,6 +105,12 @@ namespace host
         ccf::NodeInfoNetwork::NetAddress target_rpc_address;
         ccf::ds::TimeString retry_timeout = {"1000ms"};
         bool follow_redirect = true;
+        bool fetch_recent_snapshot = true;
+        size_t fetch_snapshot_max_attempts = 3;
+        ccf::ds::TimeString fetch_snapshot_retry_interval = {"1000ms"};
+        ccf::ds::SizeString fetch_snapshot_max_size = {"10GB"};
+        std::optional<std::string> host_data_transparent_statement_path =
+          std::nullopt;
 
         bool operator==(const Join&) const = default;
       };
@@ -170,68 +127,62 @@ namespace host
     Command command = {};
   };
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Enclave);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Enclave, type, platform);
-  DECLARE_JSON_OPTIONAL_FIELDS(CCHostConfig::Enclave, file);
-
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::OutputFiles);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::OutputFiles);
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(HostConfig::OutputFiles);
+  DECLARE_JSON_REQUIRED_FIELDS(HostConfig::OutputFiles);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::OutputFiles,
+    HostConfig::OutputFiles,
     node_certificate_file,
     pid_file,
     node_to_node_address_file,
     rpc_addresses_file);
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Ledger);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Ledger);
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(HostConfig::Logging);
+  DECLARE_JSON_REQUIRED_FIELDS(HostConfig::Logging);
+  DECLARE_JSON_OPTIONAL_FIELDS(HostConfig::Logging, format);
+
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(HostConfig::Memory);
+  DECLARE_JSON_REQUIRED_FIELDS(HostConfig::Memory);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::Ledger, directory, read_only_directories, chunk_size);
+    HostConfig::Memory, circuit_size, max_msg_size, max_fragment_size);
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Snapshots);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Snapshots);
-  DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::Snapshots, directory, tx_count, read_only_directory);
-
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Logging);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Logging);
-  DECLARE_JSON_OPTIONAL_FIELDS(CCHostConfig::Logging, host_level, format);
-
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Memory);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Memory);
-  DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::Memory, circuit_size, max_msg_size, max_fragment_size);
-
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Command::Start);
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(HostConfig::Command::Start);
   DECLARE_JSON_REQUIRED_FIELDS(
-    CCHostConfig::Command::Start, members, constitution_files);
+    HostConfig::Command::Start, members, constitution_files);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::Command::Start,
+    HostConfig::Command::Start,
     service_configuration,
     initial_service_certificate_validity_days,
-    service_subject_name);
+    service_subject_name,
+    cose_signatures);
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Command::Join);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Command::Join, target_rpc_address);
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(HostConfig::Command::Join);
+  DECLARE_JSON_REQUIRED_FIELDS(HostConfig::Command::Join, target_rpc_address);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::Command::Join, retry_timeout, follow_redirect);
+    HostConfig::Command::Join,
+    retry_timeout,
+    follow_redirect,
+    fetch_recent_snapshot,
+    fetch_snapshot_max_attempts,
+    fetch_snapshot_retry_interval,
+    fetch_snapshot_max_size,
+    host_data_transparent_statement_path);
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Command::Recover);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Command::Recover);
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(HostConfig::Command::Recover);
+  DECLARE_JSON_REQUIRED_FIELDS(HostConfig::Command::Recover);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::Command::Recover,
+    HostConfig::Command::Recover,
     initial_service_certificate_validity_days,
     previous_service_identity_file);
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CCHostConfig::Command);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig::Command, type);
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(HostConfig::Command);
+  DECLARE_JSON_REQUIRED_FIELDS(HostConfig::Command, type);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig::Command, service_certificate_file, start, join, recover);
+    HostConfig::Command, service_certificate_file, start, join, recover);
 
-  DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(CCHostConfig, CCFConfig);
-  DECLARE_JSON_REQUIRED_FIELDS(CCHostConfig, enclave, command);
+  DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(HostConfig, ccf::CCFConfig);
+  DECLARE_JSON_REQUIRED_FIELDS(HostConfig, command);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    CCHostConfig,
+    HostConfig,
     tick_interval,
     slow_io_logging_threshold,
     node_client_interface,
@@ -240,8 +191,8 @@ namespace host
     node_data_json_file,
     service_data_json_file,
     ignore_first_sigterm,
+    sealing_recovery,
     output_files,
-    ledger,
     snapshots,
     logging,
     memory);

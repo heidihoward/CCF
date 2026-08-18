@@ -3,8 +3,9 @@
 import collections
 import csv
 import os
-from loguru import logger as LOG
+
 import infra.bencher
+from loguru import logger as LOG
 
 benchmark_specs = {
     "kv_bench.csv": [
@@ -44,18 +45,6 @@ benchmark_specs = {
             "_name": "CHAMP get",
             "Suite": "get",
             "Benchmark": "bench_champ_map_get",
-            "D": "2048",
-        },
-        {
-            "_name": "RBMap put",
-            "Suite": "put",
-            "Benchmark": "bench_rb_map_put",
-            "D": "2048",
-        },
-        {
-            "_name": "RBMap get",
-            "Suite": "get",
-            "Benchmark": "bench_rb_map_get",
             "D": "2048",
         },
     ],

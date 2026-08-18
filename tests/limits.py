@@ -1,15 +1,16 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.network
-import infra.e2e_args
-import infra.checker
-import infra.jwt_issuer
-import infra.proc
+import copy
 import http
+
+import infra.checker
 import infra.clients
 import infra.crypto
+import infra.e2e_args
+import infra.jwt_issuer
+import infra.network
+import infra.proc
 from infra.runner import ConcurrentRunner
-import copy
 
 
 def test_forward_larger_than_default_requests(network, args):
@@ -25,10 +26,16 @@ def test_forward_larger_than_default_requests(network, args):
             }
         )
     )
-    network.join_node(new_node, args.package, args)
+    network.join_node(new_node, args.package, args, from_snapshot=False)
     network.trust_node(new_node, args)
 
     primary, _ = network.find_primary()
+
+    def get_request_payload_too_large_errors():
+        with primary.client() as c:
+            return c.get("/node/metrics").body.json()["sessions"]["interfaces"][
+                infra.interfaces.PRIMARY_RPC_INTERFACE
+            ]["errors"]["request_payload_too_large"]
 
     # Big request, but under the cap
     with primary.client("user0") as c:
@@ -37,9 +44,16 @@ def test_forward_larger_than_default_requests(network, args):
         assert r.status_code == http.HTTPStatus.OK.value, r
 
     # Big request, over the cap for the primary
-    with primary.client("user0") as c:
-        msg = "A" * 2 * 1024 * 1024
-        r = c.post("/app/log/private", {"id": 42, "msg": msg})
+    msg = "A" * 2 * 1024 * 1024
+    before_errors_count = get_request_payload_too_large_errors()
+    try:
+        with primary.client("user0") as c:
+            r = c.post("/app/log/private", {"id": 42, "msg": msg})
+    except infra.clients.CCFIOException:
+        # The server may close before the client finishes writing the rejected
+        # body, so confirm the rejection through the interface error metric.
+        assert get_request_payload_too_large_errors() == before_errors_count + 1
+    else:
         assert r.status_code == http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value, r
 
     # Big request, over the cap for the primary, but under the cap for the new node
@@ -51,16 +65,14 @@ def test_forward_larger_than_default_requests(network, args):
 
 def run_parser_limits_checks(args):
     new_args = copy.copy(args)
-    # Deliberately large because some builds (eg. SGX Debug) take
+    # Deliberately large because some builds take
     # a long time to process large requests
     new_args.election_timeout_ms = 10000
-    new_args.host_log_level = "info"
-    new_args.enclave_log_level = "info"
+    new_args.log_level = "info"
     with infra.network.network(
         new_args.nodes,
         new_args.binary_dir,
         new_args.debug_nodes,
-        new_args.perf_nodes,
         pdb=args.pdb,
     ) as network:
         network.start_and_open(new_args)
@@ -76,7 +88,7 @@ if __name__ == "__main__":
         cr.add(
             "parser_limits",
             run_parser_limits_checks,
-            package="samples/apps/logging/liblogging",
+            package="samples/apps/logging/logging",
             nodes=infra.e2e_args.max_nodes(cr.args, f=0),
         )
 

@@ -1,21 +1,22 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 import argparse
-import os
-import infra.e2e_args
-import infra.remote_client
-import infra.jwt_issuer
-from infra.perf import PERF_COLUMNS
-from random import seed
 import getpass
-from loguru import logger as LOG
-import time
-import http
 import hashlib
 import json
-from piccolo import generator
-from piccolo import analyzer
+import os
+import time
+from random import seed
+
+from loguru import logger as LOG
+from piccolo import analyzer, generator
+
 import infra.bencher
+import infra.e2e_args
+import infra.jwt_issuer
+import infra.proc
+import infra.remote_client
+from infra.perf import PERF_COLUMNS
 
 
 def get_command_args(args, network, get_command):
@@ -49,11 +50,8 @@ def filter_nodes(primary, backups, filter_type):
 
 
 def my_configure_remote_client(args, client_id, client_host, node, command_args):
-    if client_host == "localhost":
-        client_host = infra.net.expand_localhost()
-        remote_impl = infra.remote.LocalRemote
-    else:
-        remote_impl = infra.remote.SSHRemote
+    client_host = infra.net.expand_localhost()
+
     try:
         remote_client = infra.remote_client.CCFRemoteClient(
             f"client_{client_id}",
@@ -65,13 +63,12 @@ def my_configure_remote_client(args, client_id, client_host, node, command_args)
             args.label,
             args.config,
             command_args,
-            remote_impl,
             piccolo_run=True,
         )
         remote_client.setup()
         return remote_client
     except Exception:
-        LOG.exception("Failed to start client {}".format(client_host))
+        LOG.exception(f"Failed to start client {client_host}")
         raise
 
 
@@ -81,16 +78,16 @@ def run(get_command, args):
 
     hosts = args.nodes
     if not hosts:
-        hosts = ["local://localhost"] * minimum_number_of_local_nodes(args)
+        hosts = infra.e2e_args.nodes(args, minimum_number_of_local_nodes(args))
 
     args.initial_user_count = 3
     args.sig_ms_interval = 100
-    args.ledger_chunk_bytes = "5MB"  # Set to cchost default value
+    args.ledger_chunk_bytes = "5MB"  # Set to node default value
 
-    LOG.info("Starting nodes on {}".format(hosts))
+    LOG.info(f"Starting nodes on {hosts}")
 
     with infra.network.network(
-        hosts, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        hosts, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
@@ -110,7 +107,7 @@ def run(get_command, args):
         for i in range(args.repetitions):
             body = {
                 "id": i % 100,
-                "msg": f"Unique message: {hashlib.md5(str(i).encode()).hexdigest()}",
+                "msg": f"Unique message: {hashlib.sha256(str(i).encode()).hexdigest()}",
             }
             msgs.append(
                 "/app/log/private",
@@ -180,7 +177,7 @@ def run(get_command, args):
                 while True:
                     stop_waiting = True
                     for i, remote_client in enumerate(clients):
-                        done = remote_client.check_done()
+                        done = remote_client.check_done(timeout=0)
                         # all the clients need to be done
                         LOG.info(
                             f"Client {i} has {'completed' if done else 'not completed'} running ({time.time() - start_time:>{format_width}.2f}s / {hard_stop_timeout}s)"
@@ -194,6 +191,8 @@ def run(get_command, args):
                         )
 
                     time.sleep(5)
+
+                perf_label = args.perf_label
 
                 for remote_client in clients:
                     analysis = analyzer.Analyze()
@@ -214,23 +213,15 @@ def run(get_command, args):
                     # see basicperf.py for a better, cross-client approach.
                     bf = infra.bencher.Bencher()
                     bf.set(
-                        args.perf_label,
+                        perf_label,
                         infra.bencher.Throughput(perf_result),
                     )
 
                 primary, _ = network.find_primary()
-                with primary.client() as nc:
-                    r = nc.get("/node/memory")
-                    assert r.status_code == http.HTTPStatus.OK.value
-                    results = r.body.json()
-                    current_value = results["current_allocated_heap_size"]
-                    peak_value = results["peak_allocated_heap_size"]
-
+                mem = infra.proc.get_proc_memory_stats(primary.remote.remote.proc.pid)
+                if mem is not None:
                     bf = infra.bencher.Bencher()
-                    bf.set(
-                        args.perf_label,
-                        infra.bencher.Memory(current_value, high_value=peak_value),
-                    )
+                    bf.set_memory(perf_label, mem)
 
                 for remote_client in clients:
                     remote_client.stop()
@@ -296,11 +287,6 @@ def cli_args(add=lambda x: None, accept_unknown=False):
         help="Number of requests to send",
         type=int,
         default=100,
-    )
-    parser.add_argument(
-        "--write-tx-times",
-        help="Unused, swallowed for compatibility with old args",
-        action="store_true",
     )
     parser.add_argument("--config", help="Path to config for client binary", default="")
 

@@ -10,7 +10,7 @@
 
 namespace ccf::crypto
 {
-  enum class JsonWebKeyType
+  enum class JsonWebKeyType : uint8_t
   {
     EC = 0,
     RSA = 1,
@@ -24,43 +24,62 @@ namespace ccf::crypto
 
   struct JsonWebKey
   {
-    JsonWebKeyType kty;
+    JsonWebKeyType kty = JsonWebKeyType::EC;
     std::optional<std::string> kid = std::nullopt;
     std::optional<std::vector<std::string>> x5c = std::nullopt;
-    std::optional<std::string> issuer = std::nullopt;
 
     bool operator==(const JsonWebKey&) const = default;
   };
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(JsonWebKey);
   DECLARE_JSON_REQUIRED_FIELDS(JsonWebKey, kty);
-  DECLARE_JSON_OPTIONAL_FIELDS(JsonWebKey, kid, x5c, issuer);
+  DECLARE_JSON_OPTIONAL_FIELDS(JsonWebKey, kid, x5c);
 
-  enum class JsonWebKeyECCurve
+  enum class JsonWebKeyECCurve : uint8_t
   {
     P256 = 0,
-    P256K1 = 1,
-    P384 = 2,
-    P521 = 3
+    P384 = 1,
+    P521 = 2
   };
   DECLARE_JSON_ENUM(
     JsonWebKeyECCurve,
     {{JsonWebKeyECCurve::P256, "P-256"},
-     {JsonWebKeyECCurve::P256K1,
-      "secp256k1"}, // As per
-                    // https://www.rfc-editor.org/rfc/rfc8812#name-jose-and-cose-secp256k1-cur
      {JsonWebKeyECCurve::P384, "P-384"},
      {JsonWebKeyECCurve::P521, "P-521"}});
+
+  struct JsonWebKeyData
+  {
+    JsonWebKeyType kty = JsonWebKeyType::EC;
+    std::optional<std::string> kid = std::nullopt;
+    std::optional<std::vector<std::string>> x5c = std::nullopt;
+    std::optional<std::string> n = std::nullopt;
+    std::optional<std::string> e = std::nullopt;
+    std::optional<std::string> x = std::nullopt;
+    std::optional<std::string> y = std::nullopt;
+    std::optional<JsonWebKeyECCurve> crv = std::nullopt;
+    std::optional<std::string> issuer = std::nullopt;
+
+    bool operator==(const JsonWebKeyData&) const = default;
+  };
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(JsonWebKeyData);
+  DECLARE_JSON_REQUIRED_FIELDS(JsonWebKeyData, kty);
+  DECLARE_JSON_OPTIONAL_FIELDS(
+    JsonWebKeyData, kid, x5c, n, e, x, y, crv, issuer);
 
   static JsonWebKeyECCurve curve_id_to_jwk_curve(CurveID curve_id)
   {
     switch (curve_id)
     {
+      case CurveID::NONE:
+      case CurveID::CURVE25519:
+      case CurveID::X25519:
+        throw std::logic_error(
+          fmt::format("Invalid JWK EC CurveId {}", curve_id));
       case CurveID::SECP384R1:
         return JsonWebKeyECCurve::P384;
       case CurveID::SECP256R1:
         return JsonWebKeyECCurve::P256;
-      case CurveID::SECP256K1:
-        return JsonWebKeyECCurve::P256K1;
+      case CurveID::SECP521R1:
+        return JsonWebKeyECCurve::P521;
       default:
         throw std::logic_error(fmt::format("Unknown curve {}", curve_id));
     }
@@ -70,18 +89,18 @@ namespace ccf::crypto
   {
     switch (jwk_curve)
     {
+      case JsonWebKeyECCurve::P521:
+        return CurveID::SECP521R1;
       case JsonWebKeyECCurve::P384:
         return CurveID::SECP384R1;
       case JsonWebKeyECCurve::P256:
         return CurveID::SECP256R1;
-      case JsonWebKeyECCurve::P256K1:
-        return CurveID::SECP256K1;
       default:
         throw std::logic_error(fmt::format("Unknown JWK curve {}", jwk_curve));
     }
   }
 
-  enum class JsonWebKeyEdDSACurve
+  enum class JsonWebKeyEdDSACurve : std::uint8_t
   {
     ED25519 = 0,
     X25519 = 1
@@ -95,6 +114,11 @@ namespace ccf::crypto
   {
     switch (curve_id)
     {
+      case CurveID::NONE:
+      case CurveID::SECP384R1:
+      case CurveID::SECP256R1:
+      case CurveID::SECP521R1:
+        throw std::logic_error(fmt::format("Invalid EdDSA curve {}", curve_id));
       case CurveID::CURVE25519:
         return JsonWebKeyEdDSACurve::ED25519;
       case CurveID::X25519:
@@ -106,7 +130,7 @@ namespace ccf::crypto
 
   struct JsonWebKeyECPublic : JsonWebKey
   {
-    JsonWebKeyECCurve crv;
+    JsonWebKeyECCurve crv = JsonWebKeyECCurve::P256;
     std::string x; // base64url
     std::string y; // base64url
 
@@ -150,7 +174,7 @@ namespace ccf::crypto
 
   struct JsonWebKeyEdDSAPublic : JsonWebKey
   {
-    JsonWebKeyEdDSACurve crv;
+    JsonWebKeyEdDSACurve crv = JsonWebKeyEdDSACurve::ED25519;
     std::string x; // base64url
 
     bool operator==(const JsonWebKeyEdDSAPublic&) const = default;

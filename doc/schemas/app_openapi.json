@@ -31,43 +31,9 @@
         },
         "type": "object"
       },
-      "CodeStatus": {
-        "enum": [
-          "AllowedToJoin"
-        ],
+      "Cose": {
+        "format": "binary",
         "type": "string"
-      },
-      "GetCode__Out": {
-        "properties": {
-          "versions": {
-            "$ref": "#/components/schemas/GetCode__Version_array"
-          }
-        },
-        "required": [
-          "versions"
-        ],
-        "type": "object"
-      },
-      "GetCode__Version": {
-        "properties": {
-          "digest": {
-            "$ref": "#/components/schemas/string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/CodeStatus"
-          }
-        },
-        "required": [
-          "digest",
-          "status"
-        ],
-        "type": "object"
-      },
-      "GetCode__Version_array": {
-        "items": {
-          "$ref": "#/components/schemas/GetCode__Version"
-        },
-        "type": "array"
       },
       "GetCommit__Out": {
         "properties": {
@@ -106,6 +72,17 @@
         },
         "required": [
           "endorsements"
+        ],
+        "type": "object"
+      },
+      "LoggingGetCoseSignature__Out": {
+        "properties": {
+          "cose_signature": {
+            "$ref": "#/components/schemas/base64string"
+          }
+        },
+        "required": [
+          "cose_signature"
         ],
         "type": "object"
       },
@@ -284,7 +261,7 @@
   "info": {
     "description": "This CCF sample app implements a simple logging application, securely recording messages at client-specified IDs. It demonstrates most of the features available to CCF apps.",
     "title": "CCF Sample Logging App",
-    "version": "2.4.3"
+    "version": "2.8.4"
   },
   "openapi": "3.0.0",
   "paths": {
@@ -307,32 +284,6 @@
           }
         },
         "summary": "OpenAPI schema",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/app/code": {
-      "get": {
-        "deprecated": true,
-        "description": "This endpoint is deprecated from 5.0.0. It is replaced by GET /gov/service/join-policy",
-        "operationId": "GetAppCode",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GetCode__Out"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "summary": "Permitted SGX code identities",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
@@ -381,6 +332,30 @@
         }
       }
     },
+    "/app/cose_signatures_config": {
+      "get": {
+        "operationId": "GetAppCoseSignaturesConfig",
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "security": [
+          {
+            "jwt": []
+          },
+          {
+            "user_cose_sign1": []
+          }
+        ],
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
     "/app/custom_auth": {
       "get": {
         "operationId": "GetAppCustomAuth",
@@ -399,6 +374,110 @@
             "$ref": "#/components/responses/default"
           }
         },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/always"
+        }
+      }
+    },
+    "/app/log/blocking/private": {
+      "get": {
+        "operationId": "GetAppLogBlockingPrivate",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/uint64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoggingGet__Out"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "security": [
+          {
+            "jwt": []
+          },
+          {
+            "user_cose_sign1": []
+          }
+        ],
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "post": {
+        "operationId": "PostAppLogBlockingPrivate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoggingRecord__In"
+              }
+            }
+          },
+          "description": "Auto-generated request body schema"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/boolean"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "security": [
+          {
+            "jwt": []
+          },
+          {
+            "user_cose_sign1": []
+          }
+        ],
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/always"
+        }
+      }
+    },
+    "/app/log/blocking/private/receipt": {
+      "post": {
+        "operationId": "PostAppLogBlockingPrivateReceipt",
+        "responses": {
+          "200": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "security": [
+          {
+            "jwt": []
+          },
+          {
+            "user_cose_sign1": []
+          }
+        ],
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/always"
         }
@@ -827,6 +906,55 @@
         }
       }
     },
+    "/app/log/private/historical/handle": {
+      "get": {
+        "operationId": "GetAppLogPrivateHistoricalHandle",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "handle",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/uint64"
+            }
+          },
+          {
+            "in": "query",
+            "name": "seqno",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/uint64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/json"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "security": [
+          {
+            "jwt": []
+          },
+          {
+            "user_cose_sign1": []
+          }
+        ],
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
     "/app/log/private/historical/sparse": {
       "get": {
         "operationId": "GetAppLogPrivateHistoricalSparse",
@@ -930,6 +1058,57 @@
         },
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      }
+    },
+    "/app/log/private/optional_commit": {
+      "post": {
+        "operationId": "PostAppLogPrivateOptionalCommit",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "wait_for_commit",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoggingRecord__In"
+              }
+            }
+          },
+          "description": "Auto-generated request body schema"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/boolean"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "security": [
+          {
+            "jwt": []
+          },
+          {
+            "user_cose_sign1": []
+          }
+        ],
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/always"
         }
       }
     },
@@ -1207,11 +1386,18 @@
         }
       }
     },
-    "/app/log/public/cbor_merkle_proof": {
+    "/app/log/public/cose_endorsements": {
       "get": {
-        "operationId": "GetAppLogPublicCborMerkleProof",
+        "operationId": "GetAppLogPublicCoseEndorsements",
         "responses": {
-          "204": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoggingGetCoseEndorsements__Out"
+                }
+              }
+            },
             "description": "Default response description"
           },
           "default": {
@@ -1231,15 +1417,31 @@
         }
       }
     },
-    "/app/log/public/cose_endorsements": {
+    "/app/log/public/cose_receipt": {
       "get": {
-        "operationId": "GetAppLogPublicCoseEndorsements",
+        "operationId": "GetAppLogPublicCoseReceipt",
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
+    "/app/log/public/cose_signature": {
+      "get": {
+        "operationId": "GetAppLogPublicCoseSignature",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LoggingGetCoseEndorsements__Out"
+                  "$ref": "#/components/schemas/LoggingGetCoseSignature__Out"
                 }
               }
             },
@@ -1391,6 +1593,38 @@
         }
       }
     },
+    "/app/log/public/trusted_keys": {
+      "get": {
+        "operationId": "GetAppLogPublicTrustedKeys",
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
+    "/app/log/public/verify_cose_receipt": {
+      "get": {
+        "operationId": "GetAppLogPublicVerifyCoseReceipt",
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
     "/app/log/request_query": {
       "get": {
         "operationId": "GetAppLogRequestQuery",
@@ -1411,6 +1645,38 @@
         },
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/always"
+        }
+      }
+    },
+    "/app/log/signed_statement": {
+      "post": {
+        "operationId": "PostAppLogSignedStatement",
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/always"
+        }
+      }
+    },
+    "/app/log/transparent_statement": {
+      "get": {
+        "operationId": "GetAppLogTransparentStatement",
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
         }
       }
     },
@@ -1471,11 +1737,66 @@
             },
             "description": "Default response description"
           },
+          "202": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/string"
+                }
+              }
+            },
+            "description": "The transaction is not yet available. The response describes why and the Retry-After header indicates when to retry."
+          },
           "default": {
             "$ref": "#/components/responses/default"
           }
         },
         "summary": "Receipt for a transaction",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      }
+    },
+    "/app/receipt/cose": {
+      "get": {
+        "description": "A COSE Sign1 envelope containing a signed statement from the service over a transaction entry in the ledger, with a Merkle proof in the unprotected header. See https://datatracker.ietf.org/doc/draft-ietf-scitt-receipts-ccf-profile/ for a complete description.",
+        "operationId": "GetAppReceiptCose",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "transaction_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TransactionId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/cose": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cose"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "202": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/string"
+                }
+              }
+            },
+            "description": "The transaction is not yet available. The response describes why and the Retry-After header indicates when to retry."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "COSE receipt for a transaction",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }

@@ -4,6 +4,7 @@
 
 #include "ccf/endpoint_registry.h"
 
+#include "ds/internal_logger.h"
 #include "ds/nonstd.h"
 #include "endpoint_utils.h"
 
@@ -30,6 +31,34 @@ std::optional<PathTemplateSpec> require_parsed_components(
   return spec;
 }
 
+using ExpectedMatchTestCase = std::map<std::string, std::vector<std::string>>;
+
+void require_template_parsing(
+  const std::string& url_template,
+  const ExpectedMatchTestCase& matched = {},
+  const std::vector<std::string>& unmatched = {})
+{
+  std::optional<PathTemplateSpec> spec;
+  REQUIRE_NOTHROW(spec = PathTemplateSpec::parse(url_template));
+
+  for (const auto& [path, elements] : matched)
+  {
+    std::smatch match;
+    REQUIRE(std::regex_match(path, match, spec->template_regex));
+    REQUIRE(match.size() == elements.size() + 1);
+    for (size_t i = 1; i < match.size(); ++i)
+    {
+      REQUIRE(match[i].str() == elements[i - 1]);
+    }
+  }
+
+  for (const auto& path : unmatched)
+  {
+    std::smatch match;
+    REQUIRE_FALSE(std::regex_match(path, match, spec->template_regex));
+  }
+}
+
 TEST_CASE("URL template parsing")
 {
   ccf::logger::config::default_init();
@@ -44,16 +73,16 @@ TEST_CASE("URL template parsing")
     require_parsed_components(prefix + "/{name}", {"name"});
     require_parsed_components(prefix + "/{name}/world", {"name"});
 
-    auto parsed =
+    auto parsed_components =
       require_parsed_components(prefix + "/{name}/{place}", {"name", "place"});
 
     path = prefix + "/alice/spain";
-    REQUIRE(std::regex_match(path, match, parsed->template_regex));
+    REQUIRE(std::regex_match(path, match, parsed_components->template_regex));
     REQUIRE(match[1].str() == "alice");
     REQUIRE(match[2].str() == "spain");
 
     path = prefix + "/alice:jump/spain";
-    REQUIRE(std::regex_match(path, match, parsed->template_regex));
+    REQUIRE(std::regex_match(path, match, parsed_components->template_regex));
     REQUIRE(match[1].str() == "alice:jump");
     REQUIRE(match[2].str() == "spain");
 
@@ -83,20 +112,121 @@ TEST_CASE("URL template parsing")
     REQUIRE(match[3].str() == "spain");
   }
 
-  REQUIRE_THROWS(PathTemplateSpec::parse("/foo{id}"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/foo{id}bar"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/{id}bar"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/{id}-{name}"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/id{id}"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/foo{id}:"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/foo{id}/bar"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/foo/{id}bar"));
-  REQUIRE_THROWS(PathTemplateSpec::parse("/foo/id{id}:bar"));
+  require_template_parsing(
+    "/foo{id}",
+    {{"/foo1", {"1"}}, {"/foobar", {"bar"}}},
+    {"/foo", "/foo/1", "/foo/bar"});
+  require_template_parsing(
+    "/foo{id}bar",
+    {{"/foo1bar", {"1"}}, {"/foofazbar", {"faz"}}},
+    {"/foobar", "/foobazbar", "/foo/bar", "/foo/baz/bar"});
+  require_template_parsing(
+    "/{id}bar",
+    {{"/1bar", {"1"}}, {"/foobar", {"foo"}}},
+    {"/bar", "/bazbar", "/foo/bar", "foo/bar"});
+  require_template_parsing(
+    "/{id}-{name}",
+    {{"/foo-bar", {"foo", "bar"}}, {"/1-2", {"1", "2"}}},
+    {"/foobar", "/foo/-bar", "/foo-/bar", "/foo/-/bar"});
+  require_template_parsing("/id{id}");
+  require_template_parsing("/foo{id}:");
+  require_template_parsing("/foo{id}/bar");
+  require_template_parsing("/foo/{id}bar");
+  require_template_parsing("/foo/id{id}:bar");
 
   REQUIRE_THROWS(PathTemplateSpec::parse("/{id}/{id}"));
   REQUIRE_THROWS(PathTemplateSpec::parse("/foo/{id}/{id}"));
   REQUIRE_THROWS(PathTemplateSpec::parse("/{id}/foo/{id}"));
   REQUIRE_THROWS(PathTemplateSpec::parse("/{id}/{id}/foo"));
+}
+
+TEST_CASE("Endpoint properties OpenAPI default")
+{
+  EndpointProperties properties;
+  REQUIRE(properties.openapi == nlohmann::json::object());
+
+  const nlohmann::json serialised = properties;
+  REQUIRE_FALSE(serialised.contains("openapi"));
+
+  const auto deserialised = serialised.get<EndpointProperties>();
+  REQUIRE(deserialised.openapi == nlohmann::json::object());
+}
+
+TEST_CASE("Additional OpenAPI responses")
+{
+  Endpoint endpoint;
+  endpoint.dispatch.uri_path = "/foo";
+  endpoint.dispatch.verb = HTTP_GET;
+  endpoint.full_uri_path = endpoint.dispatch.uri_path;
+
+  endpoint.set_auto_schema<void, nlohmann::json>();
+  endpoint.add_openapi_response<std::string>(
+    HTTP_STATUS_ACCEPTED, "The result is not ready");
+  endpoint.add_openapi_response<ccf::ds::openapi::Binary>(
+    HTTP_STATUS_PARTIAL_CONTENT, "A partial binary response");
+  endpoint.add_openapi_response(
+    HTTP_STATUS_SERVICE_UNAVAILABLE, "The endpoint is not ready");
+  endpoint.require_operator_feature(OperatorFeature::SnapshotRead);
+
+  auto document = ccf::ds::openapi::create_document("Test", "Test", "1.0.0");
+  for (const auto& schema_builder : endpoint.schema_builders)
+  {
+    schema_builder(document, endpoint);
+  }
+
+  const auto& responses = document["paths"]["/foo"]["get"]["responses"];
+  REQUIRE(responses["200"]["content"].contains("application/json"));
+  REQUIRE(responses["202"]["description"] == "The result is not ready");
+  REQUIRE(responses["202"]["content"].contains("text/plain"));
+  REQUIRE(responses["206"]["content"].contains("application/octet-stream"));
+  REQUIRE(responses["503"]["description"] == "The endpoint is not ready");
+  REQUIRE_FALSE(responses["503"].contains("content"));
+  REQUIRE(
+    responses["404"]["description"] ==
+    "The required operator feature is not enabled on this interface.");
+  REQUIRE_FALSE(responses["404"].contains("content"));
+
+  Endpoint specific_not_found_endpoint;
+  specific_not_found_endpoint.dispatch.uri_path = "/specific";
+  specific_not_found_endpoint.dispatch.verb = HTTP_GET;
+  specific_not_found_endpoint.full_uri_path =
+    specific_not_found_endpoint.dispatch.uri_path;
+  specific_not_found_endpoint.add_openapi_response(
+    HTTP_STATUS_NOT_FOUND, "Endpoint-specific response");
+  specific_not_found_endpoint.require_operator_feature(
+    OperatorFeature::SnapshotRead);
+  for (const auto& schema_builder : specific_not_found_endpoint.schema_builders)
+  {
+    schema_builder(document, specific_not_found_endpoint);
+  }
+  REQUIRE(
+    document["paths"]["/specific"]["get"]["responses"]["404"]["description"] ==
+    "Endpoint-specific response");
+
+  Endpoint raw_schema_endpoint;
+  raw_schema_endpoint.dispatch.uri_path = "/raw";
+  raw_schema_endpoint.dispatch.verb = HTTP_POST;
+  raw_schema_endpoint.full_uri_path = raw_schema_endpoint.dispatch.uri_path;
+
+  auto request_schema = nlohmann::json{{"type", "string"}};
+  auto response_schema = nlohmann::json{{"type", "boolean"}};
+  raw_schema_endpoint.set_params_schema(request_schema);
+  raw_schema_endpoint.set_result_schema(response_schema, HTTP_STATUS_CREATED);
+  request_schema["type"] = "integer";
+  response_schema["type"] = "number";
+
+  for (const auto& schema_builder : raw_schema_endpoint.schema_builders)
+  {
+    schema_builder(document, raw_schema_endpoint);
+  }
+
+  const auto& raw_operation = document["paths"]["/raw"]["post"];
+  REQUIRE(
+    raw_operation["requestBody"]["content"]["application/json"]["schema"]
+                 ["type"] == "string");
+  REQUIRE(
+    raw_operation["responses"]["201"]["content"]["application/json"]["schema"]
+                 ["type"] == "boolean");
 }
 
 TEST_CASE("camel_case" * doctest::test_suite("nonstd"))

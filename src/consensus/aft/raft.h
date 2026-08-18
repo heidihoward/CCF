@@ -2,15 +2,17 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ds/ccf_exception.h"
-#include "ccf/ds/logger.h"
 #include "ccf/pal/locking.h"
+#include "ccf/service/reconfiguration_type.h"
 #include "ccf/tx_id.h"
 #include "ccf/tx_status.h"
+#include "consensus/aft/raft_types.h"
+#include "ds/ccf_assert.h"
+#include "ds/internal_logger.h"
 #include "ds/serialized.h"
-#include "enclave/reconfiguration_type.h"
 #include "impl/state.h"
 #include "kv/kv_types.h"
+#include "node/commit_callback_subsystem.h"
 #include "node/node_client.h"
 #include "node/node_to_node.h"
 #include "node/node_types.h"
@@ -30,29 +32,25 @@
     ("{} | {} | {} | " s, \
      state->node_id, \
      state->leadership_state, \
-     state->membership_state, \
-     ##__VA_ARGS__)
+     state->membership_state __VA_OPT__(, ) __VA_ARGS__)
 #  define RAFT_DEBUG_FMT(s, ...) \
     CCF_LOG_FMT(DEBUG, "raft") \
     ("{} | {} | {} | " s, \
      state->node_id, \
      state->leadership_state, \
-     state->membership_state, \
-     ##__VA_ARGS__)
+     state->membership_state __VA_OPT__(, ) __VA_ARGS__)
 #  define RAFT_INFO_FMT(s, ...) \
     CCF_LOG_FMT(INFO, "raft") \
     ("{} | {} | {} | " s, \
      state->node_id, \
      state->leadership_state, \
-     state->membership_state, \
-     ##__VA_ARGS__)
+     state->membership_state __VA_OPT__(, ) __VA_ARGS__)
 #  define RAFT_FAIL_FMT(s, ...) \
     CCF_LOG_FMT(FAIL, "raft") \
     ("{} | {} | {} | " s, \
      state->node_id, \
      state->leadership_state, \
-     state->membership_state, \
-     ##__VA_ARGS__)
+     state->membership_state __VA_OPT__(, ) __VA_ARGS__)
 #else
 #  define RAFT_TRACE_FMT LOG_TRACE_FMT
 #  define RAFT_DEBUG_FMT LOG_DEBUG_FMT
@@ -100,21 +98,21 @@ namespace aft
       Configuration::NodeInfo node_info;
 
       // the highest index sent to the node
-      Index sent_idx;
+      Index sent_idx = 0;
 
       // the highest matching index with the node that was confirmed
-      Index match_idx;
+      Index match_idx = 0;
 
       // timeout tracking the last time an ack was received from the node
-      std::chrono::milliseconds last_ack_timeout;
+      std::chrono::milliseconds last_ack_timeout{0};
 
       NodeState() = default;
 
       NodeState(
-        const Configuration::NodeInfo& node_info_,
+        Configuration::NodeInfo node_info_,
         Index sent_idx_,
         Index match_idx_ = 0) :
-        node_info(node_info_),
+        node_info(std::move(node_info_)),
         sent_idx(sent_idx_),
         match_idx(match_idx_),
         last_ack_timeout(0)
@@ -132,7 +130,7 @@ namespace aft
     struct Votes
     {
       std::unordered_set<ccf::NodeId> votes;
-      size_t quorum;
+      size_t quorum = 0;
     };
     std::map<Index, Votes> votes_for_me;
 
@@ -175,13 +173,14 @@ namespace aft
     // active configuration.
     std::unordered_map<ccf::NodeId, NodeState> all_other_nodes;
     std::unordered_map<ccf::NodeId, ccf::SeqNo> retired_nodes;
-    ReconfigurationType reconfiguration_type;
 
     // Node client to trigger submission of RPC requests
     std::shared_ptr<ccf::NodeClient> node_client;
 
     // Used to remove retired nodes from store
     std::unique_ptr<ccf::RetiredNodeCleanup> retired_node_cleanup;
+
+    std::shared_ptr<ccf::CommitCallbackSubsystem> commit_callbacks;
 
     size_t entry_size_not_limited = 0;
     size_t entry_count = 0;
@@ -207,7 +206,6 @@ namespace aft
     std::unique_ptr<LedgerProxy> ledger;
     std::shared_ptr<ccf::NodeToNode> channels;
 
-  public:
     Aft(
       const ccf::consensus::Configuration& settings_,
       std::unique_ptr<Store> store_,
@@ -215,25 +213,23 @@ namespace aft
       std::shared_ptr<ccf::NodeToNode> channels_,
       std::shared_ptr<aft::State> state_,
       std::shared_ptr<ccf::NodeClient> rpc_request_context_,
-      bool public_only_ = false,
-      ccf::kv::MembershipState initial_membership_state_ =
-        ccf::kv::MembershipState::Active,
-      ReconfigurationType reconfiguration_type_ =
-        ReconfigurationType::ONE_TRANSACTION) :
+      std::shared_ptr<ccf::CommitCallbackSubsystem>
+        commit_callbacks_subsystem_ = nullptr,
+      bool public_only_ = false) :
       store(std::move(store_)),
 
       timeout_elapsed(0),
 
-      state(state_),
+      state(std::move(state_)),
 
       request_timeout(settings_.message_timeout),
       election_timeout(settings_.election_timeout),
       max_uncommitted_tx_count(settings_.max_uncommitted_tx_count),
 
-      reconfiguration_type(reconfiguration_type_),
-      node_client(rpc_request_context_),
+      node_client(std::move(rpc_request_context_)),
       retired_node_cleanup(
         std::make_unique<ccf::RetiredNodeCleanup>(node_client)),
+      commit_callbacks(std::move(commit_callbacks_subsystem_)),
 
       public_only(public_only_),
 
@@ -241,10 +237,15 @@ namespace aft
       rand((int)(uintptr_t)this),
 
       ledger(std::move(ledger_)),
-      channels(channels_)
-    {}
+      channels(std::move(channels_))
+    {
+      if (commit_callbacks != nullptr)
+      {
+        commit_callbacks->set_consensus(this);
+      }
+    }
 
-    virtual ~Aft() = default;
+    ~Aft() override = default;
 
     std::optional<ccf::NodeId> primary() override
     {
@@ -297,15 +298,9 @@ namespace aft
         {
           return Consensus::SignatureDisposition::SHOULD_SIGN;
         }
-        else
-        {
-          return Consensus::SignatureDisposition::CAN_SIGN;
-        }
+        return Consensus::SignatureDisposition::CAN_SIGN;
       }
-      else
-      {
-        return Consensus::SignatureDisposition::CANT_REPLICATE;
-      }
+      return Consensus::SignatureDisposition::CANT_REPLICATE;
     }
 
     bool is_backup() override
@@ -338,7 +333,7 @@ namespace aft
     void set_retired_committed(
       ccf::SeqNo seqno, const std::vector<ccf::kv::NodeId>& node_ids) override
     {
-      for (auto& node_id : node_ids)
+      for (const auto& node_id : node_ids)
       {
         if (id() == node_id)
         {
@@ -528,17 +523,11 @@ namespace aft
       return nodes;
     }
 
-  public:
     void add_configuration(
-      Index idx,
-      const ccf::kv::Configuration::Nodes& conf,
-      const std::unordered_set<ccf::NodeId>& new_learner_nodes = {},
-      const std::unordered_set<ccf::NodeId>& new_retired_nodes = {}) override
+      Index idx, const ccf::kv::Configuration::Nodes& conf) override
     {
       RAFT_DEBUG_FMT(
         "Configurations: add new configuration at {}: {{{}}}", idx, conf);
-
-      assert(new_learner_nodes.empty());
 
 #ifdef CCF_RAFT_TRACING
       nlohmann::json j = {};
@@ -564,9 +553,9 @@ namespace aft
         become_retired(idx, ccf::kv::RetirementPhase::Ordered);
       }
 
-      if (conf != configurations.back().nodes)
+      if (configurations.empty() || conf != configurations.back().nodes)
       {
-        Configuration new_config = {idx, std::move(conf), idx};
+        Configuration new_config = {idx, conf, idx};
         configurations.push_back(new_config);
 
         create_and_remove_node_state();
@@ -628,7 +617,7 @@ namespace aft
         details.acks[k] = {
           v.match_idx, static_cast<size_t>(v.last_ack_timeout.count())};
       }
-      details.reconfiguration_type = reconfiguration_type;
+      details.reconfiguration_type = ccf::ReconfigurationType::ONE_TRANSACTION;
       return details;
     }
 
@@ -665,12 +654,14 @@ namespace aft
 
       RAFT_DEBUG_FMT("Replicating {} entries", entries.size());
 
-      for (auto& [index, data, is_globally_committable, hooks] : entries)
+      for (const auto& [index, data, is_globally_committable, hooks] : entries)
       {
         bool globally_committable = is_globally_committable;
 
         if (index != state->last_idx + 1)
+        {
           return false;
+        }
 
         RAFT_DEBUG_FMT(
           "Replicated on leader {}: {}{} ({} hooks)",
@@ -747,7 +738,7 @@ namespace aft
     void recv_message(
       const ccf::NodeId& from, const uint8_t* data, size_t size) override
     {
-      RaftMsgType type = serialized::peek<RaftMsgType>(data, size);
+      auto type = serialized::peek<RaftMsgType>(data, size);
 
       try
       {
@@ -771,11 +762,29 @@ namespace aft
             break;
           }
 
+          case raft_request_pre_vote:
+          {
+            RequestPreVote r =
+              channels->template recv_authenticated<RequestPreVote>(
+                from, data, size);
+            recv_request_pre_vote(from, r);
+            break;
+          }
+
           case raft_request_vote:
           {
             RequestVote r = channels->template recv_authenticated<RequestVote>(
               from, data, size);
             recv_request_vote(from, r);
+            break;
+          }
+
+          case raft_request_pre_vote_response:
+          {
+            RequestPreVoteResponse r =
+              channels->template recv_authenticated<RequestPreVoteResponse>(
+                from, data, size);
+            recv_request_pre_vote_response(from, r);
             break;
           }
 
@@ -797,9 +806,11 @@ namespace aft
             break;
           }
 
+          case raft_append_entries_signed_response:
           default:
           {
-            RAFT_FAIL_FMT("Unhandled AFT message type: {}", type);
+            RAFT_FAIL_FMT("Received unhandled AFT message type: {}", type);
+            return;
           }
         }
       }
@@ -815,7 +826,8 @@ namespace aft
       }
       catch (const std::exception& e)
       {
-        LOG_FAIL_EXC(e.what());
+        LOG_FAIL_FMT("Exception in {}", __PRETTY_FUNCTION__);
+        LOG_DEBUG_FMT("Error: {}", e.what());
         return;
       }
     }
@@ -845,38 +857,36 @@ namespace aft
           node.second.last_ack_timeout += elapsed;
         }
 
-        bool has_quorum_of_backups = false;
-        for (auto const& conf : configurations)
-        {
-          size_t backup_ack_timeout_count = 0;
-          for (auto const& node : conf.nodes)
-          {
-            auto search = all_other_nodes.find(node.first);
-            if (search == all_other_nodes.end())
+        bool every_active_config_has_a_quorum = std::all_of(
+          configurations.begin(),
+          configurations.end(),
+          [this](const Configuration& conf) {
+            size_t live_nodes_in_config = 0;
+            for (auto const& node : conf.nodes)
             {
-              // Ignore ourselves as primary
-              continue;
+              auto search = all_other_nodes.find(node.first);
+              if (
+                // if a (non-self) node is in a configuration, then it is in
+                // all_other_nodes. So if a node in a configuration is not found
+                // in all_other_nodes, it must be self, and hence is live
+                search == all_other_nodes.end() ||
+                // Otherwise we use the most recent ack as a failure probe
+                search->second.last_ack_timeout < election_timeout)
+              {
+                ++live_nodes_in_config;
+              }
+              else
+              {
+                RAFT_DEBUG_FMT(
+                  "No ack received from {} in last {}",
+                  node.first,
+                  election_timeout);
+              }
             }
-            if (search->second.last_ack_timeout >= election_timeout)
-            {
-              RAFT_DEBUG_FMT(
-                "No ack received from {} in last {}",
-                node.first,
-                election_timeout);
-              backup_ack_timeout_count++;
-            }
-          }
+            return live_nodes_in_config >= get_quorum(conf.nodes.size());
+          });
 
-          if (backup_ack_timeout_count < get_quorum(conf.nodes.size() - 1))
-          {
-            // If primary has quorum of active backups in _any_ configuration,
-            // it should remain primary
-            has_quorum_of_backups = true;
-            break;
-          }
-        }
-
-        if (!has_quorum_of_backups)
+        if (!every_active_config_has_a_quorum)
         {
           // CheckQuorum: The primary automatically steps down if there are no
           // active configuration in which it has heard back from a majority of
@@ -897,7 +907,14 @@ namespace aft
           timeout_elapsed >= election_timeout)
         {
           // Start an election.
-          become_candidate();
+          if (state->pre_vote_enabled)
+          {
+            become_pre_vote_candidate();
+          }
+          else
+          {
+            become_candidate();
+          }
         }
       }
     }
@@ -936,7 +953,7 @@ namespace aft
       return probe_index;
     }
 
-    inline void update_batch_size()
+    void update_batch_size()
     {
       auto avg_entry_size = (entry_count == 0) ?
         append_entries_size_limit :
@@ -955,7 +972,9 @@ namespace aft
     Term get_term_internal(Index idx)
     {
       if (idx > state->last_idx)
+      {
         return ccf::VIEW_UNKNOWN;
+      }
 
       return state->view_history.view_at(idx);
     }
@@ -1005,7 +1024,7 @@ namespace aft
         return std::min(start + entries_batch_size - 1, max_idx);
       };
 
-      Index end_idx;
+      Index end_idx = 0;
 
       // We break _after_ sending, so that in the case where this is called
       // with start==last, we send a single empty heartbeat
@@ -1033,16 +1052,6 @@ namespace aft
       const auto prev_term = get_term_internal(prev_idx);
       const auto term_of_idx = get_term_internal(end_idx);
 
-      RAFT_DEBUG_FMT(
-        "Send append entries from {} to {}: ({}.{}, {}.{}] ({})",
-        state->node_id,
-        to,
-        prev_term,
-        prev_idx,
-        term_of_idx,
-        end_idx,
-        state->commit_idx);
-
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wc99-designator"
       AppendEntries ae{
@@ -1054,6 +1063,17 @@ namespace aft
         .term_of_idx = term_of_idx,
       };
 #pragma clang diagnostic pop
+
+      RAFT_DEBUG_FMT(
+        "Send {} from {} to {}: ({}.{}, {}.{}] ({})",
+        ae.msg,
+        state->node_id,
+        to,
+        prev_term,
+        prev_idx,
+        term_of_idx,
+        end_idx,
+        state->commit_idx);
 
       auto& node = all_other_nodes.at(to);
 
@@ -1090,12 +1110,14 @@ namespace aft
       std::unique_lock<ccf::pal::Mutex> guard(state->lock);
 
       RAFT_DEBUG_FMT(
-        "Received append entries: {}.{} to {}.{} (from {} in term {})",
+        "Recv {} to {} from {}: {}.{} to {}.{} in term {}",
+        r.msg,
+        state->node_id,
+        from,
         r.prev_term,
         r.prev_idx,
         r.term_of_idx,
         r.idx,
-        from,
         r.term);
 
 #ifdef CCF_RAFT_TRACING
@@ -1116,7 +1138,8 @@ namespace aft
       // follower if necessary
       if (
         state->current_view == r.term &&
-        state->leadership_state == ccf::kv::LeadershipState::Candidate)
+        (state->leadership_state == ccf::kv::LeadershipState::Candidate ||
+         state->leadership_state == ccf::kv::LeadershipState::PreVoteCandidate))
       {
         become_aware_of_new_term(r.term);
       }
@@ -1128,7 +1151,8 @@ namespace aft
       {
         // Reply false, since our term is later than the received term.
         RAFT_INFO_FMT(
-          "Recv append entries to {} from {} but our term is later ({} > {})",
+          "Recv {} to {} from {} but our term is later ({} > {})",
+          r.msg,
           state->node_id,
           from,
           state->current_view,
@@ -1146,11 +1170,12 @@ namespace aft
 
         // Reply false if the log doesn't contain an entry at r.prev_idx
         // whose term is r.prev_term. Rejects "future" entries.
-        if (prev_term == 0)
+        if (prev_term == ccf::VIEW_UNKNOWN)
         {
           RAFT_DEBUG_FMT(
-            "Recv append entries to {} from {} but our log does not yet "
+            "Recv {} to {} from {} but our log does not yet "
             "contain index {}",
+            r.msg,
             state->node_id,
             from,
             r.prev_idx);
@@ -1159,8 +1184,9 @@ namespace aft
         else
         {
           RAFT_DEBUG_FMT(
-            "Recv append entries to {} from {} but our log at {} has the wrong "
+            "Recv {} to {} from {} but our log at {} has the wrong "
             "previous term (ours: {}, theirs: {})",
+            r.msg,
             state->node_id,
             from,
             r.prev_idx,
@@ -1186,22 +1212,24 @@ namespace aft
       if (r.prev_idx < state->commit_idx)
       {
         RAFT_DEBUG_FMT(
-          "Recv append entries to {} from {} but prev_idx ({}) < commit_idx "
+          "Recv {} to {} from {} but prev_idx ({}) < commit_idx "
           "({})",
+          r.msg,
           state->node_id,
           from,
           r.prev_idx,
           state->commit_idx);
         return;
       }
-      // Redundant with check on get_term_internal() at line 1149
-      // Which captures this case in every situation, except r.prev_term == 0.
-      // That only happens if r.prev_idx == 0 however, see line 1033,
-      // in which case this path should not be taken either.
-      else if (r.prev_idx > state->last_idx)
+      // This block is redundant - the checks above cover this case, so the code
+      // inside this block should be unreachable. It is retained out of
+      // abundance of caution, in case future rewrites of the above conditions
+      // allow a fallthrough.
+      if (r.prev_idx > state->last_idx)
       {
         RAFT_FAIL_FMT(
-          "Recv append entries to {} from {} but prev_idx ({}) > last_idx ({})",
+          "Recv {} to {} from {} but prev_idx ({}) > last_idx ({})",
+          r.msg,
           state->node_id,
           from,
           r.prev_idx,
@@ -1210,7 +1238,8 @@ namespace aft
       }
 
       RAFT_DEBUG_FMT(
-        "Recv append entries to {} from {} for index {} and previous index {}",
+        "Recv {} to {} from {} for index {} and previous index {}",
+        r.msg,
         state->node_id,
         from,
         r.idx,
@@ -1292,7 +1321,8 @@ namespace aft
         {
           // This should only fail if there is malformed data.
           RAFT_FAIL_FMT(
-            "Recv append entries to {} from {} but the data is malformed: {}",
+            "Recv {} to {} from {} but the data is malformed: {}",
+            r.msg,
             state->node_id,
             from,
             e.what());
@@ -1300,24 +1330,24 @@ namespace aft
           return;
         }
 
-        ccf::kv::TxID expected{r.term_of_idx, i};
+        ccf::TxID expected{r.term_of_idx, i};
         auto ds = store->deserialize(entry, public_only, expected);
         if (ds == nullptr)
         {
           RAFT_FAIL_FMT(
-            "Recv append entries to {} from {} but the entry could not be "
+            "Recv {} to {} from {} but the entry could not be "
             "deserialised",
+            r.msg,
             state->node_id,
             from);
           send_append_entries_response_nack(from);
           return;
         }
 
-        append_entries.push_back(std::make_tuple(std::move(ds), i));
+        append_entries.emplace_back(std::move(ds), i);
       }
 
-      execute_append_entries_sync(
-        std::move(append_entries), from, std::move(r));
+      execute_append_entries_sync(std::move(append_entries), from, r);
     }
 
     void execute_append_entries_sync(
@@ -1325,7 +1355,7 @@ namespace aft
         std::unique_ptr<ccf::kv::AbstractExecutionWrapper>,
         ccf::kv::Version>>&& append_entries,
       const ccf::NodeId& from,
-      AppendEntries&& r)
+      const AppendEntries& r)
     {
       for (auto& ae : append_entries)
       {
@@ -1391,7 +1421,7 @@ namespace aft
             }
             state->committable_indices.push_back(i);
 
-            if (ds->get_term())
+            if (ds->get_term() != 0u)
             {
               // A signature for sig_term tells us that all transactions from
               // the previous signature onwards (at least, if not further back)
@@ -1418,16 +1448,16 @@ namespace aft
           }
 
           case ccf::kv::ApplyResult::PASS:
-          {
-            break;
-          }
-
           case ccf::kv::ApplyResult::PASS_ENCRYPTED_PAST_LEDGER_SECRET:
           {
             break;
           }
 
-          default:
+          case ccf::kv::ApplyResult::PASS_BACKUP_SIGNATURE:
+          case ccf::kv::ApplyResult::PASS_BACKUP_SIGNATURE_SEND_ACK:
+          case ccf::kv::ApplyResult::PASS_NONCES:
+          case ccf::kv::ApplyResult::PASS_NEW_VIEW:
+          case ccf::kv::ApplyResult::PASS_APPLY:
           {
             throw std::logic_error("Unknown ApplyResult value");
           }
@@ -1438,7 +1468,7 @@ namespace aft
     }
 
     void execute_append_entries_finish(
-      AppendEntries& r, const ccf::NodeId& from)
+      const AppendEntries& r, const ccf::NodeId& from)
     {
       // After entries have been deserialised, try to commit the leader's
       // commit index and update our term history accordingly
@@ -1505,18 +1535,19 @@ namespace aft
       aft::Term response_term,
       aft::Index response_idx)
     {
-      RAFT_DEBUG_FMT(
-        "Send append entries response from {} to {} for index {}: {}",
-        state->node_id,
-        to,
-        response_idx,
-        (answer == AppendEntriesResponseType::OK ? "ACK" : "NACK"));
-
       AppendEntriesResponse response{
         .term = response_term,
         .last_log_idx = response_idx,
         .success = answer,
       };
+
+      RAFT_DEBUG_FMT(
+        "Send {} from {} to {} for index {}: {}",
+        response.msg,
+        state->node_id,
+        to,
+        response_idx,
+        (answer == AppendEntriesResponseType::OK ? "ACK" : "NACK"));
 
 #ifdef CCF_RAFT_TRACING
       nlohmann::json j = {};
@@ -1563,8 +1594,9 @@ namespace aft
       // Ignore if we're not the leader.
       if (state->leadership_state != ccf::kv::LeadershipState::Leader)
       {
-        RAFT_FAIL_FMT(
-          "Recv append entries response to {} from {}: no longer leader",
+        RAFT_INFO_FMT(
+          "Recv {} to {} from {}: no longer leader",
+          r.msg,
           state->node_id,
           from);
         return;
@@ -1577,8 +1609,9 @@ namespace aft
       {
         // We are behind, update our state.
         RAFT_DEBUG_FMT(
-          "Recv append entries response to {} from {}: more recent term ({} "
+          "Recv {} to {} from {}: more recent term ({} "
           "> {})",
+          r.msg,
           state->node_id,
           from,
           r.term,
@@ -1586,7 +1619,7 @@ namespace aft
         become_aware_of_new_term(r.term);
         return;
       }
-      else if (state->current_view != r.term)
+      if (state->current_view != r.term)
       {
         // Stale response, discard if success.
         // Otherwise reset sent_idx and try again.
@@ -1596,7 +1629,8 @@ namespace aft
         if (r.success == AppendEntriesResponseType::OK)
         {
           RAFT_DEBUG_FMT(
-            "Recv append entries response to {} from {}: stale term ({} != {})",
+            "Recv {} to {} from {}: stale term ({} != {})",
+            r.msg,
             state->node_id,
             from,
             r.term,
@@ -1614,9 +1648,7 @@ namespace aft
         if (r.success == AppendEntriesResponseType::OK)
         {
           RAFT_DEBUG_FMT(
-            "Recv append entries response to {} from {}: stale idx",
-            state->node_id,
-            from);
+            "Recv {} to {} from {}: stale idx", r.msg, state->node_id, from);
           return;
         }
       }
@@ -1626,46 +1658,61 @@ namespace aft
       {
         // Failed due to log inconsistency. Reset sent_idx, and try again soon.
         RAFT_DEBUG_FMT(
-          "Recv append entries response to {} from {}: failed",
-          state->node_id,
-          from);
+          "Recv {} to {} from {}: failed", r.msg, state->node_id, from);
         const auto this_match =
           find_highest_possible_match({r.term, r.last_log_idx});
         node->second.sent_idx = std::max(
           std::min(this_match, node->second.sent_idx), node->second.match_idx);
         return;
       }
-      else
-      {
-        // max(...) because why would we ever want to go backwards on a success
-        // response?!
-        node->second.match_idx =
-          std::max(node->second.match_idx, r.last_log_idx);
-      }
+
+      // max(...) because why would we ever want to go backwards on a success
+      // response?!
+      node->second.match_idx = std::max(node->second.match_idx, r.last_log_idx);
 
       RAFT_DEBUG_FMT(
-        "Recv append entries response to {} from {} for index {}: success",
+        "Recv {} to {} from {} for index {}: success",
+        r.msg,
         state->node_id,
         from,
         r.last_log_idx);
       update_commit();
     }
 
+    void send_request_pre_vote(const ccf::NodeId& to)
+    {
+      auto last_committable_idx = last_committable_index();
+      CCF_ASSERT(last_committable_idx >= state->commit_idx, "lci < ci");
+
+      RequestPreVote rpv{
+        .term = state->current_view,
+        .last_committable_idx = last_committable_idx,
+        .term_of_last_committable_idx =
+          get_term_internal(last_committable_idx)};
+
+#ifdef CCF_RAFT_TRACING
+      nlohmann::json j = {};
+      j["function"] = "send_request_vote";
+      j["packet"] = rpv;
+      j["state"] = *state;
+      COMMITTABLE_INDICES(j["state"], state);
+      j["to_node_id"] = to;
+      RAFT_TRACE_JSON_OUT(j);
+#endif
+
+      channels->send_authenticated(to, ccf::NodeMsgType::consensus_msg, rpv);
+    }
+
     void send_request_vote(const ccf::NodeId& to)
     {
       auto last_committable_idx = last_committable_index();
-      RAFT_INFO_FMT(
-        "Send request vote from {} to {} at {}",
-        state->node_id,
-        to,
-        last_committable_idx);
       CCF_ASSERT(last_committable_idx >= state->commit_idx, "lci < ci");
 
       RequestVote rv{
         .term = state->current_view,
         .last_committable_idx = last_committable_idx,
-        .term_of_last_committable_idx = get_term_internal(last_committable_idx),
-      };
+        .term_of_last_committable_idx =
+          get_term_internal(last_committable_idx)};
 
 #ifdef CCF_RAFT_TRACING
       nlohmann::json j = {};
@@ -1680,16 +1727,126 @@ namespace aft
       channels->send_authenticated(to, ccf::NodeMsgType::consensus_msg, rv);
     }
 
-    void recv_request_vote(const ccf::NodeId& from, RequestVote r)
+    void recv_request_vote_unsafe(
+      const ccf::NodeId& from, RequestVote r, ElectionType election_type)
     {
-      std::lock_guard<ccf::pal::Mutex> guard(state->lock);
-
       // Do not check that from is a known node. It is possible to receive
       // RequestVotes from nodes that this node doesn't yet know, just as it
       // receives AppendEntries from those nodes. These should be obeyed just
       // like any other RequestVote - it is possible that this node is needed to
       // produce a primary in the new term, who will then help this node catch
       // up.
+
+      if (state->current_view > r.term)
+      {
+        // Reply false, since our term is later than the received term.
+        RAFT_DEBUG_FMT(
+          "Recv {} to {} from {}: our term is later ({} > {})",
+          r.msg,
+          state->node_id,
+          from,
+          state->current_view,
+          r.term);
+        send_request_vote_response(from, false, election_type);
+        return;
+      }
+      if (state->current_view < r.term)
+      {
+        RAFT_DEBUG_FMT(
+          "Recv {} to {} from {}: their term is later ({} < {})",
+          r.msg,
+          state->node_id,
+          from,
+          state->current_view,
+          r.term);
+
+        // Even if ElectionType::PreVote, we should still update the term.
+        // A pre-vote-candidate does not update its term until it becomes a
+        // candidate. So a pre-vote request from a higher term indicates that we
+        // should catch up to the term that had a candidate in it.
+        become_aware_of_new_term(r.term);
+      }
+
+      bool grant_vote = true;
+
+      if ((election_type == ElectionType::RegularVote) && leader_id.has_value())
+      {
+        // Reply false, since we already know the leader in the current term.
+        RAFT_DEBUG_FMT(
+          "Recv {} to {} from {}: leader {} already known in term {}",
+          r.msg,
+          state->node_id,
+          from,
+          leader_id.value(),
+          state->current_view);
+        grant_vote = false;
+      }
+
+      auto voted_for_other =
+        (voted_for.has_value()) && (voted_for.value() != from);
+      if ((election_type == ElectionType::RegularVote) && voted_for_other)
+      {
+        // Reply false, since we already voted for someone else.
+        RAFT_DEBUG_FMT(
+          "Recv {} to {} from {}: already voted for {}",
+          r.msg,
+          state->node_id,
+          from,
+          voted_for.value());
+        grant_vote = false;
+      }
+
+      // If the candidate's committable log is at least as up-to-date as ours,
+      // vote yes
+
+      const auto last_committable_idx = last_committable_index();
+      const auto term_of_last_committable_idx =
+        get_term_internal(last_committable_idx);
+      const auto log_up_to_date =
+        (r.term_of_last_committable_idx > term_of_last_committable_idx) ||
+        ((r.term_of_last_committable_idx == term_of_last_committable_idx) &&
+         (r.last_committable_idx >= last_committable_idx));
+      if (!log_up_to_date)
+      {
+        RAFT_DEBUG_FMT(
+          "Recv {} to {} from {}: candidate log {}.{} is not up-to-date "
+          "with ours {}.{}",
+          r.msg,
+          state->node_id,
+          from,
+          r.term_of_last_committable_idx,
+          r.last_committable_idx,
+          term_of_last_committable_idx,
+          last_committable_idx);
+        grant_vote = false;
+      }
+
+      if (grant_vote && election_type == ElectionType::RegularVote)
+      {
+        // If we grant our vote to a candidate, then an election is in progress
+        restart_election_timeout();
+        leader_id.reset();
+        voted_for = from;
+      }
+
+      RAFT_INFO_FMT(
+        "Recv {} to {} from {}: {} vote to candidate at {}.{} with "
+        "local state at {}.{}",
+        r.msg,
+        state->node_id,
+        from,
+        grant_vote ? "granted" : "denied",
+        r.term_of_last_committable_idx,
+        r.last_committable_idx,
+        term_of_last_committable_idx,
+        last_committable_idx);
+
+      send_request_vote_response(from, grant_vote, election_type);
+    }
+
+    void recv_request_vote(const ccf::NodeId& from, RequestVote r)
+    {
+      std::lock_guard<ccf::pal::Mutex> guard(state->lock);
 
 #ifdef CCF_RAFT_TRACING
       nlohmann::json j = {};
@@ -1701,104 +1858,73 @@ namespace aft
       RAFT_TRACE_JSON_OUT(j);
 #endif
 
-      if (state->current_view > r.term)
+      recv_request_vote_unsafe(from, r, ElectionType::RegularVote);
+    }
+
+    void recv_request_pre_vote(const ccf::NodeId& from, RequestPreVote r)
+    {
+      std::lock_guard<ccf::pal::Mutex> guard(state->lock);
+
+#ifdef CCF_RAFT_TRACING
+      nlohmann::json j = {};
+      j["function"] = "recv_request_vote";
+      j["packet"] = r;
+      j["state"] = *state;
+      COMMITTABLE_INDICES(j["state"], state);
+      j["from_node_id"] = from;
+      RAFT_TRACE_JSON_OUT(j);
+#endif
+
+      // A pre-vote is a speculative request vote, so we translate it back to a
+      // RequestVote to avoid duplicating the logic.
+      RequestVote rv{
+        .term = r.term,
+        .last_committable_idx = r.last_committable_idx,
+        .term_of_last_committable_idx = r.term_of_last_committable_idx,
+      };
+      rv.msg = RaftMsgType::raft_request_pre_vote;
+      recv_request_vote_unsafe(from, rv, ElectionType::PreVote);
+    }
+
+    void send_request_vote_response(
+      const ccf::NodeId& to, bool answer, ElectionType election_type)
+    {
+      if (election_type == ElectionType::RegularVote)
       {
-        // Reply false, since our term is later than the received term.
-        RAFT_DEBUG_FMT(
-          "Recv request vote to {} from {}: our term is later ({} > {})",
+        RequestVoteResponse response{
+          .term = state->current_view, .vote_granted = answer};
+
+        RAFT_INFO_FMT(
+          "Send {} from {} to {}: {}",
+          response.msg,
           state->node_id,
-          from,
-          state->current_view,
-          r.term);
-        send_request_vote_response(from, false);
-        return;
-      }
-      else if (state->current_view < r.term)
-      {
-        RAFT_DEBUG_FMT(
-          "Recv request vote to {} from {}: their term is later ({} < {})",
-          state->node_id,
-          from,
-          state->current_view,
-          r.term);
-        become_aware_of_new_term(r.term);
-      }
+          to,
+          answer);
 
-      if (leader_id.has_value())
-      {
-        // Reply false, since we already know the leader in the current term.
-        RAFT_DEBUG_FMT(
-          "Recv request vote to {} from {}: leader {} already known in term {}",
-          state->node_id,
-          from,
-          leader_id.value(),
-          state->current_view);
-        send_request_vote_response(from, false);
-        return;
-      }
-
-      if ((voted_for.has_value()) && (voted_for.value() != from))
-      {
-        // Reply false, since we already voted for someone else.
-        RAFT_DEBUG_FMT(
-          "Recv request vote to {} from {}: already voted for {}",
-          state->node_id,
-          from,
-          voted_for.value());
-        send_request_vote_response(from, false);
-        return;
-      }
-
-      // If the candidate's committable log is at least as up-to-date as ours,
-      // vote yes
-
-      const auto last_committable_idx = last_committable_index();
-      const auto term_of_last_committable_idx =
-        get_term_internal(last_committable_idx);
-
-      const auto answer =
-        (r.term_of_last_committable_idx > term_of_last_committable_idx) ||
-        ((r.term_of_last_committable_idx == term_of_last_committable_idx) &&
-         (r.last_committable_idx >= last_committable_idx));
-
-      if (answer)
-      {
-        // If we grant our vote, we also acknowledge that an election is in
-        // progress.
-        restart_election_timeout();
-        leader_id.reset();
-        voted_for = from;
+        channels->send_authenticated(
+          to, ccf::NodeMsgType::consensus_msg, response);
       }
       else
       {
+        RequestPreVoteResponse response{
+          .term = state->current_view, .vote_granted = answer};
+
         RAFT_INFO_FMT(
-          "Voting against candidate at {}.{} because local state is at {}.{}",
-          r.term_of_last_committable_idx,
-          r.last_committable_idx,
-          term_of_last_committable_idx,
-          last_committable_idx);
+          "Send {} from {} to {}: {}",
+          response.msg,
+          state->node_id,
+          to,
+          answer);
+
+        channels->send_authenticated(
+          to, ccf::NodeMsgType::consensus_msg, response);
       }
-
-      send_request_vote_response(from, answer);
-    }
-
-    void send_request_vote_response(const ccf::NodeId& to, bool answer)
-    {
-      RAFT_INFO_FMT(
-        "Send request vote response from {} to {}: {}",
-        state->node_id,
-        to,
-        answer);
-
-      RequestVoteResponse response{
-        .term = state->current_view, .vote_granted = answer};
-
-      channels->send_authenticated(
-        to, ccf::NodeMsgType::consensus_msg, response);
     }
 
     void recv_request_vote_response(
-      const ccf::NodeId& from, RequestVoteResponse r)
+      const ccf::NodeId& from,
+      RequestVoteResponse r,
+      ElectionType election_type)
     {
       std::lock_guard<ccf::pal::Mutex> guard(state->lock);
 
@@ -1812,31 +1938,21 @@ namespace aft
       RAFT_TRACE_JSON_OUT(j);
 #endif
 
-      if (state->leadership_state != ccf::kv::LeadershipState::Candidate)
-      {
-        RAFT_INFO_FMT(
-          "Recv request vote response to {} from: {}: we aren't a candidate",
-          state->node_id,
-          from);
-        return;
-      }
-
       // Ignore if we don't recognise the node.
       auto node = all_other_nodes.find(from);
       if (node == all_other_nodes.end())
       {
         RAFT_INFO_FMT(
-          "Recv request vote response to {} from {}: unknown node",
-          state->node_id,
-          from);
+          "Recv {} to {} from {}: unknown node", r.msg, state->node_id, from);
         return;
       }
 
       if (state->current_view < r.term)
       {
         RAFT_INFO_FMT(
-          "Recv request vote response to {} from {}: their term is more recent "
+          "Recv {} to {} from {}: their term is more recent "
           "({} < {})",
+          r.msg,
           state->node_id,
           from,
           state->current_view,
@@ -1844,7 +1960,7 @@ namespace aft
         become_aware_of_new_term(r.term);
         return;
       }
-      else if (state->current_view != r.term)
+      if (state->current_view != r.term)
       {
         // Ignore as it is stale.
         RAFT_INFO_FMT(
@@ -1855,7 +1971,53 @@ namespace aft
           r.term);
         return;
       }
-      else if (!r.vote_granted)
+
+      if (
+        state->leadership_state != ccf::kv::LeadershipState::PreVoteCandidate &&
+        state->leadership_state != ccf::kv::LeadershipState::Candidate)
+      {
+        RAFT_INFO_FMT(
+          "Recv {} to {} from: {}: we aren't a candidate",
+          r.msg,
+          state->node_id,
+          from);
+        return;
+      }
+      if (
+        election_type == ElectionType::RegularVote &&
+        state->leadership_state != ccf::kv::LeadershipState::Candidate)
+      {
+        // Stale message from previous candidacy
+        // Candidate(T) -> Follower(T) -> PreVoteCandidate(T)
+        RAFT_INFO_FMT(
+          "Recv {} to {} from {}: no longer a candidate in {}",
+          r.msg,
+          state->node_id,
+          from,
+          r.term);
+        return;
+      }
+      if (
+        election_type == ElectionType::PreVote &&
+        state->leadership_state != ccf::kv::LeadershipState::PreVoteCandidate)
+      {
+        // To receive a PreVoteResponse, we must have been a PreVoteCandidate in
+        // that term.
+        // Since we are a Candidate for term T, we can only have transitioned
+        // from PreVoteCandidate for term (T-1). Since terms are monotonic this
+        // is impossible.
+        RAFT_FAIL_FMT(
+          "Recv {} to {} from {}: unexpected message in {} when "
+          "Candidate for {}",
+          r.msg,
+          state->node_id,
+          from,
+          r.term,
+          state->current_view);
+        return;
+      }
+
+      if (!r.vote_granted)
       {
         // Do nothing.
         RAFT_INFO_FMT(
@@ -1871,6 +2033,20 @@ namespace aft
         from);
 
       add_vote_for_me(from);
+    }
+
+    void recv_request_vote_response(
+      const ccf::NodeId& from, RequestVoteResponse r)
+    {
+      recv_request_vote_response(from, r, ElectionType::RegularVote);
+    }
+
+    void recv_request_pre_vote_response(
+      const ccf::NodeId& from, RequestPreVoteResponse r)
+    {
+      RequestVoteResponse rvr{.term = r.term, .vote_granted = r.vote_granted};
+      rvr.msg = RaftMsgType::raft_request_pre_vote_response;
+      recv_request_vote_response(from, rvr, ElectionType::PreVote);
     }
 
     void recv_propose_request_vote(
@@ -1913,6 +2089,47 @@ namespace aft
       {
         votes_for_me[conf.idx].quorum = get_quorum(conf.nodes.size());
         votes_for_me[conf.idx].votes.clear();
+      }
+    }
+
+    void become_pre_vote_candidate()
+    {
+      if (configurations.empty())
+      {
+        LOG_INFO_FMT(
+          "Not becoming pre-vote candidate {} due to lack of a configuration.",
+          state->node_id);
+        return;
+      }
+
+      state->leadership_state = ccf::kv::LeadershipState::PreVoteCandidate;
+      leader_id.reset();
+
+      reset_votes_for_me();
+      restart_election_timeout();
+
+      RAFT_INFO_FMT(
+        "Becoming pre-vote candidate {}: {}",
+        state->node_id,
+        state->current_view);
+
+#ifdef CCF_RAFT_TRACING
+      nlohmann::json j = {};
+      j["function"] = "become_pre_vote_candidate";
+      j["state"] = *state;
+      COMMITTABLE_INDICES(j["state"], state);
+      j["configurations"] = configurations;
+      RAFT_TRACE_JSON_OUT(j);
+#endif
+
+      add_vote_for_me(state->node_id);
+
+      // Request votes only go to nodes in configurations, since only
+      // their votes can be tallied towards an election quorum.
+      for (auto const& node_id : other_nodes_in_active_configs())
+      {
+        // ccfraft!RequestVote
+        send_request_pre_vote(node_id);
       }
     }
 
@@ -1963,7 +2180,7 @@ namespace aft
       }
     }
 
-    void become_leader(bool force_become_leader = false)
+    void become_leader(bool /*force_become_leader*/ = false)
     {
       if (is_retired_committed())
       {
@@ -2041,11 +2258,6 @@ namespace aft
       restart_election_timeout();
       reset_last_ack_timeouts();
 
-      // Drop anything unsigned here, but retain all signed entries. Only do a
-      // more aggressive rollback, potentially including signatures, when
-      // receiving a conflicting AppendEntries
-      rollback(last_committable_index());
-
       state->leadership_state = ccf::kv::LeadershipState::Follower;
       RAFT_INFO_FMT(
         "Becoming follower {}: {}.{}",
@@ -2070,14 +2282,67 @@ namespace aft
     {
       RAFT_DEBUG_FMT("Becoming aware of new term {}", term);
 
+      if (state->current_view != term)
+      {
+        voted_for.reset();
+      }
       state->current_view = term;
-      voted_for.reset();
       reset_votes_for_me();
       become_follower();
       is_new_follower = true;
     }
 
   private:
+    std::optional<ccf::NodeId> find_successor()
+    {
+      std::optional<ccf::NodeId> successor = std::nullopt;
+      Index max_match_idx = 0;
+      ccf::kv::ReconfigurationId reconf_id_of_max_match = 0;
+
+      // Pick the node that has the highest match_idx, and break
+      // ties by looking at the highest reconfiguration id they are
+      // part of. This can lead to nudging a node that is
+      // about to retire too, but that node will then nudge
+      // a successor, and that seems preferable to nudging a node that
+      // risks not being eligible if reconfiguration id is prioritised.
+      // Alternatively, we could pick the node with the highest match idx
+      // in the latest config, provided that match idx at least as high as a
+      // majority. That would make them both eligible and unlikely to retire
+      // soon.
+      for (auto& [node, node_state] : all_other_nodes)
+      {
+        if (node_state.match_idx >= max_match_idx)
+        {
+          ccf::kv::ReconfigurationId latest_reconf_id = 0;
+          auto conf = configurations.rbegin();
+          while (conf != configurations.rend())
+          {
+            if (conf->nodes.find(node) != conf->nodes.end())
+            {
+              latest_reconf_id = conf->idx;
+              break;
+            }
+            conf++;
+          }
+          if (!(node_state.match_idx == max_match_idx &&
+                latest_reconf_id < reconf_id_of_max_match))
+          {
+            reconf_id_of_max_match = latest_reconf_id;
+            successor = node;
+            max_match_idx = node_state.match_idx;
+          }
+        }
+      }
+      return successor;
+    }
+
+    void send_propose_request_vote(const ccf::NodeId& successor)
+    {
+      ProposeRequestVote prv{.term = state->current_view};
+      RAFT_INFO_FMT("Proposing that {} becomes candidate", successor);
+      channels->send_authenticated(
+        successor, ccf::NodeMsgType::consensus_msg, prv);
+    }
     void become_retired(Index idx, ccf::kv::RetirementPhase phase)
     {
       RAFT_INFO_FMT(
@@ -2093,6 +2358,7 @@ namespace aft
         CCF_ASSERT_FMT(
           !state->retirement_idx.has_value(),
           "retirement_idx already set to {}",
+          // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
           state->retirement_idx.value());
         state->retirement_idx = idx;
         RAFT_INFO_FMT("Node retiring at {}", idx);
@@ -2101,64 +2367,18 @@ namespace aft
       {
         assert(state->retirement_idx.has_value());
         CCF_ASSERT_FMT(
+          // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
           idx >= state->retirement_idx.value(),
           "Index {} unexpectedly lower than retirement_idx {}",
           idx,
+          // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
           state->retirement_idx.value());
         state->retirement_committable_idx = idx;
         RAFT_INFO_FMT("Node retirement committable at {}", idx);
       }
       else if (phase == ccf::kv::RetirementPhase::RetiredCommitted)
       {
-        if (state->leadership_state == ccf::kv::LeadershipState::Leader)
-        {
-          ProposeRequestVote prv{.term = state->current_view};
-
-          std::optional<ccf::NodeId> successor = std::nullopt;
-          Index max_match_idx = 0;
-          ccf::kv::ReconfigurationId reconf_id_of_max_match = 0;
-
-          // Pick the node that has the highest match_idx, and break
-          // ties by looking at the highest reconfiguration id they are
-          // part of. This can lead to nudging a node that is
-          // about to retire too, but that node will then nudge
-          // a successor, and that seems preferable to nudging a node that
-          // risks not being eligible if reconfiguration id is prioritised.
-          // Alternatively, we could pick the node with the higest match idx
-          // in the latest config, provided that match idx at least as high as a
-          // majority. That would make them both eligible and unlikely to retire
-          // soon.
-          for (auto& [node, node_state] : all_other_nodes)
-          {
-            if (node_state.match_idx >= max_match_idx)
-            {
-              ccf::kv::ReconfigurationId latest_reconf_id = 0;
-              auto conf = configurations.rbegin();
-              while (conf != configurations.rend())
-              {
-                if (conf->nodes.find(node) != conf->nodes.end())
-                {
-                  latest_reconf_id = conf->idx;
-                  break;
-                }
-                conf++;
-              }
-              if (!(node_state.match_idx == max_match_idx &&
-                    latest_reconf_id < reconf_id_of_max_match))
-              {
-                reconf_id_of_max_match = latest_reconf_id;
-                successor = node;
-                max_match_idx = node_state.match_idx;
-              }
-            }
-          }
-          if (successor.has_value())
-          {
-            RAFT_INFO_FMT("Node retired, nudging {}", successor.value());
-            channels->send_authenticated(
-              successor.value(), ccf::NodeMsgType::consensus_msg, prv);
-          }
-        }
+        nominate_successor();
 
         leader_id.reset();
         state->leadership_state = ccf::kv::LeadershipState::None;
@@ -2197,7 +2417,7 @@ namespace aft
           votes_for_me[conf.idx].quorum);
       }
 
-      // We need a quorum of votes in _all_ configurations to become leader
+      // We need a quorum of votes in _all_ configurations
       bool is_elected = true;
       for (auto const& v : votes_for_me)
       {
@@ -2213,7 +2433,21 @@ namespace aft
 
       if (is_elected)
       {
-        become_leader();
+        switch (state->leadership_state)
+        {
+          case ccf::kv::LeadershipState::PreVoteCandidate:
+            become_candidate();
+            break;
+          case ccf::kv::LeadershipState::Candidate:
+            become_leader();
+            break;
+          case ccf::kv::LeadershipState::None:
+          case ccf::kv::LeadershipState::Leader:
+          case ccf::kv::LeadershipState::Follower:
+            throw std::logic_error(
+              "add_vote_for_me() called while not a pre-vote candidate or "
+              "candidate");
+        }
       }
     }
 
@@ -2238,7 +2472,7 @@ namespace aft
         std::vector<Index> match;
         match.reserve(c.nodes.size());
 
-        for (auto node : c.nodes)
+        for (const auto& node : c.nodes)
         {
           if (node.first == state->node_id)
           {
@@ -2340,7 +2574,9 @@ namespace aft
       // This could happen if a follower becomes the leader when it
       // has committed fewer log entries, although it has them available.
       if (idx <= state->commit_idx)
+      {
         return;
+      }
 
 #ifdef CCF_RAFT_TRACING
       nlohmann::json j = {};
@@ -2359,15 +2595,26 @@ namespace aft
       if (
         is_retired() &&
         state->retirement_phase == ccf::kv::RetirementPhase::Signed &&
-        state->retirement_committable_idx.has_value() &&
-        idx >= state->retirement_committable_idx.value())
+        state->retirement_committable_idx.has_value())
       {
-        become_retired(idx, ccf::kv::RetirementPhase::Completed);
+        const auto retirement_committable =
+          state // NOLINT(bugprone-unchecked-optional-access)
+            ->retirement_committable_idx.value();
+        if (idx >= retirement_committable)
+        {
+          become_retired(idx, ccf::kv::RetirementPhase::Completed);
+        }
       }
 
       RAFT_DEBUG_FMT("Compacting...");
       store->compact(idx);
       ledger->commit(idx);
+
+      if (commit_callbacks != nullptr)
+      {
+        const auto term = get_term_internal(idx);
+        commit_callbacks->trigger_callbacks({term, idx}, state->view_history);
+      }
 
       RAFT_DEBUG_FMT("Commit on {}: {}", state->node_id, idx);
 
@@ -2462,10 +2709,16 @@ namespace aft
         state->retirement_phase == ccf::kv::RetirementPhase::Signed)
       {
         assert(state->retirement_committable_idx.has_value());
-        if (state->retirement_committable_idx.value() > idx)
+        if (state->retirement_committable_idx.has_value())
         {
-          state->retirement_committable_idx = std::nullopt;
-          state->retirement_phase = ccf::kv::RetirementPhase::Ordered;
+          const auto retirement_committable =
+            state // NOLINT(bugprone-unchecked-optional-access)
+              ->retirement_committable_idx.value();
+          if (retirement_committable > idx)
+          {
+            state->retirement_committable_idx = std::nullopt;
+            state->retirement_phase = ccf::kv::RetirementPhase::Ordered;
+          }
         }
       }
 
@@ -2474,12 +2727,18 @@ namespace aft
         state->retirement_phase == ccf::kv::RetirementPhase::Ordered)
       {
         assert(state->retirement_idx.has_value());
-        if (state->retirement_idx.value() > idx)
+        if (state->retirement_idx.has_value())
         {
-          state->retirement_idx = std::nullopt;
-          state->retirement_phase = std::nullopt;
-          state->membership_state = ccf::kv::MembershipState::Active;
-          RAFT_DEBUG_FMT("Becoming Active after rollback");
+          const auto retirement =
+            state // NOLINT(bugprone-unchecked-optional-access)
+              ->retirement_idx.value();
+          if (retirement > idx)
+          {
+            state->retirement_idx = std::nullopt;
+            state->retirement_phase = std::nullopt;
+            state->membership_state = ccf::kv::MembershipState::Active;
+            RAFT_DEBUG_FMT("Becoming Active after rollback");
+          }
         }
       }
 
@@ -2506,6 +2765,35 @@ namespace aft
       return *state;
     }
 
+    void nominate_successor() override
+    {
+      if (state->leadership_state != ccf::kv::LeadershipState::Leader)
+      {
+        RAFT_DEBUG_FMT(
+          "Not proposing request vote from {} since not leader",
+          state->node_id);
+        return;
+      }
+
+      LOG_INFO_FMT("Nominating successor for {}", state->node_id);
+
+      const auto successor = find_successor();
+
+      if (successor.has_value())
+      {
+#ifdef CCF_RAFT_TRACING
+        nlohmann::json j = {};
+        j["function"] = "step_down_and_nominate_successor";
+        j["state"] = *state;
+        COMMITTABLE_INDICES(j["state"], state);
+        j["configurations"] = configurations;
+        RAFT_TRACE_JSON_OUT(j);
+#endif
+
+        send_propose_request_vote(successor.value());
+      }
+    }
+
   private:
     void create_and_remove_node_state()
     {
@@ -2517,18 +2805,6 @@ namespace aft
         for (auto const& node : conf.nodes)
         {
           active_nodes.emplace(node.first, node.second);
-        }
-      }
-
-      // Remove all nodes in the node state that are not present in any active
-      // configuration.
-      std::vector<ccf::NodeId> to_remove;
-
-      for (const auto& node : all_other_nodes)
-      {
-        if (active_nodes.find(node.first) == active_nodes.end())
-        {
-          to_remove.push_back(node.first);
         }
       }
 

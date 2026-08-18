@@ -1,32 +1,32 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-from contextlib import contextmanager, closing
-from enum import Enum, auto
-import infra.crypto
-import infra.remote
-import infra.docker_remote
-from datetime import datetime, timedelta, timezone
-import infra.net
-import infra.path
-import infra.interfaces
-import infra.clients
-import ccf.ledger
-import os
-import socket
-import re
-import ipaddress
-import ssl
 import copy
-import json
-import time
+import functools
 import http
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import time
+from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
+from enum import Enum, auto
 
 import ccf._versionifier
-
+import ccf.ledger
+from ccf.tx_id import TxID
+from loguru import logger as LOG
 from packaging.version import Version  # type: ignore
 
-from loguru import logger as LOG
+import infra.clients
+import infra.crypto
+import infra.interfaces
+import infra.net
+import infra.path
+import infra.remote
 
 BASE_NODE_CLIENT_HOST = "127.100.0.0"
 
@@ -107,6 +107,28 @@ def version_after(version, cmp_version):
     ) > ccf._versionifier.to_python_version(cmp_version)
 
 
+@functools.total_ordering
+class CCFVersion:
+    # None is assumed to be the latest development version
+    # so None > any specific version, and None == None
+    def __init__(self, version_str):
+        self.version_str = version_str
+        if version_str is not None:
+            self.parsed_version = ccf._versionifier.to_python_version(version_str)
+        else:
+            self.parsed_version = None
+
+    def __eq__(self, other):
+        return self.parsed_version == other.parsed_version
+
+    def __lt__(self, other):
+        if self.parsed_version is None:
+            return False
+        if other.parsed_version is None:
+            return True
+        return self.parsed_version < other.parsed_version
+
+
 class Node:
     def __init__(
         self,
@@ -119,18 +141,20 @@ class Node:
         node_port=0,
         version=None,
         node_data_json_file=None,
-        nodes_in_container=False,
+        ipv6=False,
     ):
         self.local_node_id = local_node_id
         self.binary_dir = binary_dir
         self.library_dir = library_dir
         self.debug = debug
         self.perf = perf
+        self.ipv6 = ipv6
         self.remote = None
         self.network_state = NodeNetworkState.stopped
         self.common_dir = None
         self.suspended = False
         self.node_id = None
+        self.sealing_recovery_location = None
         self.node_client_host = None
         # Note: Do not modify host argument as it may be passed to multiple
         # nodes or networks
@@ -147,40 +171,34 @@ class Node:
         self.label = None
         self.verify_ca_by_default = True
 
-        requires_docker_remote = nodes_in_container or os.getenv("CONTAINER_NODES")
-
         if isinstance(self.host, str):
-            raise ValueError("Translate host to HostSpec before you get here")
+            raise TypeError("Translate host to HostSpec before you get here")
 
         for interface_name, rpc_interface in self.host.rpc_interfaces.items():
+            # Expand "localhost" to a concrete address first, so the IPv6
+            # detection below sees the effective host (when this node is
+            # running in IPv6 mode, expand_localhost() returns the "::1"
+            # loopback address).
+            if rpc_interface.host == "localhost":
+                rpc_interface.host = infra.net.expand_localhost(ipv6=self.ipv6)
+
             # Main RPC interface determines remote implementation
             if interface_name == infra.interfaces.PRIMARY_RPC_INTERFACE:
                 if rpc_interface.protocol == "local":
-                    self.remote_impl = (
-                        infra.docker_remote.DockerRemote
-                        if requires_docker_remote
-                        else infra.remote.LocalRemote
-                    )
-                    # Node client address does not currently work with DockerRemote
-                    if not requires_docker_remote:
-                        if not self.major_version or self.major_version > 1:
+                    if not self.major_version or self.major_version > 1:
+                        if ":" in rpc_interface.host:
+                            # IPv6 addresses (e.g. ::1 from expand_localhost())
+                            # are not compatible with the IPv4-based client
+                            # interface used for partition simulation. Skip
+                            # client interface binding for IPv6.
+                            self.node_client_host = None
+                        else:
                             self.node_client_host = str(
                                 ipaddress.ip_address(BASE_NODE_CLIENT_HOST)
                                 + self.local_node_id
                             )
-                elif rpc_interface.protocol == "ssh":
-                    if requires_docker_remote:
-                        raise ValueError(
-                            "Cannot use SSH remote with containerised nodes"
-                        )
-                    self.remote_impl = infra.remote.SSHRemote
                 else:
-                    assert (
-                        False
-                    ), f"{rpc_interface.protocol} is not 'local://' or 'ssh://'"
-
-            if rpc_interface.host == "localhost":
-                rpc_interface.host = infra.net.expand_localhost()
+                    assert False, f"{rpc_interface.protocol} is not 'local://'"
 
             if rpc_interface.public_host is None:
                 rpc_interface.public_host = rpc_interface.host
@@ -192,6 +210,24 @@ class Node:
                     host=rpc_interface.host, port=node_port
                 )
 
+            # LedgerChunkRead operator feature is only supported from 7.0.0-dev7 onwards
+            if (
+                self.version is not None
+                and Version(strip_version(self.version)) <= Version("7.0.0-dev6")
+                and rpc_interface.enabled_operator_features
+                and "LedgerChunkRead" in rpc_interface.enabled_operator_features
+            ):
+                rpc_interface.enabled_operator_features.remove("LedgerChunkRead")
+
+            # SnapshotCreate operator feature is only supported from 7.0.0-dev14 onwards
+            if (
+                self.version is not None
+                and Version(strip_version(self.version)) <= Version("7.0.0-dev13")
+                and rpc_interface.enabled_operator_features
+                and "SnapshotCreate" in rpc_interface.enabled_operator_features
+            ):
+                rpc_interface.enabled_operator_features.remove("SnapshotCreate")
+
     def __hash__(self):
         return self.local_node_id
 
@@ -201,7 +237,6 @@ class Node:
     def start(
         self,
         lib_name,
-        enclave_type,
         workspace,
         label,
         common_dir,
@@ -211,7 +246,6 @@ class Node:
         self._setup(
             infra.remote.StartType.start,
             lib_name,
-            enclave_type,
             workspace,
             label,
             common_dir,
@@ -224,7 +258,6 @@ class Node:
     def join(
         self,
         lib_name,
-        enclave_type,
         workspace,
         label,
         common_dir,
@@ -233,7 +266,6 @@ class Node:
         self._setup(
             infra.remote.StartType.join,
             lib_name,
-            enclave_type,
             workspace,
             label,
             common_dir,
@@ -244,7 +276,6 @@ class Node:
     def prepare_join(
         self,
         lib_name,
-        enclave_type,
         workspace,
         label,
         common_dir,
@@ -253,7 +284,6 @@ class Node:
         self._setup(
             infra.remote.StartType.join,
             lib_name,
-            enclave_type,
             workspace,
             label,
             common_dir,
@@ -263,11 +293,10 @@ class Node:
     def complete_join(self):
         self._start()
 
-    def recover(self, lib_name, enclave_type, workspace, label, common_dir, **kwargs):
+    def recover(self, lib_name, workspace, label, common_dir, **kwargs):
         self._setup(
             infra.remote.StartType.recover,
             lib_name,
-            enclave_type,
             workspace,
             label,
             common_dir,
@@ -280,33 +309,44 @@ class Node:
         self,
         start_type,
         lib_name,
-        enclave_type,
         workspace,
         label,
         common_dir,
         members_info=None,
-        enclave_platform="sgx",
+        host_data_transparent_statement_path=None,
         **kwargs,
     ):
         """
         Creates a CCFRemote instance, sets it up (connects, creates the directory
         and ships over the files)
         """
-        lib_path = infra.path.build_lib_path(
-            lib_name, enclave_type, enclave_platform, library_dir=self.library_dir
-        )
+        if self.version is None or Version(strip_version(self.version)) > Version(
+            "7.0.0-dev1"
+        ):
+            lib_path = lib_name
+        else:
+            lib_path = infra.path.build_lib_path(
+                lib_name,
+                library_dir=self.library_dir,
+                version=self.version,
+            )
         self.common_dir = common_dir
         members_info = members_info or []
         self.label = label
 
+        self.host_data_transparent_statement_path = host_data_transparent_statement_path
         self.certificate_validity_days = kwargs.get("initial_node_cert_validity_days")
+        self.election_timeout_ms = kwargs.get("election_timeout_ms")
         self.remote = infra.remote.CCFRemote(
             start_type,
             lib_path,
-            enclave_type,
-            self.remote_impl,
             workspace,
             common_dir,
+            binary_name=(
+                "cchost"
+                if self.major_version is not None and self.major_version < 7
+                else None
+            ),
             binary_dir=self.binary_dir,
             label=label,
             local_node_id=self.local_node_id,
@@ -320,7 +360,7 @@ class Node:
             version=self.version,
             major_version=self.major_version,
             node_data_json_file=self.initial_node_data_json_file,
-            enclave_platform=enclave_platform,
+            host_data_transparent_statement_path=self.host_data_transparent_statement_path,
             **kwargs,
         )
         self.remote.setup()
@@ -341,30 +381,28 @@ class Node:
                 f.write(f"exec {' '.join(self.remote.remote.cmd)}\n")
                 f.write("fi\n")
 
-            print("")
+            print()
             print(
                 "================= Please run the below command on "
                 + self.get_public_rpc_host()
                 + " and press enter to continue ================="
             )
-            print("")
+            print()
             print(self.remote.debug_node_cmd())
-            print("")
+            print()
             input("Press Enter to continue...")
         else:
-            if self.perf:
-                self.remote.set_perf()
             self.remote.start()
 
         # Detect whether node started up successfully
         for _ in range(NODE_STARTUP_RETRY_COUNT):
             try:
-                if self.remote.check_done():
+                if self.remote.check_done(timeout=0):
                     raise RuntimeError("Node crashed at startup")
                 self.remote.get_startup_files(self.common_dir)
                 break
             except Exception as e:
-                if self.remote.check_done():
+                if self.remote.check_done(timeout=0):
                     raise RuntimeError(
                         f"Error starting node {self.local_node_id}"
                     ) from e
@@ -389,6 +427,8 @@ class Node:
             time.sleep(0.1)
 
         self._read_ports()
+
+        self.sealing_recovery_location = self.get_sealing_recovery_location()
 
         start_msg = f"Node {self.local_node_id} started: {self.node_id}"
         if self.version is not None:
@@ -425,7 +465,7 @@ class Node:
                 )
                 self._resolve_address(rpc_address_file, self.host.rpc_interfaces)
                 #  In the infra, public RPC port is always the same as local RPC port
-                for _, interface in self.host.rpc_interfaces.items():
+                for interface in self.host.rpc_interfaces.values():
                     interface.public_port = interface.port
         else:
             # Legacy 1.x nodes
@@ -477,6 +517,9 @@ class Node:
     def sigterm(self):
         self.remote.sigterm()
 
+    def sigkill(self):
+        self.remote.sigkill()
+
     def is_stopped(self):
         return self.network_state == NodeNetworkState.stopped
 
@@ -491,7 +534,7 @@ class Node:
         start_time = time.time()
         while time.time() < start_time + timeout:
             try:
-                with self.client(connection_timeout=timeout, *args, **kwargs) as nc:
+                with self.client(*args, connection_timeout=timeout, **kwargs) as nc:
                     rep = nc.get("/node/commit")
                     if rep.status_code == 200:
                         self.network_state = infra.node.NodeNetworkState.joined
@@ -504,18 +547,22 @@ class Node:
 
         raise TimeoutError(f"Node {self.local_node_id} failed to join the network")
 
-    def get_ledger_public_tables_at(self, seqno, insecure=False):
-        validator = ccf.ledger.LedgerValidator() if not insecure else None
-        ledger = ccf.ledger.Ledger(self.remote.ledger_paths(), validator=validator)
+    def get_ledger_public_tables_at(self, seqno):
+        ledger = ccf.ledger.Ledger(self.remote.ledger_paths())
         assert ledger.last_committed_chunk_range[1] >= seqno
         tx = ledger.get_transaction(seqno)
         return tx.get_public_domain().get_tables()
 
-    def get_ledger_public_state_at(self, seqno, insecure=False):
-        validator = ccf.ledger.LedgerValidator() if not insecure else None
-        ledger = ccf.ledger.Ledger(self.remote.ledger_paths(), validator=validator)
+    def get_ledger_public_state_at(self, seqno):
+        ledger = ccf.ledger.Ledger(self.remote.ledger_paths())
         assert ledger.last_committed_chunk_range[1] >= seqno
         return ledger.get_latest_public_state()
+
+    def get_main_ledger_dir(self):
+        """
+        Get the main ledger directory
+        """
+        return self.remote.get_main_ledger_dir()
 
     def get_ledger(self):
         """
@@ -605,10 +652,23 @@ class Node:
     def get_public_rpc_address(
         self, interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE
     ):
-        interface = self.host.rpc_interfaces[interface_name]
+        interface = self.host.rpc_interfaces.get(interface_name, None)
+        assert (
+            interface is not None
+        ), f"Missing interface {interface_name} on {self} ({self.local_node_id}, {self.node_id})"
         return infra.interfaces.make_address(
             interface.public_host, interface.public_port
         )
+
+    def get_sealing_recovery_location(self):
+        if self.sealing_recovery_location is not None:
+            return dict(self.sealing_recovery_location)
+
+        self.sealing_recovery_location = {
+            "name": self.local_node_id,
+            "address": self.get_public_rpc_address(),
+        }
+        return dict(self.sealing_recovery_location)
 
     def retrieve_self_signed_cert(self, *args, **kwargs):
         # Retrieve and overwrite node self-signed certificate in common directory
@@ -686,10 +746,14 @@ class Node:
         if description_suffix is not None:
             description += f"|{description_suffix}"
         akwargs["description"] = f"[{description}]"
+        if self.election_timeout_ms is not None:
+            akwargs.setdefault("election_timeout_ms", self.election_timeout_ms)
         akwargs.update(kwargs)
 
         if hasattr(self, "client_impl"):
             akwargs["impl_type"] = self.client_impl
+        if hasattr(self, "openapi_validator"):
+            akwargs["openapi_validator"] = self.openapi_validator
 
         return cls(rpc_interface.public_host, rpc_interface.public_port, **akwargs)
 
@@ -793,7 +857,7 @@ class Node:
         return False
 
     def version_after(self, version):
-        return version_after(self.version, version)
+        return CCFVersion(self.version) > CCFVersion(version)
 
     def get_receipt(self, view, seqno, timeout=3):
         found = False
@@ -822,7 +886,7 @@ class Node:
 
         if not found:
             raise ValueError(
-                f"Unable to retrieve entry at TxID {view}.{seqno} on node {node.local_node_id} after {timeout}s"
+                f"Unable to retrieve entry at TxID {view}.{seqno} on node {self.local_node_id} after {timeout}s"
             )
 
     def wait_for_leadership_state(self, min_view, leadership_states, timeout=3):
@@ -839,6 +903,34 @@ class Node:
         raise TimeoutError(
             f"Node {self.local_node_id} was not in leadership states {leadership_states} in view > {min_view} after {timeout}s: {r}"
         )
+
+    def refresh_network_state(self, **client_kwargs):
+        try:
+            with self.client(**client_kwargs) as c:
+                LOG.info(f"Trying to refresh using {c}")
+                r = c.get(f"/node/network/nodes/{self.node_id}").body.json()
+                LOG.info(r)
+
+                if r["status"] == "Pending":
+                    self.network_state = NodeNetworkState.started
+                elif r["status"] == "Trusted":
+                    self.network_state = NodeNetworkState.joined
+        except Exception as e:
+            LOG.debug(f"Failed to connect {e}")
+            self.network_state = NodeNetworkState.stopped
+
+    def trigger_snapshot(self) -> TxID:
+        LOG.info(f"Triggering snapshot on {self.local_node_id}")
+        with self.client(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        ) as c:
+            r = c.post("/node/snapshot:create")
+            assert r.status_code == http.HTTPStatus.NO_CONTENT, r
+        return TxID(r.view, r.seqno)
+
+    def log_stack_trace(self, timeout=20):
+        if self.remote and self.network_state is not NodeNetworkState.stopped:
+            self.remote.log_stack_trace(timeout=timeout)
 
 
 @contextmanager

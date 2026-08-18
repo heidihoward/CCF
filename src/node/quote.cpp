@@ -3,10 +3,22 @@
 
 #include "ccf/node/quote.h"
 
+#include "ccf/crypto/cose.h"
+#include "ccf/ds/json.h"
+#include "ccf/historical_queries_utils.h"
 #include "ccf/pal/attestation.h"
+#include "ccf/pal/attestation_sev_snp.h"
+#include "ccf/pal/sev_snp_cpuid.h"
 #include "ccf/service/tables/code_id.h"
+#include "ccf/service/tables/jsengine.h"
+#include "ccf/service/tables/node_join_policy.h"
 #include "ccf/service/tables/snp_measurements.h"
+#include "ccf/service/tables/tcb_verification.h"
 #include "ccf/service/tables/uvm_endorsements.h"
+#include "ccf/service/tables/virtual_measurements.h"
+#include "crypto/cose_utils.h"
+#include "ds/internal_logger.h"
+#include "node/js_policy.h"
 #include "node/uvm_endorsements.h"
 
 namespace ccf
@@ -18,9 +30,9 @@ namespace ccf
   {
     // Uses KV-defined roots of trust (did -> (feed, svn)) to verify the
     // UVM measurement against endorsements in the quote.
-    std::vector<UVMEndorsements> uvm_roots_of_trust_from_kv;
-    auto uvmes = tx.ro<SNPUVMEndorsements>(Tables::NODE_SNP_UVM_ENDORSEMENTS);
-    if (uvmes)
+    std::vector<pal::UVMEndorsements> uvm_roots_of_trust_from_kv;
+    auto* uvmes = tx.ro<SNPUVMEndorsements>(Tables::NODE_SNP_UVM_ENDORSEMENTS);
+    if (uvmes != nullptr)
     {
       uvmes->foreach(
         [&uvm_roots_of_trust_from_kv](
@@ -28,7 +40,7 @@ namespace ccf
           for (const auto& [feed, data] : endorsements_map)
           {
             uvm_roots_of_trust_from_kv.push_back(
-              UVMEndorsements{did, feed, data.svn});
+              pal::UVMEndorsements{did, feed, data.svn});
           }
           return true;
         });
@@ -36,8 +48,9 @@ namespace ccf
 
     try
     {
-      auto uvm_endorsements_data = verify_uvm_endorsements(
-        uvm_endorsements, quote_measurement, uvm_roots_of_trust_from_kv);
+      auto uvm_endorsements_data =
+        verify_uvm_endorsements_against_roots_of_trust(
+          uvm_endorsements, quote_measurement, uvm_roots_of_trust_from_kv);
       return true;
     }
     catch (const std::logic_error& e)
@@ -58,8 +71,17 @@ namespace ccf
       case QuoteFormat::oe_sgx_v1:
       {
         if (!tx.ro<CodeIDs>(Tables::NODE_CODE_IDS)
-               ->get(pal::SgxAttestationMeasurement(quote_measurement))
-               .has_value())
+               ->has(pal::SgxAttestationMeasurement(quote_measurement)))
+        {
+          return QuoteVerificationResult::FailedMeasurementNotFound;
+        }
+        break;
+      }
+      case QuoteFormat::insecure_virtual:
+      {
+        if (!tx.ro<VirtualMeasurements>(Tables::NODE_VIRTUAL_MEASUREMENTS)
+               ->has(pal::VirtualAttestationMeasurement(
+                 quote_measurement.data.begin(), quote_measurement.data.end())))
         {
           return QuoteVerificationResult::FailedMeasurementNotFound;
         }
@@ -80,8 +102,7 @@ namespace ccf
         else
         {
           if (!tx.ro<SnpMeasurements>(Tables::NODE_SNP_MEASUREMENTS)
-                 ->get(pal::SnpAttestationMeasurement(quote_measurement))
-                 .has_value())
+                 ->has(pal::SnpAttestationMeasurement(quote_measurement)))
           {
             return QuoteVerificationResult::FailedMeasurementNotFound;
           }
@@ -129,54 +150,436 @@ namespace ccf
     return measurement;
   }
 
-  std::optional<HostData> AttestationProvider::get_host_data(
+  std::optional<pal::snp::Attestation> AttestationProvider::get_snp_attestation(
     const QuoteInfo& quote_info)
   {
     if (quote_info.format != QuoteFormat::amd_sev_snp_v1)
     {
       return std::nullopt;
     }
-
-    HostData digest{};
-    HostData::Representation rep{};
-    pal::PlatformAttestationMeasurement d = {};
-    pal::PlatformAttestationReportData r = {};
     try
     {
+      pal::PlatformAttestationMeasurement d = {};
+      pal::PlatformAttestationReportData r = {};
       pal::verify_quote(quote_info, d, r);
-      auto quote = *reinterpret_cast<const pal::snp::Attestation*>(
+      auto attestation = *reinterpret_cast<const pal::snp::Attestation*>(
         quote_info.quote.data());
-      std::copy(
-        std::begin(quote.host_data), std::end(quote.host_data), rep.begin());
+      return attestation;
     }
     catch (const std::exception& e)
     {
-      LOG_FAIL_FMT("Failed to verify attestation report: {}", e.what());
+      LOG_FAIL_FMT("Failed to verify local attestation report: {}", e.what());
       return std::nullopt;
     }
+  }
 
-    return digest.from_representation(rep);
+  std::optional<HostData> AttestationProvider::get_host_data(
+    const QuoteInfo& quote_info)
+  {
+    switch (quote_info.format)
+    {
+      case QuoteFormat::insecure_virtual:
+      {
+        auto j = ccf::parse_json_safe(quote_info.quote);
+
+        auto it = j.find("host_data");
+        if (it != j.end())
+        {
+          const auto host_data = it->get<std::string>();
+          return ccf::crypto::Sha256Hash::from_hex_string(host_data);
+        }
+
+        LOG_FAIL_FMT(
+          "No security policy in virtual attestation from which to derive host "
+          "data");
+        return std::nullopt;
+      }
+
+      case QuoteFormat::amd_sev_snp_v1:
+      {
+        HostData::Representation rep{};
+        pal::PlatformAttestationMeasurement d = {};
+        pal::PlatformAttestationReportData r = {};
+        try
+        {
+          pal::verify_quote(quote_info, d, r);
+          auto quote = *reinterpret_cast<const pal::snp::Attestation*>(
+            quote_info.quote.data());
+          std::copy(
+            std::begin(quote.host_data),
+            std::end(quote.host_data),
+            rep.begin());
+        }
+        catch (const std::exception& e)
+        {
+          LOG_FAIL_FMT("Failed to verify attestation report: {}", e.what());
+          return std::nullopt;
+        }
+
+        return HostData::from_representation(rep);
+      }
+      case QuoteFormat::oe_sgx_v1:
+      {
+        return std::nullopt;
+      }
+    }
   }
 
   QuoteVerificationResult verify_host_data_against_store(
-    ccf::kv::ReadOnlyTx& tx, const QuoteInfo& quote_info)
+    ccf::kv::ReadOnlyTx& tx,
+    const QuoteInfo& quote_info,
+    std::optional<HostData>& host_data)
   {
-    if (quote_info.format != QuoteFormat::amd_sev_snp_v1)
+    if (
+      quote_info.format != QuoteFormat::amd_sev_snp_v1 &&
+      quote_info.format != QuoteFormat::insecure_virtual)
     {
       throw std::logic_error(
         "Attempted to verify host data for an unsupported platform");
     }
 
-    auto host_data = AttestationProvider::get_host_data(quote_info);
+    host_data = AttestationProvider::get_host_data(quote_info);
     if (!host_data.has_value())
     {
       return QuoteVerificationResult::FailedHostDataDigestNotFound;
     }
 
-    auto accepted_policies_table = tx.ro<SnpHostDataMap>(Tables::HOST_DATA);
-    auto accepted_policy = accepted_policies_table->get(host_data.value());
-    if (!accepted_policy.has_value())
+    bool accepted_policy = false;
+
+    if (quote_info.format == QuoteFormat::insecure_virtual)
     {
+      auto* accepted_policies_table =
+        tx.ro<VirtualHostDataMap>(Tables::VIRTUAL_HOST_DATA);
+      accepted_policy = accepted_policies_table->contains(host_data.value());
+    }
+    else if (quote_info.format == QuoteFormat::amd_sev_snp_v1)
+    {
+      auto* accepted_policies_table = tx.ro<SnpHostDataMap>(Tables::HOST_DATA);
+      accepted_policy = accepted_policies_table->has(host_data.value());
+    }
+
+    if (!accepted_policy)
+    {
+      return QuoteVerificationResult::FailedInvalidHostData;
+    }
+
+    return QuoteVerificationResult::Verified;
+  }
+
+  QuoteVerificationResult verify_tcb_version_against_store(
+    ccf::kv::ReadOnlyTx& tx, const QuoteInfo& quote_info)
+  {
+    if (quote_info.format != QuoteFormat::amd_sev_snp_v1)
+    {
+      return QuoteVerificationResult::Verified;
+    }
+
+    pal::PlatformAttestationMeasurement d = {};
+    pal::PlatformAttestationReportData r = {};
+    pal::verify_quote(quote_info, d, r);
+    auto attestation =
+      *reinterpret_cast<const pal::snp::Attestation*>(quote_info.quote.data());
+
+    std::optional<pal::snp::TcbVersionPolicy> min_tcb_opt = std::nullopt;
+    auto* h = tx.ro<SnpTcbVersionMap>(Tables::SNP_TCB_VERSIONS);
+    h->foreach(
+      [&min_tcb_opt, &attestation](
+        const std::string& cpuid_hex, const pal::snp::TcbVersionPolicy& v) {
+        auto cpuid = pal::snp::cpuid_from_hex(cpuid_hex);
+        if (
+          cpuid.get_family_id() == attestation.cpuid_fam_id &&
+          cpuid.get_model_id() == attestation.cpuid_mod_id &&
+          cpuid.stepping == attestation.cpuid_step)
+        {
+          min_tcb_opt = v;
+          return false;
+        }
+        return true;
+      });
+
+    if (!min_tcb_opt.has_value())
+    {
+      return QuoteVerificationResult::FailedInvalidCPUID;
+    }
+    // CPUID of the attested cpu must now be equal to the min_tcb_opt's cpuid
+
+    auto product_family = pal::snp::get_sev_snp_product(
+      attestation.cpuid_fam_id, attestation.cpuid_mod_id);
+    auto attestation_tcb_policy =
+      attestation.reported_tcb.to_policy(product_family);
+
+    if (pal::snp::TcbVersionPolicy::is_valid(
+          min_tcb_opt.value(), attestation_tcb_policy))
+    {
+      return QuoteVerificationResult::Verified;
+    }
+    return QuoteVerificationResult::FailedInvalidTcbVersion;
+  }
+
+  namespace
+  {
+    ccf::crypto::Pem resolve_pubkey_from_x5chain_and_issuer(
+      const std::vector<std::vector<uint8_t>>& x5chain,
+      const std::string& issuer_did)
+    {
+      std::vector<std::string> pem_chain;
+      pem_chain.reserve(x5chain.size());
+      for (const auto& c : x5chain)
+      {
+        pem_chain.emplace_back(ccf::crypto::cert_der_to_pem(c).str());
+      }
+
+      auto jwk =
+        ccf::parse_json_safe(didx509::resolve_jwk(pem_chain, issuer_did, true));
+      auto generic_jwk = jwk.get<ccf::crypto::JsonWebKey>();
+
+      if (generic_jwk.kty != ccf::crypto::JsonWebKeyType::EC)
+      {
+        throw std::logic_error(fmt::format(
+          "Unsupported key type ({}) for DID {}", generic_jwk.kty, issuer_did));
+      }
+
+      auto ec_jwk = jwk.get<ccf::crypto::JsonWebKeyECPublic>();
+      return ccf::crypto::make_ec_public_key(ec_jwk)->public_key_pem();
+    }
+
+    // Verify the COSE_Sign1 signature and that the payload matches the
+    // expected host_data.  Returns the decoded protected header on success.
+    cose::Sign1ProtectedHeader verify_ts_signature_and_payload(
+      const ccf::cbor::Value& cose_array, const HostData& host_data)
+    {
+      const auto& phdr_raw = ccf::cbor::rethrow_with_msg(
+        [&]() -> const ccf::cbor::Value& { return cose_array->array_at(0); },
+        "COSE_Sign1 protected header");
+      auto phdr_cbor = ccf::cbor::rethrow_with_msg(
+        [&]() { return ccf::cbor::parse(phdr_raw->as_bytes()); },
+        "Parse protected header");
+
+      auto h = cose::decode_sign1_protected_header(phdr_cbor);
+
+      if (h.x5chain.empty())
+      {
+        throw std::logic_error(
+          "No certificates in transparent statement x5chain");
+      }
+      if (h.cwt.iss.empty())
+      {
+        throw std::logic_error("No CWT issuer in transparent statement");
+      }
+
+      cose::validate_cwt_iat_against_x5chain(
+        h.cwt, h.x5chain, "code transparent statement");
+
+      auto pubk = resolve_pubkey_from_x5chain_and_issuer(h.x5chain, h.cwt.iss);
+      auto verifier = ccf::crypto::make_cose_verifier_from_key(pubk);
+
+      auto payload = ccf::cbor::rethrow_with_msg(
+        [&]() { return cose_array->array_at(2)->as_bytes(); },
+        "COSE_Sign1 payload");
+      auto sig_bytes = ccf::cbor::rethrow_with_msg(
+        [&]() { return cose_array->array_at(3)->as_bytes(); },
+        "COSE_Sign1 signature");
+
+      if (!verifier->verify_decomposed(
+            phdr_raw->as_bytes(), payload, sig_bytes, h.alg))
+      {
+        throw std::logic_error(
+          "Transparent statement signature verification failed");
+      }
+
+      if (
+        payload.size() != HostData::SIZE ||
+        std::memcmp(payload.data(), host_data.h.data(), HostData::SIZE) != 0)
+      {
+        throw std::logic_error(fmt::format(
+          "Transparent statement payload ({}) does not match host_data ({})",
+          ccf::ds::to_hex(payload),
+          host_data.hex_str()));
+      }
+
+      return h;
+    }
+
+    // Parse and verify all receipts attached to the transparent statement.
+    // Returns the collected policy inputs for each receipt.
+    std::vector<ccf::policy::ReceiptPolicyInput> verify_ts_receipts(
+      const std::vector<uint8_t>& ts_raw,
+      const ccf::cbor::Value& cose_array,
+      std::shared_ptr<NetworkIdentitySubsystemInterface>
+        network_identity_subsystem)
+    {
+      const auto& uhdr = ccf::cbor::rethrow_with_msg(
+        [&]() -> const ccf::cbor::Value& { return cose_array->array_at(1); },
+        "Parse transparent statement unprotected header");
+
+      const auto& receipts_array = ccf::cbor::rethrow_with_msg(
+        [&]() -> const ccf::cbor::Value& {
+          return uhdr->map_at(
+            ccf::cbor::make_signed(ccf::cose::header::iana::VDP));
+        },
+        "Parse receipts array from unprotected header");
+
+      const auto num_receipts = receipts_array->size();
+      if (num_receipts == 0)
+      {
+        throw std::logic_error("No receipts in transparent statement");
+      }
+
+      if (!network_identity_subsystem)
+      {
+        throw std::logic_error(
+          "Network identity subsystem not available for receipt "
+          "verification");
+      }
+
+      auto signed_statement = ccf::cose::edit::set_unprotected_header(
+        ts_raw, ccf::cose::edit::desc::Empty{});
+      auto expected_claims_digest = ccf::crypto::Sha256Hash(signed_statement);
+
+      std::vector<ccf::policy::ReceiptPolicyInput> inputs;
+
+      for (size_t i = 0; i < num_receipts; ++i)
+      {
+        const auto& receipt_bytes = ccf::cbor::rethrow_with_msg(
+          [&]() { return receipts_array->array_at(i)->as_bytes(); },
+          fmt::format("Extract receipt {} from array", i));
+
+        std::vector<uint8_t> receipt_raw(
+          receipt_bytes.begin(), receipt_bytes.end());
+
+        auto receipt_cbor = ccf::cbor::rethrow_with_msg(
+          [&]() { return ccf::cbor::parse(receipt_raw); },
+          fmt::format("Parse receipt {} COSE envelope", i));
+
+        const auto& receipt_envelope = ccf::cbor::rethrow_with_msg(
+          [&]() -> const ccf::cbor::Value& {
+            return receipt_cbor->tag_at(ccf::cbor::tag::COSE_SIGN_1);
+          },
+          fmt::format("Parse receipt {} COSE_Sign1 tag", i));
+
+        auto receipt_phdr_raw = ccf::cbor::rethrow_with_msg(
+          [&]() -> const ccf::cbor::Value& {
+            return receipt_envelope->array_at(0);
+          },
+          fmt::format("Parse receipt {} protected header bytes", i));
+        auto receipt_phdr_cbor = ccf::cbor::rethrow_with_msg(
+          [&]() { return ccf::cbor::parse(receipt_phdr_raw->as_bytes()); },
+          fmt::format("Decode receipt {} protected header", i));
+        auto decoded_receipt_phdr =
+          cose::decode_ccf_receipt_phdr(receipt_phdr_cbor);
+
+        auto proofs = cose::decode_merkle_proofs(receipt_envelope);
+        if (proofs.empty())
+        {
+          throw std::logic_error(
+            fmt::format("No Merkle proofs found in receipt {}", i));
+        }
+
+        for (const auto& proof : proofs)
+        {
+          if (
+            proof.leaf.claims_digest.size() != ccf::crypto::Sha256Hash::SIZE ||
+            std::memcmp(
+              proof.leaf.claims_digest.data(),
+              expected_claims_digest.h.data(),
+              ccf::crypto::Sha256Hash::SIZE) != 0)
+          {
+            throw std::logic_error(fmt::format(
+              "Receipt {} claims_digest ({}) does not match signed "
+              "statement hash ({})",
+              i,
+              ccf::ds::to_hex(proof.leaf.claims_digest),
+              expected_claims_digest.hex_str()));
+          }
+        }
+
+        std::vector<cose::Leaf> receipt_leaves;
+        receipt_leaves.reserve(proofs.size());
+        for (const auto& proof : proofs)
+        {
+          receipt_leaves.push_back(proof.leaf);
+        }
+        inputs.push_back(
+          {std::move(decoded_receipt_phdr), std::move(receipt_leaves)});
+
+        ccf::historical::verify_self_issued_receipt(
+          receipt_raw, network_identity_subsystem);
+      }
+
+      return inputs;
+    }
+
+    // Look up the code update policy from the KV store and evaluate it
+    // against the transparent statement inputs.
+    void apply_code_update_policy(
+      ccf::kv::ReadOnlyTx& tx,
+      const cose::Sign1ProtectedHeader& phdr,
+      std::vector<ccf::policy::ReceiptPolicyInput> receipt_inputs)
+    {
+      auto* policy_table = tx.ro<CodeUpdatePolicy>(Tables::NODE_JOIN_POLICY);
+      if (policy_table == nullptr)
+      {
+        throw std::logic_error("No code update policy table available");
+      }
+
+      auto policy_script = policy_table->get();
+      if (!policy_script.has_value())
+      {
+        throw std::logic_error("No code update policy set");
+      }
+
+      std::vector<ccf::policy::TransparentStatementPolicyInput> inputs;
+      inputs.push_back({phdr, std::move(receipt_inputs)});
+
+      std::optional<std::string> violation;
+      try
+      {
+        violation =
+          ccf::policy::apply_node_join_policy(policy_script.value(), inputs);
+      }
+      catch (const std::runtime_error& e)
+      {
+        throw std::logic_error(
+          fmt::format("Failed to populate JS policy inputs: {}", e.what()));
+      }
+      if (violation.has_value())
+      {
+        throw std::logic_error(fmt::format(
+          "Code update policy rejected transparent statement: {}",
+          violation.value()));
+      }
+    }
+  }
+
+  QuoteVerificationResult verify_code_transparent_statement(
+    ccf::kv::ReadOnlyTx& tx,
+    const std::vector<uint8_t>& ts_raw,
+    const HostData& host_data,
+    std::shared_ptr<NetworkIdentitySubsystemInterface>
+      network_identity_subsystem)
+  {
+    try
+    {
+      auto parsed = ccf::cbor::rethrow_with_msg(
+        [&]() { return ccf::cbor::parse(ts_raw); },
+        "Transparent statement COSE envelope");
+
+      const auto& cose_array = ccf::cbor::rethrow_with_msg(
+        [&]() -> const ccf::cbor::Value& {
+          return parsed->tag_at(ccf::cbor::tag::COSE_SIGN_1);
+        },
+        "COSE_Sign1 tag");
+
+      auto phdr = verify_ts_signature_and_payload(cose_array, host_data);
+
+      auto receipt_inputs =
+        verify_ts_receipts(ts_raw, cose_array, network_identity_subsystem);
+
+      apply_code_update_policy(tx, phdr, std::move(receipt_inputs));
+    }
+    catch (const std::exception& e)
+    {
+      LOG_FAIL_FMT("Failed to verify code transparent statement: {}", e.what());
       return QuoteVerificationResult::FailedInvalidHostData;
     }
 
@@ -187,7 +590,10 @@ namespace ccf
     ccf::kv::ReadOnlyTx& tx,
     const QuoteInfo& quote_info,
     const std::vector<uint8_t>& expected_node_public_key_der,
-    pal::PlatformAttestationMeasurement& measurement)
+    pal::PlatformAttestationMeasurement& measurement,
+    const std::optional<std::vector<uint8_t>>& code_transparent_statement,
+    std::shared_ptr<NetworkIdentitySubsystemInterface>
+      network_identity_subsystem)
   {
     ccf::crypto::Sha256Hash quoted_hash;
     pal::PlatformAttestationReportData report_data;
@@ -202,22 +608,40 @@ namespace ccf
       return QuoteVerificationResult::Failed;
     }
 
-    if (quote_info.format == QuoteFormat::insecure_virtual)
+    std::optional<HostData> host_data{std::nullopt};
+    auto rc = verify_host_data_against_store(tx, quote_info, host_data);
+    if (rc == QuoteVerificationResult::FailedInvalidHostData)
     {
-      LOG_INFO_FMT("Skipped attestation report verification");
-      return QuoteVerificationResult::Verified;
-    }
-    else if (quote_info.format == QuoteFormat::amd_sev_snp_v1)
-    {
-      auto rc = verify_host_data_against_store(tx, quote_info);
-      if (rc != QuoteVerificationResult::Verified)
+      if (code_transparent_statement.has_value())
       {
-        return rc;
+        if (!host_data.has_value())
+        {
+          // It must not happen after verify_host_data_against_store returns
+          // FailedInvalidHostData, but let's handle gracefully.
+          return QuoteVerificationResult::FailedHostDataDigestNotFound;
+        }
+
+        rc = verify_code_transparent_statement(
+          tx,
+          code_transparent_statement.value(),
+          host_data.value(),
+          network_identity_subsystem);
       }
     }
 
-    auto rc = verify_enclave_measurement_against_store(
+    if (rc != QuoteVerificationResult::Verified)
+    {
+      return rc;
+    }
+
+    rc = verify_enclave_measurement_against_store(
       tx, measurement, quote_info.format, quote_info.uvm_endorsements);
+    if (rc != QuoteVerificationResult::Verified)
+    {
+      return rc;
+    }
+
+    rc = verify_tcb_version_against_store(tx, quote_info);
     if (rc != QuoteVerificationResult::Verified)
     {
       return rc;

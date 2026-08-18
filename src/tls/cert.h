@@ -2,8 +2,9 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "crypto/openssl/key_pair.h"
-#include "crypto/openssl/openssl_wrappers.h"
+#include "ccf/crypto/openssl/openssl_wrappers.h"
+#include "crypto/openssl/ec_key_pair.h"
+#include "ds/internal_logger.h"
 #include "tls/ca.h"
 
 #include <cstring>
@@ -29,18 +30,18 @@ namespace tls
 
     Unique_X509 own_cert;
     Unique_STACK_OF_X509 chain;
-    std::shared_ptr<ccf::crypto::KeyPair_OpenSSL> own_pkey;
+    std::shared_ptr<ccf::crypto::ECKeyPair_OpenSSL> own_pkey;
     bool has_own_cert = false;
 
   public:
     Cert(
       std::shared_ptr<CA> peer_ca_,
-      const std::optional<ccf::crypto::Pem>& own_cert_ = std::nullopt,
-      const std::optional<ccf::crypto::Pem>& own_pkey_ = std::nullopt,
-      const std::optional<std::string>& peer_hostname_ = std::nullopt,
+      std::optional<ccf::crypto::Pem> own_cert_ = std::nullopt,
+      std::optional<ccf::crypto::Pem> own_pkey_ = std::nullopt,
+      std::optional<std::string> peer_hostname_ = std::nullopt,
       bool auth_required_ = true) :
-      peer_ca(peer_ca_),
-      peer_hostname(peer_hostname_),
+      peer_ca(std::move(peer_ca_)),
+      peer_hostname(std::move(peer_hostname_)),
       auth_required(auth_required_)
     {
       if (own_cert_.has_value() && own_pkey_.has_value())
@@ -52,7 +53,8 @@ namespace tls
         {
           Unique_BIO certbio(certs[0]);
           own_cert = Unique_X509(certbio, true);
-          own_pkey = std::make_shared<ccf::crypto::KeyPair_OpenSSL>(*own_pkey_);
+          own_pkey =
+            std::make_shared<ccf::crypto::ECKeyPair_OpenSSL>(*own_pkey_);
         }
 
         if (certs.size() > 1)
@@ -62,7 +64,7 @@ namespace tls
             Unique_BIO certbio(*it);
             Unique_X509 cert(certbio, true);
 
-            CHECK1(sk_X509_push(chain, cert));
+            CHECKPOSITIVE(sk_X509_push(chain, cert));
             CHECK1(X509_up_ref(cert));
           }
         }
@@ -71,17 +73,11 @@ namespace tls
 
     ~Cert() = default;
 
-    void use(SSL* ssl, SSL_CTX* ssl_ctx)
+    void configure_context(SSL_CTX* ssl_ctx) const
     {
-      if (peer_hostname.has_value())
-      {
-        // Peer hostname for SNI
-        SSL_set_tlsext_host_name(ssl, peer_hostname->c_str());
-      }
-
       if (peer_ca)
       {
-        peer_ca->use(ssl_ctx);
+        peer_ca->configure_trusted_cert_store(ssl_ctx);
       }
 
       if (auth_required)
@@ -92,7 +88,6 @@ namespace tls
           return ok;
         };
         SSL_CTX_set_verify(ssl_ctx, opts, cb);
-        SSL_set_verify(ssl, opts, cb);
       }
       else
       {
@@ -104,14 +99,21 @@ namespace tls
         // to verify it here, just request it.
         auto cb = [](int, x509_store_ctx_st*) { return 1; };
         SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, cb);
-        SSL_set_verify(ssl, SSL_VERIFY_PEER, cb);
       }
 
       if (has_own_cert)
       {
         CHECK1(
           SSL_CTX_use_cert_and_key(ssl_ctx, own_cert, *own_pkey, chain, 1));
-        CHECK1(SSL_use_cert_and_key(ssl, own_cert, *own_pkey, chain, 1));
+      }
+    }
+
+    void configure_connection(SSL* ssl) const
+    {
+      if (peer_hostname.has_value())
+      {
+        // Peer hostname for SNI
+        CHECK1(SSL_set_tlsext_host_name(ssl, peer_hostname->c_str()));
       }
     }
   };

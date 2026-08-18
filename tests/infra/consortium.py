@@ -1,29 +1,28 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import os
+import datetime
+import glob
 import http
 import json
+import os
 import random
-import re
-import infra.network
-import infra.proc
-import infra.checker
-import infra.node
-import infra.crypto
-import infra.member
-import ccf.ledger
-from infra.proposal import ProposalState
 import shutil
 import tempfile
-import glob
-import datetime
-import infra.clients
 
-from cryptography import x509
 import cryptography.hazmat.backends as crypto_backends
-
+from cryptography import x509
 from loguru import logger as LOG
+
+import infra.checker
+import infra.clients
+import infra.crypto
+import infra.member
+import infra.network
+import infra.node
+import infra.proc
+from infra.node import CCFVersion
+from infra.proposal import ProposalState
 
 
 def slurp_file(path):
@@ -51,10 +50,6 @@ class Consortium:
         common_dir,
         key_generator,
         share_script,
-        consensus,
-        members_info=None,
-        curve=None,
-        public_state=None,
         authenticate_session="COSE",
         gov_api_version=infra.member.MemberAPI.Preview_v1.API_VERSION,
     ):
@@ -62,78 +57,44 @@ class Consortium:
         self.members = []
         self.key_generator = key_generator
         self.share_script = share_script
-        self.consensus = consensus
-        self.recovery_threshold = None
+        self.recovery_threshold = 0
         self.authenticate_session = authenticate_session
         self.set_gov_api_version(gov_api_version)
-        # If a list of member IDs is passed in, generate fresh member identities.
-        # Otherwise, recover the state of the consortium from the common directory
-        # and the state of the service
-        if members_info is not None:
-            self.recovery_threshold = 0
-            for m_local_id, has_share, m_data in members_info:
-                new_member = infra.member.Member(
-                    f"member{m_local_id}",
-                    curve,
-                    common_dir,
-                    share_script,
-                    has_share,
-                    key_generator,
-                    m_data,
-                    authenticate_session=authenticate_session,
-                    gov_api_impl=self.gov_api_impl,
-                )
-                if has_share:
-                    self.recovery_threshold += 1
-                self.members.append(new_member)
-        else:
-            for f in os.listdir(self.common_dir):
-                if re.search("member(.*)_cert.pem", f) is not None:
-                    local_id = f.split("_")[0]
-                    new_member = infra.member.Member(
-                        local_id,
-                        curve,
-                        self.common_dir,
-                        share_script,
-                        is_recovery_member=os.path.isfile(
-                            os.path.join(self.common_dir, f"{local_id}_enc_privk.pem")
-                        ),
-                        authenticate_session=authenticate_session,
-                        gov_api_impl=self.gov_api_impl,
-                    )
-                    self.members.append(new_member)
-                    LOG.info(
-                        f"Successfully recovered member {local_id}: {new_member.service_id}"
-                    )
 
-            self.recovery_threshold = json.loads(
-                public_state["public:ccf.gov.service.config"][
-                    ccf.ledger.WELL_KNOWN_SINGLETON_TABLE_KEY
-                ]
-            )["recovery_threshold"]
+    def add_member(self, member):
+        self.members.append(member)
 
-            if not self.members:
-                LOG.warning("No consortium member to recover")
-                return
+    def generate_new_member(self, curve, recovery_role, member_data):
+        new_member_local_id = f"member{len(self.members)}"
+        new_member = infra.member.Member(
+            new_member_local_id,
+            self.common_dir,
+            self.share_script,
+            recovery_role=recovery_role,
+            key_generator=self.key_generator,
+            curve=curve,
+            member_data=member_data,
+            authenticate_session=self.authenticate_session,
+            gov_api_impl=self.gov_api_impl,
+        )
+        return new_member
 
-            for id_bytes, info_bytes in public_state[
-                "public:ccf.gov.members.info"
-            ].items():
-                member_id = id_bytes.decode()
-                member_info = json.loads(info_bytes)
+    def generate_existing_member(self, local_id, recovery_role):
+        new_member = infra.member.Member(
+            local_id,
+            self.common_dir,
+            self.share_script,
+            recovery_role=recovery_role,
+            authenticate_session=self.authenticate_session,
+            gov_api_impl=self.gov_api_impl,
+        )
+        return new_member
 
-                status = member_info["status"]
-                member = self.get_member_by_service_id(member_id)
-                if member:
-                    if (
-                        infra.member.MemberStatus(status)
-                        == infra.member.MemberStatus.ACTIVE
-                    ):
-                        member.set_active()
-                else:
-                    LOG.warning(
-                        f"Keys and certificates for consortium member {member_id} do not exist locally"
-                    )
+    def update_recovery_threshold_from_node(self, node):
+        with node.client() as c:
+            r = c.get("/node/service/configuration")
+            assert r.status_code == 200
+            self.recovery_threshold = r.body.json()["recovery_threshold"]
 
     def set_authenticate_session(self, flag):
         self.authenticate_session = flag
@@ -144,16 +105,12 @@ class Consortium:
         for cls in (
             infra.member.MemberAPI.Preview_v1,
             infra.member.MemberAPI.v1,
-            infra.member.MemberAPI.Classic,
         ):
             if version_s == cls.API_VERSION:
                 self.gov_api_impl = cls
                 break
         else:
-            LOG.warning(
-                f"No gov API version found to match '{version_s}' specified - defaulting to classic API"
-            )
-            self.gov_api_impl = infra.member.MemberAPI.Classic
+            raise ValueError(f"Unsupported gov API version: {version_s}")
 
     def make_proposal(self, proposal_name, **kwargs):
         action = {
@@ -198,35 +155,36 @@ class Consortium:
             m.ack(remote_node)
 
     def generate_and_propose_new_member(
-        self, remote_node, curve, recovery_member=True, member_data=None
+        self,
+        remote_node,
+        curve,
+        recovery_role=infra.member.RecoveryRole.Participant,
+        member_data=None,
     ):
         # The Member returned by this function is in state ACCEPTED. The new Member
         # should ACK to become active.
-        new_member_local_id = f"member{len(self.members)}"
-        new_member = infra.member.Member(
-            new_member_local_id,
-            curve,
-            self.common_dir,
-            self.share_script,
-            is_recovery_member=recovery_member,
-            key_generator=self.key_generator,
-            authenticate_session=self.authenticate_session,
-            gov_api_impl=self.gov_api_impl,
+        new_member = self.generate_new_member(
+            curve=curve,
+            recovery_role=recovery_role,
+            member_data=member_data,
         )
 
         proposal_body, careful_vote = self.make_proposal(
             "set_member",
             cert=slurp_file(
-                os.path.join(self.common_dir, f"{new_member_local_id}_cert.pem")
+                os.path.join(self.common_dir, f"{new_member.local_id}_cert.pem")
             ),
             encryption_pub_key=(
                 slurp_file(
-                    os.path.join(self.common_dir, f"{new_member_local_id}_enc_pubk.pem")
+                    os.path.join(self.common_dir, f"{new_member.local_id}_enc_pubk.pem")
                 )
-                if recovery_member
+                if recovery_role != infra.member.RecoveryRole.NonParticipant
                 else None
             ),
             member_data=member_data,
+            recovery_role=(
+                "Owner" if recovery_role == infra.member.RecoveryRole.Owner else None
+            ),
         )
 
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
@@ -235,16 +193,20 @@ class Consortium:
         return (proposal, new_member, careful_vote)
 
     def generate_and_add_new_member(
-        self, remote_node, curve, recovery_member=True, member_data=None
+        self,
+        remote_node,
+        curve,
+        recovery_role=infra.member.RecoveryRole.Participant,
+        member_data=None,
     ):
         proposal, new_member, careful_vote = self.generate_and_propose_new_member(
-            remote_node, curve, recovery_member, member_data
+            remote_node, curve, recovery_role, member_data
         )
         self.vote_using_majority(remote_node, proposal, careful_vote)
 
         # If the member was successfully registered, add it to the
         # local list of consortium members
-        self.members.append(new_member)
+        self.add_member(new_member)
         return new_member
 
     def get_members_info(self):
@@ -256,25 +218,43 @@ class Consortium:
     def get_active_members(self):
         return [member for member in self.members if member.is_active()]
 
-    def get_active_recovery_members(self):
+    def get_active_recovery_participants(self):
         return [
             member
             for member in self.members
-            if (member.is_active() and member.is_recovery_member)
+            if (
+                member.is_active()
+                and member.recovery_role == infra.member.RecoveryRole.Participant
+            )
+        ]
+
+    def get_active_recovery_owners(self):
+        return [
+            member
+            for member in self.members
+            if (
+                member.is_active()
+                and member.recovery_role == infra.member.RecoveryRole.Owner
+            )
         ]
 
     def get_active_non_recovery_members(self):
         return [
             member
             for member in self.members
-            if (member.is_active() and not member.is_recovery_member)
+            if (
+                member.is_active()
+                and member.recovery_role == infra.member.RecoveryRole.NonParticipant
+            )
         ]
 
-    def get_any_active_member(self, recovery_member=None):
-        if recovery_member is not None:
-            if recovery_member is True:
-                return random.choice(self.get_active_recovery_members())
-            elif recovery_member is False:
+    def get_any_active_member(self, recovery_role=None):
+        if recovery_role is not None:
+            if recovery_role is infra.member.RecoveryRole.Owner:
+                return random.choice(self.get_active_recovery_owners())
+            elif recovery_role is infra.member.RecoveryRole.Participant:
+                return random.choice(self.get_active_recovery_participants())
+            else:
                 return random.choice(self.get_active_non_recovery_members())
         else:
             return random.choice(self.get_active_members())
@@ -292,7 +272,7 @@ class Consortium:
         )
 
     def vote_using_majority(
-        self, remote_node, proposal, ballot, wait_for_commit=True, timeout=5
+        self, remote_node, proposal, ballot, wait_for_commit=True, timeout=10
     ):
         response = None
 
@@ -337,6 +317,19 @@ class Consortium:
             )
             raise infra.proposal.ProposalNotAccepted(proposal, response)
 
+        raw = self.get_proposal_raw(remote_node, proposal.proposal_id)
+        assert (
+            "finalVotes" in raw
+        ), f"Expected finalVotes field to be present, got: {raw}"
+        final_votes = raw["finalVotes"]
+        for voter_id in proposal.voters:
+            assert (
+                voter_id in final_votes
+            ), f"Voter {voter_id} not found in finalVotes: {final_votes}"
+            assert (
+                final_votes[voter_id] is True
+            ), f"Voter {voter_id} vote is not true: {final_votes[voter_id]}"
+
         return proposal
 
     def get_proposal_raw(self, remote_node, proposal_id):
@@ -358,6 +351,25 @@ class Consortium:
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         self.vote_using_majority(remote_node, proposal, careful_vote)
         return pending
+
+    def retire_node_by_id(self, remote_node, node_id):
+        """
+        Submit a remove_node governance proposal for a node identified only
+        by its id. Used when we have no Node object -- e.g. a synthetic
+        identity introduced via Network.fake_join that has no managed
+        process and was never added to Network.nodes.
+
+        Skips the PENDING-status probe and the post-acceptance
+        removable_nodes / Network.nodes bookkeeping that retire_node does:
+        for a node that never started, those steps are unnecessary.
+        """
+        LOG.info(f"Retiring node by id {node_id}")
+        proposal_body, careful_vote = self.make_proposal(
+            "remove_node",
+            node_id=node_id,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        self.vote_using_majority(remote_node, proposal, careful_vote)
 
     def trust_nodes(
         self,
@@ -392,16 +404,50 @@ class Consortium:
         validity_period_days=None,
         **kwargs,
     ):
+        """
+        Single-node convenience wrapper around replace_nodes.
+        """
+        self.replace_nodes(
+            remote_node,
+            [node_to_retire],
+            [node_to_add],
+            valid_from,
+            validity_period_days,
+            **kwargs,
+        )
+
+    def replace_nodes(
+        self,
+        remote_node,
+        nodes_to_retire,
+        nodes_to_add,
+        valid_from,
+        validity_period_days=None,
+        **kwargs,
+    ):
+        """
+        Atomically trust pending replacement nodes and retire existing nodes in
+        a single governance proposal.
+
+        :param remote_node: Node used to submit and vote on the proposal.
+        :param nodes_to_retire: Existing trusted nodes to retire.
+        :param nodes_to_add: Pending replacement nodes to trust.
+        :param valid_from: Certificate validity start time for replacement nodes.
+        :param validity_period_days: Optional certificate validity period.
+        :param kwargs: Additional arguments forwarded to vote_using_majority.
+        """
         proposal_body = {"actions": []}
-        trust_args = {"node_id": node_to_add.node_id, "valid_from": str(valid_from)}
-        if validity_period_days is not None:
-            trust_args["validity_period_days"] = validity_period_days
-        proposal_body["actions"].append(
-            {"name": "transition_node_to_trusted", "args": trust_args}
-        )
-        proposal_body["actions"].append(
-            {"name": "remove_node", "args": {"node_id": node_to_retire.node_id}}
-        )
+        for node_to_add in nodes_to_add:
+            trust_args = {"node_id": node_to_add.node_id, "valid_from": str(valid_from)}
+            if validity_period_days is not None:
+                trust_args["validity_period_days"] = validity_period_days
+            proposal_body["actions"].append(
+                {"name": "transition_node_to_trusted", "args": trust_args}
+            )
+        for node_to_retire in nodes_to_retire:
+            proposal_body["actions"].append(
+                {"name": "remove_node", "args": {"node_id": node_to_retire.node_id}}
+            )
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         self.vote_using_majority(
             remote_node,
@@ -457,7 +503,7 @@ class Consortium:
             proposal["actions"].append({"name": "set_user", "args": {"cert": cert}})
 
         args = {}
-        if remote_node.version_after("ccf-2.0.0-rc3"):
+        if CCFVersion(remote_node.version) > CCFVersion("ccf-2.0.0-rc3"):
             args = {"args": {"next_service_identity": self.get_service_identity()}}
         proposal["actions"].append({"name": "transition_service_to_open", **args})
 
@@ -515,8 +561,11 @@ class Consortium:
 
     def set_constitution(self, remote_node, constitution_paths):
         concatenated = "\n".join(slurp_file(path) for path in constitution_paths)
+        return self.set_constitution_raw(remote_node, concatenated)
+
+    def set_constitution_raw(self, remote_node, constitution_value):
         proposal_body, careful_vote = self.make_proposal(
-            "set_constitution", constitution=concatenated
+            "set_constitution", constitution=constitution_value
         )
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
@@ -543,7 +592,7 @@ class Consortium:
             metadata = json.load(f)
 
         # sanity checks
-        module_paths = set(module["name"] for module in modules)
+        module_paths = {module["name"] for module in modules}
         for url, methods in metadata["endpoints"].items():
             for method, endpoint in methods.items():
                 module_path = endpoint["js_module"]
@@ -682,7 +731,7 @@ class Consortium:
                 is_recovery = False
 
         args = {}
-        if remote_node.version_after("ccf-2.0.0-rc3"):
+        if CCFVersion(remote_node.version) > CCFVersion("ccf-2.0.0-rc3"):
             args = {
                 "previous_service_identity": previous_service_identity,
                 "next_service_identity": self.get_service_identity(),
@@ -706,7 +755,7 @@ class Consortium:
         with remote_node.client() as nc:
             check_commit = infra.checker.Checker(nc)
 
-            for m in self.get_active_recovery_members():
+            for m in self.get_active_recovery_participants():
                 r = m.get_and_submit_recovery_share(remote_node)
                 submitted_shares_count += 1
                 check_commit(r)
@@ -721,6 +770,20 @@ class Consortium:
                 else:
                     assert "End of recovery procedure initiated" not in r.body.text()
 
+    def recover_with_owner_share(self, remote_node):
+        submitted_shares_count = 0
+        with remote_node.client() as nc:
+            check_commit = infra.checker.Checker(nc)
+
+            m = self.get_any_active_member(
+                recovery_role=infra.member.RecoveryRole.Owner
+            )
+            r = m.get_and_submit_recovery_share(remote_node)
+            submitted_shares_count += 1
+            check_commit(r)
+            assert "Full recovery key successfully submitted" in r.body.text()
+            assert "End of recovery procedure initiated" in r.body.text()
+
     def set_recovery_threshold(self, remote_node, recovery_threshold):
         proposal_body, careful_vote = self.make_proposal(
             "set_recovery_threshold", recovery_threshold=recovery_threshold
@@ -732,9 +795,17 @@ class Consortium:
             self.recovery_threshold = recovery_threshold
         return r
 
-    def add_new_code(self, remote_node, new_code_id):
+    def add_measurement(self, remote_node, platform, measurement):
+        if platform == "virtual":
+            return self.add_virtual_measurement(remote_node, measurement)
+        elif platform == "snp":
+            return self.add_snp_measurement(remote_node, measurement)
+        else:
+            raise ValueError(f"Unsupported platform {platform}")
+
+    def add_virtual_measurement(self, remote_node, measurement):
         proposal_body, careful_vote = self.make_proposal(
-            "add_node_code", code_id=new_code_id
+            "add_virtual_measurement", measurement=measurement
         )
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
@@ -753,9 +824,17 @@ class Consortium:
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
 
-    def retire_code(self, remote_node, code_id):
+    def remove_measurement(self, remote_node, platform, measurement):
+        if platform == "virtual":
+            return self.remove_virtual_measurement(remote_node, measurement)
+        elif platform == "snp":
+            return self.remove_snp_measurement(remote_node, measurement)
+        else:
+            raise ValueError(f"Unsupported platform {platform}")
+
+    def remove_virtual_measurement(self, remote_node, measurement):
         proposal_body, careful_vote = self.make_proposal(
-            "remove_node_code", code_id=code_id
+            "remove_virtual_measurement", measurement=measurement
         )
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
@@ -774,24 +853,101 @@ class Consortium:
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
 
-    def add_new_host_data(
+    def add_host_data(self, remote_node, platform, host_data_key, host_data_value=""):
+        if platform == "virtual":
+            return self.add_virtual_host_data(remote_node, host_data_key)
+        elif platform == "snp":
+            return self.add_snp_host_data(remote_node, host_data_key, host_data_value)
+        else:
+            raise ValueError(f"Unsupported platform {platform}")
+
+    def add_virtual_host_data(
         self,
         remote_node,
-        new_security_policy,
-        new_host_data,
+        host_data_key,
     ):
         proposal_body, careful_vote = self.make_proposal(
-            "add_snp_host_data",
-            security_policy=new_security_policy,
-            host_data=new_host_data,
+            "add_virtual_host_data",
+            host_data=host_data_key,
         )
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
 
-    def retire_host_data(self, remote_node, host_data):
+    def add_snp_host_data(
+        self,
+        remote_node,
+        new_host_data,
+        new_security_policy,
+    ):
+        proposal_body, careful_vote = self.make_proposal(
+            "add_snp_host_data",
+            host_data=new_host_data,
+            security_policy=new_security_policy,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
+    def set_snp_minimum_tcb_version(self, remote_node, cpuid, new_tcb_version):
+        proposal_body, careful_vote = self.make_proposal(
+            "set_snp_minimum_tcb_version",
+            cpuid=cpuid,
+            tcb_version=new_tcb_version,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
+    def set_snp_minimum_tcb_version_hex(self, remote_node, cpuid, new_tcb_version):
+        proposal_body, careful_vote = self.make_proposal(
+            "set_snp_minimum_tcb_version_hex",
+            cpuid=cpuid,
+            tcb_version=new_tcb_version,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
+    def remove_host_data(self, remote_node, platform, host_data_key):
+        if platform == "virtual":
+            return self.remove_virtual_host_data(remote_node, host_data_key)
+        elif platform == "snp":
+            return self.remove_snp_host_data(remote_node, host_data_key)
+        else:
+            raise ValueError(f"Unsupported platform {platform}")
+
+    def remove_virtual_host_data(self, remote_node, host_data):
+        proposal_body, careful_vote = self.make_proposal(
+            "remove_virtual_host_data",
+            host_data=host_data,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
+    def remove_snp_host_data(self, remote_node, host_data):
         proposal_body, careful_vote = self.make_proposal(
             "remove_snp_host_data",
             host_data=host_data,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
+    def remove_snp_minimum_tcb_version(self, remote_node, cpuid):
+        proposal_body, careful_vote = self.make_proposal(
+            "remove_snp_minimum_tcb_version",
+            cpuid=cpuid,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
+    def set_node_join_policy(self, remote_node, policy):
+        proposal_body, careful_vote = self.make_proposal(
+            "set_node_join_policy",
+            policy=policy,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
+    def remove_node_join_policy(self, remote_node):
+        proposal_body, careful_vote = self.make_proposal(
+            "remove_node_join_policy",
         )
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
@@ -806,7 +962,12 @@ class Consortium:
         return self.vote_using_majority(remote_node, proposal, careful_vote)
 
     def set_node_certificate_validity(
-        self, remote_node, node_to_renew, valid_from, validity_period_days
+        self,
+        remote_node,
+        node_to_renew,
+        valid_from,
+        validity_period_days,
+        **kwargs,
     ):
         proposal_body, careful_vote = self.make_proposal(
             "set_node_certificate_validity",
@@ -815,7 +976,7 @@ class Consortium:
             validity_period_days=validity_period_days,
         )
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
-        return self.vote_using_majority(remote_node, proposal, careful_vote)
+        return self.vote_using_majority(remote_node, proposal, careful_vote, **kwargs)
 
     def set_all_nodes_certificate_validity(
         self, remote_node, valid_from, validity_period_days
@@ -845,16 +1006,28 @@ class Consortium:
         proposal = self.get_any_active_member().propose(remote_node, proposal_body)
         return self.vote_using_majority(remote_node, proposal, careful_vote)
 
+    def cleanup_legacy_jwt_records(self, remote_node, ensure_new_records_exist=False):
+        # Submit a proposal to remove legacy JWT records
+        proposal_body, careful_vote = self.make_proposal(
+            "cleanup_legacy_jwt_records",
+            ensure_new_records_exist=ensure_new_records_exist,
+        )
+        proposal = self.get_any_active_member().propose(remote_node, proposal_body)
+        return self.vote_using_majority(remote_node, proposal, careful_vote)
+
     def check_for_service(self, remote_node, status, recovery_count=None):
         """
         Check the certificate associated with current CCF service signing key has been recorded in
         the KV store with the appropriate status.
         """
+        expected_statuses = (
+            status if isinstance(status, (list, tuple, set)) else [status]
+        )
         with remote_node.client() as c:
             r = c.get("/node/network").body.json()
             current_status = r["service_status"]
             current_cert = r["service_certificate"]
-            if remote_node.version_after("ccf-2.0.3"):
+            if CCFVersion(remote_node.version) > CCFVersion("ccf-2.0.3"):
                 current_recovery_count = r["recovery_count"]
             else:
                 assert "recovery_count" not in r
@@ -870,10 +1043,12 @@ class Consortium:
             assert (
                 current_cert == expected_cert
             ), "Current service certificate did not match with service_cert.pem"
-            assert (
-                current_status == status.value
-            ), f"Service status {current_status} (expected {status.value})"
-            if remote_node.version_after("ccf-2.0.3"):
+            expected_status_values = [status.value for status in expected_statuses]
+            assert current_status in expected_status_values, (
+                f"Service status {current_status} "
+                f"(expected one of {expected_status_values})"
+            )
+            if CCFVersion(remote_node.version) > CCFVersion("ccf-2.0.3"):
                 assert (
                     recovery_count is None or current_recovery_count == recovery_count
                 ), f"Current recovery count {current_recovery_count} is not expected {recovery_count}"

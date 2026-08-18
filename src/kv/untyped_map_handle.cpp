@@ -3,6 +3,7 @@
 
 #include "ccf/kv/untyped_map_handle.h"
 
+#include "ds/internal_logger.h"
 #include "kv/untyped_change_set.h"
 
 namespace ccf::kv::untyped
@@ -14,19 +15,18 @@ namespace ccf::kv::untyped
     auto write = tx_changes.writes.find(key);
     if (write != tx_changes.writes.end())
     {
-      if (write->second.has_value())
+      MapHandle::ValueType* ptr = nullptr;
+      auto& value_opt = write->second;
+      if (value_opt.has_value())
       {
-        return &write->second.value();
+        ptr = &(value_opt.value());
       }
-      else
-      {
-        return nullptr;
-      }
+      return ptr;
     }
 
     // If the key doesn't exist, return empty and record that we depend on
     // the key not existing.
-    const auto search = tx_changes.state.getp(key);
+    const auto* const search = tx_changes.state.getp(key);
     if (search == nullptr)
     {
       tx_changes.reads.insert(
@@ -69,11 +69,11 @@ namespace ccf::kv::untyped
 
     if (always_consider_writes || should_continue)
     {
-      for (auto write = w.begin(); write != w.end(); ++write)
+      for (auto& write : w)
       {
-        if (write->second.has_value())
+        if (write.second.has_value())
         {
-          should_continue = f(write->first, write->second.value());
+          should_continue = f(write.first, write.second.value());
         }
 
         if (!should_continue)
@@ -84,10 +84,9 @@ namespace ccf::kv::untyped
     }
   }
 
-  MapHandle::MapHandle(
-    ccf::kv::untyped::ChangeSet& cs, const std::string& map_name) :
+  MapHandle::MapHandle(ccf::kv::untyped::ChangeSet& cs, std::string map_name) :
     tx_changes(cs),
-    map_name(map_name)
+    map_name(std::move(map_name))
   {}
 
   std::string MapHandle::get_name_of_map() const
@@ -98,7 +97,7 @@ namespace ccf::kv::untyped
   std::optional<MapHandle::ValueType> MapHandle::get(
     const MapHandle::KeyType& key)
   {
-    auto value_p = read_key(key);
+    const auto* value_p = read_key(key);
     auto found = value_p != nullptr;
     LOG_TRACE_FMT(
       "KV[{}]::get({}) - {}found", map_name, key, found ? "" : "not ");
@@ -115,7 +114,7 @@ namespace ccf::kv::untyped
   {
     // If the key doesn't exist, return empty and record that we depend on
     // the key not existing.
-    const auto search = tx_changes.state.getp(key);
+    const auto* const search = tx_changes.state.getp(key);
     if (search == nullptr)
     {
       tx_changes.reads.insert(
@@ -146,7 +145,7 @@ namespace ccf::kv::untyped
 
   bool MapHandle::has(const MapHandle::KeyType& key)
   {
-    auto versionv_p = read_key(key);
+    const auto* versionv_p = read_key(key);
     auto found = versionv_p != nullptr;
     LOG_TRACE_FMT(
       "KV[{}]::has({}) - {}found", map_name, key, found ? "" : "not ");
@@ -155,7 +154,7 @@ namespace ccf::kv::untyped
 
   bool MapHandle::has_globally_committed(const MapHandle::KeyType& key)
   {
-    auto raw = tx_changes.committed.getp(key);
+    const auto* raw = tx_changes.committed.getp(key);
     return raw != nullptr;
   }
 
@@ -212,8 +211,8 @@ namespace ccf::kv::untyped
     // - The constructed range is loop over at the end to call lambda on.
     // Optimisation is possible to only loop over the state/writes once, in
     // order, and call the user lambda on each element in the range directly.
-    // This should include adding an iterator to underlying ordered state
-    // (i.e. rb::Map) to find the start/end of the range using
+    // This should include adding an iterator to the underlying ordered state
+    // to find the start/end of the range using
     // std::lower_bound()/std::upper_bound() and loop over it, interleaves
     // with the local writes.
 
@@ -224,14 +223,11 @@ namespace ccf::kv::untyped
       return;
     }
 
-    // Since entries are ordered in the RB Map, it is OK to early out once we
-    // have passed the end of the range. Otherwise (CHAMP), all entries should
-    // be considered.
-#ifndef KV_STATE_RB
+    // CHAMP maps are unordered, so we cannot early-out when we encounter a
+    // key past the end of the range - there may still be in-range keys later
+    // in the iteration. If the underlying state used an ordered collection,
+    // this could be set to false to stop iteration once `to` is exceeded.
     bool continue_past_range_to = true;
-#else
-    bool continue_past_range_to = false;
-#endif
 
     std::map<KeyType, ValueType> res;
     auto g = [&res, &from, &to, continue_past_range_to](
@@ -241,7 +237,8 @@ namespace ccf::kv::untyped
         // Start of range is not yet found.
         return true;
       }
-      else if (to.has_value() && (k == to.value() || to.value() < k))
+
+      if (to.has_value() && (k == to.value() || to.value() < k))
       {
         // End of range. Note: `to` is excluded.
         return continue_past_range_to;

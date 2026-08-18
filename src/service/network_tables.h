@@ -4,7 +4,6 @@
 
 #include "ccf/endpoint.h"
 #include "ccf/service/signed_req.h"
-#include "ccf/service/tables/acme_certificates.h"
 #include "ccf/service/tables/cert_bundles.h"
 #include "ccf/service/tables/code_id.h"
 #include "ccf/service/tables/constitution.h"
@@ -18,8 +17,10 @@
 #include "ccf/service/tables/proposals.h"
 #include "ccf/service/tables/service.h"
 #include "ccf/service/tables/snp_measurements.h"
+#include "ccf/service/tables/tcb_verification.h"
 #include "ccf/service/tables/users.h"
 #include "ccf/service/tables/uvm_endorsements.h"
+#include "ccf/service/tables/virtual_measurements.h"
 #include "kv/store.h"
 #include "tables/config.h"
 #include "tables/governance_history.h"
@@ -61,7 +62,7 @@ namespace ccf
     const MemberInfo member_info = {Tables::MEMBER_INFO};
     const MemberAcks member_acks = {Tables::MEMBER_ACKS};
 
-    inline auto get_all_member_tables() const
+    [[nodiscard]] auto get_all_member_tables() const
     {
       return std::make_tuple(
         member_certs, member_encryption_public_keys, member_info, member_acks);
@@ -73,7 +74,7 @@ namespace ccf
     const UserCerts user_certs = {Tables::USER_CERTS};
     const UserInfo user_info = {Tables::USER_INFO};
 
-    inline auto get_all_user_tables() const
+    [[nodiscard]] auto get_all_user_tables() const
     {
       return std::make_tuple(user_certs, user_info);
     }
@@ -85,22 +86,29 @@ namespace ccf
     const Nodes nodes = {Tables::NODES};
     const NodeEndorsedCertificates node_endorsed_certificates = {
       Tables::NODE_ENDORSED_CERTIFICATES};
-    const ACMECertificates acme_certificates = {Tables::ACME_CERTIFICATES};
+
+    const VirtualHostDataMap virtual_host_data = {Tables::VIRTUAL_HOST_DATA};
+    const VirtualMeasurements virtual_measurements = {
+      Tables::NODE_VIRTUAL_MEASUREMENTS};
+
     const SnpHostDataMap host_data = {Tables::HOST_DATA};
     const SnpMeasurements snp_measurements = {Tables::NODE_SNP_MEASUREMENTS};
     const SNPUVMEndorsements snp_uvm_endorsements = {
       Tables::NODE_SNP_UVM_ENDORSEMENTS};
+    const SnpTcbVersionMap snp_tcb_versions = {Tables::SNP_TCB_VERSIONS};
 
-    inline auto get_all_node_tables() const
+    [[nodiscard]] auto get_all_node_tables() const
     {
       return std::make_tuple(
         node_code_ids,
         nodes,
         node_endorsed_certificates,
-        acme_certificates,
+        virtual_host_data,
+        virtual_measurements,
         host_data,
         snp_measurements,
-        snp_uvm_endorsements);
+        snp_uvm_endorsements,
+        snp_tcb_versions);
     }
 
     //
@@ -116,7 +124,7 @@ namespace ccf
     const jsgov::ProposalInfoMap proposal_info = {
       jsgov::Tables::PROPOSALS_INFO};
 
-    inline auto get_all_governance_history_tables() const
+    [[nodiscard]] auto get_all_governance_history_tables() const
     {
       return std::make_tuple(
         governance_history,
@@ -138,7 +146,7 @@ namespace ccf
     const JSEngine js_engine = {Tables::JSENGINE};
     const endpoints::EndpointsMap js_endpoints = {endpoints::Tables::ENDPOINTS};
 
-    inline auto get_all_js_generic_tables() const
+    [[nodiscard]] auto get_all_js_generic_tables() const
     {
       return std::make_tuple(
         modules,
@@ -154,22 +162,13 @@ namespace ccf
     //
     const CACertBundlePEMs ca_cert_bundles = {Tables::CA_CERT_BUNDLE_PEMS};
     const JwtIssuers jwt_issuers = {Tables::JWT_ISSUERS};
-    const JwtPublicSigningKeys jwt_public_signing_keys_metadata = {
+    const JwtPublicSigningKeysMetadata jwt_public_signing_keys_metadata = {
       Tables::JWT_PUBLIC_SIGNING_KEYS_METADATA};
-    const Tables::Legacy::JwtPublicSigningKeys legacy_jwt_public_signing_keys =
-      {Tables::Legacy::JWT_PUBLIC_SIGNING_KEYS};
-    const Tables::Legacy::JwtPublicSigningKeyIssuer
-      legacy_jwt_public_signing_key_issuer = {
-        Tables::Legacy::JWT_PUBLIC_SIGNING_KEY_ISSUER};
 
-    inline auto get_all_jwt_tables() const
+    [[nodiscard]] auto get_all_jwt_tables() const
     {
       return std::make_tuple(
-        ca_cert_bundles,
-        jwt_issuers,
-        jwt_public_signing_keys_metadata,
-        legacy_jwt_public_signing_keys,
-        legacy_jwt_public_signing_key_issuer);
+        ca_cert_bundles, jwt_issuers, jwt_public_signing_keys_metadata);
     }
 
     //
@@ -186,7 +185,7 @@ namespace ccf
     const Configuration config = {Tables::CONFIGURATION};
     const Constitution constitution = {Tables::CONSTITUTION};
 
-    inline auto get_all_service_tables() const
+    [[nodiscard]] auto get_all_service_tables() const
     {
       return std::make_tuple(
         service, config, constitution, previous_service_identity);
@@ -194,7 +193,7 @@ namespace ccf
 
     // All builtin governance tables should be included here, so that wrapper
     // endpoints can be automatically generated for them
-    inline auto get_all_builtin_governance_tables() const
+    [[nodiscard]] auto get_all_builtin_governance_tables() const
     {
       return std::tuple_cat(
         get_all_member_tables(),
@@ -221,15 +220,16 @@ namespace ccf
     // the same time so that the root of the tree in the signatures table
     // matches the serialised Merkle tree.
     const Signatures signatures = {Tables::SIGNATURES};
+    const CoseSignatures cose_signatures = {Tables::COSE_SIGNATURES};
     const SerialisedMerkleTree serialise_tree = {
       Tables::SERIALISED_MERKLE_TREE};
 
-    inline auto get_all_signature_tables() const
+    [[nodiscard]] auto get_all_signature_tables() const
     {
       return std::make_tuple(signatures, serialise_tree);
     }
 
-    inline auto get_all_internal_tables() const
+    [[nodiscard]] auto get_all_internal_tables() const
     {
       return std::tuple_cat(
         std::make_tuple(

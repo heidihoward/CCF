@@ -6,7 +6,11 @@
 #include "generic_serialise_wrapper.h"
 
 #include <array>
+#include <cstring>
+#include <limits>
 #include <small_vector/SmallVector.h>
+#include <span>
+#include <tuple>
 #include <type_traits>
 
 namespace ccf::kv
@@ -26,7 +30,7 @@ namespace ccf::kv
       size_t size_before = buf.size();
       buf.resize(buf.size() + sizeof(T));
 
-      auto data_ = buf.data() + size_before;
+      auto* data_ = buf.data() + size_before;
       auto size_ = buf.size() - size_before;
       serialized::write(data_, size_, t);
     }
@@ -39,7 +43,7 @@ namespace ccf::kv
 
       buf.resize(buf.size() + entry_size_bytes);
 
-      auto data_ = buf.data() + size_before;
+      auto* data_ = buf.data() + size_before;
       auto size_ = buf.size() - size_before;
       serialized::write(
         data_,
@@ -55,7 +59,7 @@ namespace ccf::kv
       size_t size_before = buf.size();
       buf.resize(buf.size() + array_size);
 
-      auto data_ = buf.data() + size_before;
+      auto* data_ = buf.data() + size_before;
       auto size_ = buf.size() - size_before;
       serialized::write(
         data_,
@@ -69,7 +73,7 @@ namespace ccf::kv
       size_t size_before = buf.size();
       buf.resize(buf.size() + sizeof(size_t) + str.size());
 
-      auto data_ = buf.data() + size_before;
+      auto* data_ = buf.data() + size_before;
       auto size_ = buf.size() - size_before;
       serialized::write(data_, size_, str);
     }
@@ -126,57 +130,57 @@ namespace ccf::kv
 
   class RawReader
   {
-  public:
-    const uint8_t* data_ptr;
-    size_t data_offset;
-    size_t data_size;
+  private:
+    void require_bytes(size_t required, const char* description) const
+    {
+      if (required > span_.size())
+      {
+        throw std::runtime_error(fmt::format(
+          "Expected {} bytes for {}, found only {}",
+          required,
+          description,
+          span_.size()));
+      }
+    }
 
-    /** Reads the next entry, advancing data_offset
+    /** Reads the next size-prefixed payload, returning a span over it.
+     */
+    std::span<const uint8_t> read_size_prefixed_entry()
+    {
+      const auto entry_size = read_entry<size_t>();
+      require_bytes(entry_size, "size-prefixed entry");
+      const auto content = span_.subspan(0, entry_size);
+      span_ = span_.subspan(entry_size);
+      return content;
+    }
+
+    std::span<const uint8_t> span_;
+
+  public:
+    /** Reads the next entry of a trivially-copyable type, advancing the cursor.
      */
     template <typename T>
+      requires std::is_trivially_copyable_v<T>
     T read_entry()
     {
-      auto remainder = data_size - data_offset;
-      auto data = data_ptr + data_offset;
-      const auto entry = serialized::read<T>(data, remainder);
-      const auto bytes_read = data_size - data_offset - remainder;
-      data_offset += bytes_read;
+      require_bytes(sizeof(T), "fixed-size entry");
+      T entry;
+      std::memcpy(&entry, span_.data(), sizeof(T));
+      span_ = span_.subspan(sizeof(T));
       return entry;
     }
 
-    /** Reads the next size-prefixed entry
-     */
-    size_t read_size_prefixed_entry(size_t& start_offset)
-    {
-      auto remainder = data_size - data_offset;
-      auto entry_size = read_entry<size_t>();
-
-      if (remainder < entry_size)
-      {
-        throw std::runtime_error(fmt::format(
-          "Expected {} byte entry, found only {}", entry_size, remainder));
-      }
-
-      start_offset = data_offset;
-      data_offset += entry_size;
-
-      return entry_size;
-    }
-
-  public:
     RawReader(const RawReader& other) = delete;
     RawReader& operator=(const RawReader& other) = delete;
 
-    RawReader(const uint8_t* data_in_ptr = nullptr, size_t data_in_size = 0)
+    RawReader(std::span<const uint8_t> data = {})
     {
-      init(data_in_ptr, data_in_size);
+      init(data);
     }
 
-    void init(const uint8_t* data_in_ptr, size_t data_in_size)
+    void init(std::span<const uint8_t> data)
     {
-      data_offset = 0;
-      data_ptr = data_in_ptr;
-      data_size = data_in_size;
+      span_ = data;
     }
 
     template <typename T>
@@ -186,42 +190,65 @@ namespace ccf::kv
         ccf::nonstd::is_std_vector<T>::value ||
         std::is_same_v<T, ccf::kv::serialisers::SerialisedEntry>)
       {
-        size_t entry_offset = 0;
-        size_t entry_size = read_size_prefixed_entry(entry_offset);
+        const auto entry_span = read_size_prefixed_entry();
+        using Element = typename T::value_type;
+        const auto entry_size = entry_span.size();
+        if (entry_size % sizeof(Element) != 0)
+        {
+          throw std::runtime_error(fmt::format(
+            "Size-prefixed entry of {} bytes is not divisible by element size "
+            "{}",
+            entry_size,
+            sizeof(Element)));
+        }
 
-        T ret(entry_size / sizeof(typename T::value_type));
-        auto data_ = reinterpret_cast<uint8_t*>(ret.data());
-        auto size_ = entry_size;
-        serialized::write(data_, size_, data_ptr + entry_offset, entry_size);
-
+        T ret;
+        const auto element_count = entry_size / sizeof(Element);
+        if (element_count > ret.max_size())
+        {
+          throw std::length_error(fmt::format(
+            "Size-prefixed entry contains too many elements ({})",
+            element_count));
+        }
+        ret.resize(element_count);
+        if (entry_size > 0)
+        {
+          std::memcpy(ret.data(), entry_span.data(), entry_size);
+        }
         return ret;
       }
       else if constexpr (ccf::nonstd::is_std_array<T>::value)
       {
-        T ret;
-        auto data_ = reinterpret_cast<uint8_t*>(ret.data());
-        constexpr size_t size = ret.size() * sizeof(typename T::value_type);
-        auto size_ = size;
-        serialized::write(data_, size_, data_ptr + data_offset, size);
-        data_offset += size;
-
+        T ret{};
+        auto* data_ = reinterpret_cast<uint8_t*>(ret.data());
+        constexpr auto element_count = std::tuple_size_v<T>;
+        static_assert(
+          element_count <=
+          std::numeric_limits<size_t>::max() / sizeof(typename T::value_type));
+        constexpr size_t size = element_count * sizeof(typename T::value_type);
+        require_bytes(size, "fixed-size array");
+        if constexpr (size > 0)
+        {
+          std::memcpy(data_, span_.data(), size);
+          span_ = span_.subspan(size);
+        }
         return ret;
       }
       else if constexpr (std::is_same_v<T, ccf::kv::EntryType>)
       {
-        uint8_t entry_type = read_entry<uint8_t>();
+        auto entry_type = read_entry<uint8_t>();
         if (entry_type > static_cast<uint8_t>(ccf::kv::EntryType::MAX))
+        {
           throw std::logic_error(
             fmt::format("Invalid EntryType: {}", entry_type));
+        }
 
         return ccf::kv::EntryType(entry_type);
       }
       else if constexpr (std::is_same_v<T, std::string>)
       {
-        size_t entry_offset = 0;
-        read_size_prefixed_entry(entry_offset);
-
-        return {data_ptr + entry_offset, data_ptr + data_offset};
+        const auto entry_span = read_size_prefixed_entry();
+        return {entry_span.begin(), entry_span.end()};
       }
       else if constexpr (std::is_integral_v<T>)
       {
@@ -235,9 +262,9 @@ namespace ccf::kv
       }
     }
 
-    bool is_eos()
+    [[nodiscard]] bool is_eos() const
     {
-      return data_offset >= data_size;
+      return span_.empty();
     }
   };
 

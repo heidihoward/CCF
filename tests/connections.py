@@ -1,26 +1,25 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.e2e_args
-import time
-import infra.network
-import infra.proc
-import infra.checker
-import infra.interfaces
 import contextlib
-import resource
-import psutil
-from infra.log_capture import flush_info
-from infra.clients import CCFConnectionException, CCFIOException
-import random
-import http
 import functools
-import httpx
+import http
 import os
+import random
+import resource
 import socket
 import struct
-from infra.snp import IS_SNP
-from infra.runner import ConcurrentRunner
+import time
 
+import fuzzing
+import httpx
+import infra.checker
+import infra.e2e_args
+import infra.interfaces
+import infra.network
+import infra.proc
+from infra.clients import CCFConnectionException, CCFIOException
+from infra.log_capture import flush_info
+from infra.runner import ConcurrentRunner
 from loguru import logger as LOG
 
 
@@ -28,6 +27,10 @@ class AllConnectionsCreatedException(Exception):
     """
     Raised if we expected a node to refuse connections, but it didn't
     """
+
+
+def fd_count(pid: int) -> int:
+    return len(os.listdir(f"/proc/{pid}/fd"))
 
 
 def get_session_metrics(node, timeout=3):
@@ -73,7 +76,7 @@ def run_connection_caps_tests(args):
     args.ubsan_options = "suppressions=" + str(supp_file)
 
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         check = infra.checker.Checker()
         network.start_and_open(args)
@@ -83,7 +86,7 @@ def run_connection_caps_tests(args):
 
         primary_pid = primary.remote.remote.proc.pid
 
-        initial_fds = psutil.Process(primary_pid).num_fds()
+        initial_fds = fd_count(primary_pid)
         assert (
             initial_fds < args.max_open_sessions
         ), f"Initial number of file descriptors has already reached session limit: {initial_fds} >= {args.max_open_sessions}"
@@ -166,7 +169,7 @@ def run_connection_caps_tests(args):
                         f"Successfully created {target} clients without exception - expected this to exhaust available connections"
                     )
 
-                num_fds = psutil.Process(primary_pid).num_fds()
+                num_fds = fd_count(primary_pid)
                 LOG.success(
                     f"{primary_pid} has {num_fds}/{max_fds} open file descriptors"
                 )
@@ -191,16 +194,16 @@ def run_connection_caps_tests(args):
                         client.post(
                             "/log/private",
                             {"id": 42, "msg": "foo"},
-                            timeout=3 if IS_SNP else 1,
+                            timeout=1,
                             log_capture=logs,
                         )
                     except Exception as e:
                         flush_info(logs)
                         LOG.error(e)
-                        raise e
+                        raise
 
                 time.sleep(1)
-                num_fds = psutil.Process(primary_pid).num_fds()
+                num_fds = fd_count(primary_pid)
                 LOG.success(
                     f"{primary_pid} has {num_fds}/{max_fds} open file descriptors"
                 )
@@ -209,7 +212,7 @@ def run_connection_caps_tests(args):
                 clients = []
 
             time.sleep(1)
-            num_fds = psutil.Process(primary_pid).num_fds()
+            num_fds = fd_count(primary_pid)
             LOG.success(f"{primary_pid} has {num_fds}/{max_fds} open file descriptors")
             return num_fds
 
@@ -289,7 +292,7 @@ def run_idle_timeout_tests(args):
         args.idle_connection_timeout_s = timeout
 
         with infra.network.network(
-            args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+            args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
         ) as network:
             network.start_and_open(args)
 
@@ -324,7 +327,7 @@ def run_idle_timeout_tests(args):
 
                         try:
                             r = c.get("/node/commit")
-                        except http.client.RemoteDisconnected:
+                        except (http.client.RemoteDisconnected, BrokenPipeError):
                             pass
                         else:
                             assert (
@@ -344,7 +347,7 @@ def node_tcp_socket(node):
 # NB: This does rudimentary smoke testing. See fuzzing.py for more thorough test
 def run_node_socket_robustness_tests(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
@@ -380,8 +383,8 @@ def run_node_socket_robustness_tests(args):
                     f"Sending raw TCP bytes to {primary.local_node_id}'s node-to-node port: {msg_bytes}"
                 )
                 sock.send(msg_bytes)
-                assert (
-                    not primary.remote.check_done()
+                assert not primary.remote.check_done(
+                    timeout=0
                 ), f"Crashed node with N2N message: {msg_bytes}"
                 LOG.success(f"Node {primary.local_node_id} tolerated this message")
 
@@ -395,7 +398,7 @@ def run_node_socket_robustness_tests(args):
                 try_write(msg)
 
         LOG.info("Sending messages which do not contain initial header")
-        for size in range(0, 16):
+        for size in range(16):
             try_write(struct.pack("<I", size) + b"\x00" * size)
 
         LOG.info("Sending plausible messages")
@@ -443,16 +446,23 @@ if __name__ == "__main__":
     cr = ConcurrentRunner()
 
     cr.add(
+        "fuzzing",
+        fuzzing.run,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),
+    )
+
+    cr.add(
         "robustness",
         run_node_socket_robustness_tests,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.nodes(cr.args, 1),
     )
 
     cr.add(
         "idletimeout",
         run_idle_timeout_tests,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.nodes(cr.args, 1),
     )
 
@@ -465,7 +475,7 @@ if __name__ == "__main__":
     cr.add(
         "caps",
         run_connection_caps_tests,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.nodes(cr.args, 1),
         initial_user_count=1,
     )

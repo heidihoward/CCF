@@ -355,7 +355,7 @@ TEST_CASE("Backup catchup from many ledger secrets")
         ccf::kv::ApplyResult::PASS);
 
       auto tx_id = backup_store.current_txid();
-      tx_id.version--;
+      tx_id.seqno--;
       // While catching up, assume the backup rolls back (e.g. because of an
       // election)
       backup_store.rollback(tx_id, backup_store.commit_view());
@@ -390,7 +390,7 @@ TEST_CASE("KV integrity verification")
   std::string pub_value = "pubv1";
   public_map->put("pubk1", pub_value);
   private_map->put("privk1", "privv1");
-  auto rc = tx.commit();
+  REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
 
   // Tamper with serialised public data
   auto latest_data = consensus->get_latest_data();
@@ -449,11 +449,9 @@ TEST_CASE("Encryptor rollback")
 int main(int argc, char** argv)
 {
   ccf::logger::config::default_init();
-  ccf::crypto::openssl_sha256_init();
   doctest::Context context;
   context.applyCommandLine(argc, argv);
   int res = context.run();
-  ccf::crypto::openssl_sha256_shutdown();
   if (context.shouldExit())
     return res;
   return res;

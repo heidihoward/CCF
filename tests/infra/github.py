@@ -1,19 +1,16 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import re
 import os
-
-import subprocess
-import git
-import urllib
+import re
 import shutil
+import subprocess
+import urllib
+
+import git
 import requests
-
-from packaging.version import Version  # type: ignore
-
 from loguru import logger as LOG
-
+from packaging.version import Version  # type: ignore
 
 REPOSITORY_NAME = "microsoft/CCF"
 REMOTE_URL = f"https://github.com/{REPOSITORY_NAME}"
@@ -23,7 +20,7 @@ TAG_DAILY_RELEASE_PREFIX = "daily-"
 TAG_DEVELOPMENT_SUFFIX = "-dev"
 TAG_RELEASE_CANDIDATE_SUFFIX = "-rc"
 MAIN_BRANCH_NAME = "main"
-DEBIAN_PACKAGE_EXTENSION = "_amd64.deb"
+RPM_PACKAGE_EXTENSION = "_x86_64.rpm"
 # This assumes that CCF is installed at `/opt/ccf`, which is true from 1.0.0
 INSTALL_DIRECTORY_PREFIX = "ccf_install_"
 INSTALL_DIRECTORY_SUB_PATH = "opt/ccf"
@@ -37,7 +34,7 @@ BACKPORT_BRANCH_PREFIX = "backport/"  # Automatically added by backport CLI
 # versions to no longer be run in the recovery LTS compatibility test
 # and corresponding ledgers should be copied to the testdata/ directory
 # instead.
-END_OF_LIFE_MAJOR_VERSIONS = [1, 2]
+END_OF_LIFE_MAJOR_VERSIONS = [1, 2, 3, 4, 5]
 
 # Note: Releases are identified by tag since releases are not necessarily named, but all
 # releases are tagged
@@ -147,17 +144,25 @@ def get_major_version_from_branch_name(branch_name):
     )
 
 
-def get_debian_package_prefix_with_platform(tag_name, platform="sgx"):
+def get_devel_package_prefix_with_platform(tag_name, platform="snp"):
+    tag_components = tag_name.split("-")
+    tag_components[0] += f"_{platform}_devel"
+    return "-".join(tag_components)
+
+
+def get_package_prefix_with_platform(tag_name, platform="snp"):
     tag_components = tag_name.split("-")
     tag_components[0] += f"_{platform}"
     return "-".join(tag_components)
 
 
-def get_debian_package_url_from_tag_name(tag_name, platform="sgx"):
-    if get_version_from_tag_name(tag_name) >= Version("3.0.0-rc0"):
-        return f'{REMOTE_URL}/releases/download/{tag_name}/{get_debian_package_prefix_with_platform(tag_name, platform).replace("-", "_")}{DEBIAN_PACKAGE_EXTENSION}'
-    else:
-        return f'{REMOTE_URL}/releases/download/{tag_name}/{tag_name.replace("-", "_")}{DEBIAN_PACKAGE_EXTENSION}'
+def get_package_url_from_tag_name(tag_name, platform="snp"):
+    # First release with RPM packages for Azure Linux
+    if get_version_from_tag_name(tag_name) >= Version("6.0.0.rc2"):
+        return f"{REMOTE_URL}/releases/download/{tag_name}/{get_devel_package_prefix_with_platform(tag_name, platform).replace('-', '_')}{RPM_PACKAGE_EXTENSION}"
+    if get_version_from_tag_name(tag_name) >= Version("6.0.0.dev19"):
+        return f"{REMOTE_URL}/releases/download/{tag_name}/{get_package_prefix_with_platform(tag_name, platform).replace('-', '_')}{RPM_PACKAGE_EXTENSION}"
+    raise ValueError(f"Unsupported tag name: {tag_name} for platform {platform}")
 
 
 class GitEnv:
@@ -173,11 +178,21 @@ class GitEnv:
             for branch in self.g.ls_remote(REMOTE_URL).split("\n")
             if "heads/release" in branch
         ]
+        repo = git.Repo(os.getcwd(), search_parent_directories=True)
+        current_commit = repo.head.commit
+        self.tags_for_current_commit = [
+            tag.name for tag in repo.tags if tag.commit == current_commit
+        ]
 
     def has_release_for_tag_name(self, tag_name):
+        try:
+            package_url = get_package_url_from_tag_name(tag_name)
+        except ValueError:
+            return False
+
         return (
             requests.head(
-                get_debian_package_url_from_tag_name(tag_name),
+                package_url,
                 allow_redirects=True,
                 timeout=30,
             ).status_code
@@ -281,7 +296,7 @@ class Repository:
             if is_release_branch(branch)
             else None
         )
-        major_version = 1
+        major_version = 6
         while max_major_version is None or major_version <= max_major_version:
             tag = self.get_latest_tag_for_major_version(major_version)
             if tag is None:
@@ -291,7 +306,7 @@ class Repository:
             major_version += 1
         return releases
 
-    def install_release(self, tag, platform="sgx"):
+    def install_release(self, tag, platform="snp"):
         stripped_tag = strip_release_tag_name(tag)
         install_directory = f"{INSTALL_DIRECTORY_PREFIX}{stripped_tag}"
         if get_version_from_tag_name(tag) >= Version("3.0.0-rc1"):
@@ -304,7 +319,7 @@ class Repository:
             install_path = os.path.abspath(
                 os.path.join(install_directory, INSTALL_DIRECTORY_SUB_PATH)
             )
-        debian_package_url = get_debian_package_url_from_tag_name(tag, platform)
+        package_url = get_package_url_from_tag_name(tag, platform)
         installed_file_path = os.path.join(install_path, INSTALL_SUCCESS_FILE)
 
         # Skip downloading release if it already exists
@@ -314,22 +329,32 @@ class Repository:
             )
             return tag, install_path
 
-        debian_package_name = debian_package_url.split("/")[-1]
-        download_path = os.path.join(DOWNLOAD_FOLDER_NAME, debian_package_name)
-        LOG.info(f"Downloading {debian_package_url} to {download_path}...")
+        package_name = package_url.split("/")[-1]
+        download_path = os.path.join(DOWNLOAD_FOLDER_NAME, package_name)
+        LOG.info(f"Downloading {package_url} to {download_path}...")
         if not os.path.exists(DOWNLOAD_FOLDER_NAME):
             os.mkdir(DOWNLOAD_FOLDER_NAME)
 
         shutil.rmtree(download_path, ignore_errors=True)
-        urllib.request.urlretrieve(debian_package_url, download_path)
+        urllib.request.urlretrieve(package_url, download_path)
 
-        LOG.info("Unpacking debian package...")
         shutil.rmtree(install_directory, ignore_errors=True)
-        install_cmd = ["dpkg-deb", "-R", download_path, install_directory]
-        subprocess.run(install_cmd, check=True)
+
+        if download_path.endswith(RPM_PACKAGE_EXTENSION):
+            LOG.info("Unpacking RPM package...")
+            os.makedirs(install_directory, exist_ok=True)
+            install_cmd = (
+                f"rpm2cpio {download_path} | cpio -idmv -D {install_directory}"
+            )
+            subprocess.run(install_cmd, shell=True, check=True)
+        else:
+            assert False, f"Unsupported package type: {download_path}"
 
         # Write new file to avoid having to download install again
-        open(os.path.join(install_path, INSTALL_SUCCESS_FILE), "w+", encoding="utf-8")
+        with open(
+            os.path.join(install_path, INSTALL_SUCCESS_FILE), "w+", encoding="utf-8"
+        ):
+            pass
 
         LOG.info(f"CCF release {tag} successfully installed at {install_path}")
         return tag, install_path
@@ -403,16 +428,37 @@ class Repository:
             return None
 
     def install_latest_lts_for_branch(
-        self, branch, this_release_branch_only, platform="sgx"
+        self, branch, this_release_branch_only, platform="snp"
     ):
         latest_tag = self.get_latest_released_tag_for_branch(
             branch, this_release_branch_only
         )
-        return (
-            self.install_release(latest_tag, platform) if latest_tag else (None, None)
-        )
 
-    def install_next_lts_for_branch(self, branch, platform="sgx"):
+        if not latest_tag:
+            return (None, None)
+
+        if get_version_from_tag_name(latest_tag).major < 6:
+            # Target Azure Linux, which is only supported from 6.x onwards by forcing level-up to 6.0.0.
+            LOG.info(
+                f"Bump up the tag to 6.x: this_release_branch_only={this_release_branch_only}, branch={branch}, latest_tag={latest_tag}"
+            )
+            tags = sorted(
+                (
+                    tag
+                    for tag in self.tags
+                    if (
+                        get_version_from_tag_name(tag) >= Version("6.0.0.dev0")
+                        and tag not in self.g.tags_for_current_commit
+                    )
+                ),
+                key=get_version_from_tag_name,
+                reverse=True,
+            )
+            latest_tag = tags[0]
+
+        return self.install_release(latest_tag, platform)
+
+    def install_next_lts_for_branch(self, branch, platform="snp"):
         next_tag = self.get_first_tag_for_next_release_branch(branch)
         return self.install_release(next_tag, platform) if next_tag else (None, None)
 
@@ -435,7 +481,7 @@ if __name__ == "__main__":
         def has_release_for_tag_name(self, tag_name):
             # If tag_name is local branch, then the release from this tag
             # must be in progress
-            return True if tag_name != self.local_branch else False
+            return tag_name != self.local_branch
 
     def exp(prev=None, same=None):
         return {"previous LTS": prev, "same LTS": same}

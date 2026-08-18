@@ -1,10 +1,9 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-from dataclasses import dataclass, asdict, field
-from typing import Optional, Dict, Union
-from enum import Enum
 import urllib.parse
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 
 from loguru import logger as LOG
 
@@ -16,7 +15,7 @@ def split_netloc(netloc, default_port=0):
 
 
 def make_address(host, port=0):
-    if ":" in host:
+    if ":" in host and not host.startswith("["):
         return f"[{host}]:{port}"
     else:
         return f"{host}:{port}"
@@ -38,13 +37,13 @@ DEFAULT_FORWARDING_TIMEOUT_MS = 3000
 
 PRIMARY_RPC_INTERFACE = "primary_rpc_interface"
 SECONDARY_RPC_INTERFACE = "secondary_rpc_interface"
+FILE_SERVING_RPC_INTERFACE = "file_serving_rpc_interface"
 NODE_TO_NODE_INTERFACE_NAME = "node_to_node_interface"
 
 
 class EndorsementAuthority(str, Enum):
     Service = "Service"
     Node = "Node"
-    ACME = "ACME"
     Unsecured = "Unsecured"
 
 
@@ -52,20 +51,15 @@ class EndorsementAuthority(str, Enum):
 class Endorsement:
     authority: EndorsementAuthority = EndorsementAuthority.Service
 
-    acme_configuration: Optional[str] = None
-
     @staticmethod
     def to_json(endorsement):
         r = {"authority": endorsement.authority.name}
-        if endorsement.acme_configuration:
-            r["acme_configuration"] = endorsement.acme_configuration
         return r
 
     @staticmethod
     def from_json(json):
         endorsement = Endorsement()
         endorsement.authority = EndorsementAuthority(json["authority"])
-        endorsement.acme_configuration = json.get("acme_configuration", None)
         return endorsement
 
 
@@ -95,7 +89,7 @@ class TargetRole:
 
 @dataclass
 class NodeByRoleResolver:
-    target: TargetRole = TargetRole(role=NodeRole.primary)
+    target: TargetRole = field(default_factory=lambda: TargetRole(NodeRole.primary))
     kind: str = "NodeByRole"
 
     @staticmethod
@@ -126,14 +120,14 @@ class StaticAddressResolver:
         return StaticAddressResolver(target_address=json["target"]["address"])
 
 
-RedirectionResolver = Union[NodeByRoleResolver, StaticAddressResolver]
+RedirectionResolver = NodeByRoleResolver | StaticAddressResolver
 
 
 @dataclass
 class RedirectionConfig:
-    to_primary: RedirectionResolver = NodeByRoleResolver()
-    to_backup: RedirectionResolver = NodeByRoleResolver(
-        target=TargetRole(role=NodeRole.backup)
+    to_primary: NodeByRoleResolver = field(default_factory=lambda: NodeByRoleResolver())
+    to_backup: NodeByRoleResolver = field(
+        default_factory=lambda: NodeByRoleResolver(target=TargetRole(NodeRole.backup))
     )
 
     @staticmethod
@@ -167,39 +161,52 @@ class RedirectionConfig:
 @dataclass
 class RPCInterface(Interface):
     # How nodes are created (local, ssh, ...)
-    protocol: str = "local"
+    protocol: str = field(default_factory=lambda: "local")
     # Underlying transport layer protocol (tcp, udp)
-    transport: str = "tcp"
+    transport: str = field(default_factory=lambda: "tcp")
     # Host name/IP
-    public_host: Optional[str] = None
+    public_host: str | None = None
     # Host port
-    public_port: Optional[int] = None
-    max_open_sessions_soft: Optional[int] = DEFAULT_MAX_OPEN_SESSIONS_SOFT
-    max_open_sessions_hard: Optional[int] = DEFAULT_MAX_OPEN_SESSIONS_HARD
-    max_http_body_size: Optional[int] = DEFAULT_MAX_HTTP_BODY_SIZE
-    max_http_header_size: Optional[int] = DEFAULT_MAX_HTTP_HEADER_SIZE
-    max_http_headers_count: Optional[int] = DEFAULT_MAX_HTTP_HEADERS_COUNT
-    max_concurrent_streams_count: Optional[int] = DEFAULT_MAX_CONCURRENT_STREAMS_COUNT
-    initial_window_size: Optional[int] = DEFAULT_INITIAL_WINDOW_SIZE
-    max_frame_size: Optional[int] = DEFAULT_MAX_FRAME_SIZE
-    endorsement: Optional[Endorsement] = Endorsement()
-    acme_configuration: Optional[str] = None
-    accepted_endpoints: Optional[str] = None
-    forwarding_timeout_ms: Optional[int] = DEFAULT_FORWARDING_TIMEOUT_MS
-    redirections: Optional[RedirectionConfig] = None
-    app_protocol: str = "HTTP1"
+    public_port: int | None = None
+    max_open_sessions_soft: int | None = field(
+        default_factory=lambda: DEFAULT_MAX_OPEN_SESSIONS_SOFT
+    )
+    max_open_sessions_hard: int | None = field(
+        default_factory=lambda: DEFAULT_MAX_OPEN_SESSIONS_HARD
+    )
+    max_http_body_size: int | None = field(
+        default_factory=lambda: DEFAULT_MAX_HTTP_BODY_SIZE
+    )
+    max_http_header_size: int | None = field(
+        default_factory=lambda: DEFAULT_MAX_HTTP_HEADER_SIZE
+    )
+    max_http_headers_count: int | None = field(
+        default_factory=lambda: DEFAULT_MAX_HTTP_HEADERS_COUNT
+    )
+    max_concurrent_streams_count: int | None = field(
+        default_factory=lambda: DEFAULT_MAX_CONCURRENT_STREAMS_COUNT
+    )
+    initial_window_size: int | None = field(
+        default_factory=lambda: DEFAULT_INITIAL_WINDOW_SIZE
+    )
+    max_frame_size: int | None = field(default_factory=lambda: DEFAULT_MAX_FRAME_SIZE)
+    endorsement: Endorsement | None = field(default_factory=lambda: Endorsement())
+    accepted_endpoints: str | None = None
+    enabled_operator_features: list[str] | None = None
+    forwarding_timeout_ms: int | None = field(
+        default_factory=lambda: DEFAULT_FORWARDING_TIMEOUT_MS
+    )
+    redirections: RedirectionConfig | None = None
+    app_protocol: str = field(default_factory=lambda: "HTTP1")
 
-    @staticmethod
-    def from_args(args):
-        return RPCInterface(
-            max_open_sessions_soft=args.max_open_sessions,
-            max_open_sessions_hard=args.max_open_sessions_hard,
-            max_http_body_size=args.max_http_body_size,
-            max_http_header_size=args.max_http_header_size,
-            max_http_headers_count=args.max_http_headers_count,
-            forwarding_timeout_ms=args.forwarding_timeout_ms,
-            app_protocol="HTTP2" if args.http2 else "HTTP1",
-        )
+    def apply_args(self, args):
+        self.max_open_sessions_soft = args.max_open_sessions
+        self.max_open_sessions_hard = args.max_open_sessions_hard
+        self.max_http_body_size = args.max_http_body_size
+        self.max_http_header_size = args.max_http_header_size
+        self.max_http_headers_count = args.max_http_headers_count
+        self.forwarding_timeout_ms = args.forwarding_timeout_ms
+        self.app_protocol = "HTTP2" if args.http2 else "HTTP1"
 
     def parse_from_str(self, s):
         # Format: local|ssh(,tcp|udp)://hostname:port
@@ -240,11 +247,13 @@ class RPCInterface(Interface):
             "endorsement": Endorsement.to_json(interface.endorsement),
         }
         if interface.public_host:
-            r["published_address"] = (
-                f"{interface.public_host}:{interface.public_port or 0}"
+            r["published_address"] = make_address(
+                interface.public_host, interface.public_port or 0
             )
         if interface.accepted_endpoints:
             r["accepted_endpoints"] = interface.accepted_endpoints
+        if interface.enabled_operator_features:
+            r["enabled_operator_features"] = interface.enabled_operator_features
         if interface.forwarding_timeout_ms:
             r["forwarding_timeout_ms"] = interface.forwarding_timeout_ms
         if interface.redirections:
@@ -278,6 +287,7 @@ class RPCInterface(Interface):
         if "endorsement" in json:
             interface.endorsement = Endorsement.from_json(json["endorsement"])
         interface.accepted_endpoints = json.get("accepted_endpoints")
+        interface.enabled_operator_features = json.get("enabled_operator_features")
         return interface
 
 
@@ -291,13 +301,29 @@ def make_secondary_interface(transport="tcp", interface_name=SECONDARY_RPC_INTER
 
 @dataclass
 class HostSpec:
-    rpc_interfaces: Dict[str, RPCInterface] = field(
-        default_factory=lambda: {PRIMARY_RPC_INTERFACE: RPCInterface()}
+    rpc_interfaces: dict[str, RPCInterface] = field(
+        default_factory=lambda: {
+            PRIMARY_RPC_INTERFACE: RPCInterface(),
+            FILE_SERVING_RPC_INTERFACE: RPCInterface(
+                enabled_operator_features=[
+                    "SnapshotRead",
+                    "LedgerChunkRead",
+                    "SnapshotCreate",
+                ],
+            ),
+        }
     )
-    acme_challenge_server_interface: Optional[str] = None
 
     def get_primary_interface(self):
         return self.rpc_interfaces[PRIMARY_RPC_INTERFACE]
+
+    def get_file_serving_interface(self):
+        return self.rpc_interfaces[FILE_SERVING_RPC_INTERFACE]
+
+    def with_args(self, args):
+        for interface in self.rpc_interfaces.values():
+            interface.apply_args(args)
+        return self
 
     @staticmethod
     def to_json(host_spec):
@@ -317,6 +343,11 @@ class HostSpec:
 
 
 if __name__ == "__main__":
+    assert make_address("::1", 8000) == "[::1]:8000"
+    assert make_address("[::1]", 8000) == "[::1]:8000"
+    assert make_address("1.2.3.4", 8000) == "1.2.3.4:8000"
+    assert make_address("example.com", 443) == "example.com:443"
+
     # Test some roundtrip conversions
     def test_roundtrip(before):
         j = before.to_json(before)

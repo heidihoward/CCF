@@ -1,9 +1,4 @@
 {
-  "enclave": {
-    "file": "libjs_generic.enclave.so.signed",
-    "platform": "SGX",
-    "type": "Release"
-  },
   "network": {
     "node_to_node_interface": { "bind_address": "127.0.0.1:8081" },
     "rpc_interfaces": {
@@ -39,7 +34,6 @@
     "tx_count": 10000
   },
   "logging": {
-    "host_level": "Info",
     "format": "Text"
   },
   "consensus": {
@@ -51,7 +45,8 @@
     "delay": "1s"
   },
   "jwt": {
-    "key_refresh_interval": "30min"
+    "key_refresh_interval": "30min",
+    "key_refresh_max_response_size": "1MB"
   },
   "output_files": {
     "node_certificate_file": "node.pem",

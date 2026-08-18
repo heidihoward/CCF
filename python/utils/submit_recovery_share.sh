@@ -3,11 +3,12 @@
 # Licensed under the Apache 2.0 License.
 
 set -e
+set -o pipefail
 
 function usage()
 {
-    echo "Usage:"""
-    echo "  $0 https://<node-address> --member-enc-privk /path/to/member_enc_privk.pem --api-version api_version --member-id-privk /path/to/member_id_privk.pem ----member-id-cert /path/to/member_cert.pem [CURL_OPTIONS]"
+    echo "Usage:"
+    echo "  $0 https://<node-address> --member-enc-privk /path/to/member_enc_privk.pem --api-version api_version --member-id-privk /path/to/member_id_privk.pem --member-id-cert /path/to/member_cert.pem [CURL_OPTIONS]"
     echo "Retrieves the encrypted recovery share for a given member, decrypts the share and submits it for recovery."
     echo ""
     echo "A sufficient number of recovery shares must be submitted by members to initiate the end of recovery procedure."
@@ -25,7 +26,7 @@ fi
 node_rpc_address=$1
 shift
 
-api_version="classic"
+api_version="2024-07-01"
 while [ "$1" != "" ]; do
     case $1 in
         -h|-\?|--help)
@@ -66,25 +67,17 @@ if [ -z "${member_id_cert}" ]; then
     exit 1
 fi
 
-if [ ! -f "env/bin/activate" ]
-    then
-        python3.8 -m venv env
+if ! command -v ccf_cose_sign1 > /dev/null; then
+    echo "Error: This script requires the ccf_cose_sign1 CLI tool, distributed as part of the CCF Python package. Please install it via 'pip install ccf' in the current Python environment"
+    exit 1
 fi
-source env/bin/activate
-pip install -q ccf
 
 # Compute member ID, as the SHA-256 fingerprint of the signing certificate
 member_id=$(openssl x509 -in "$member_id_cert" -noout -fingerprint -sha256 | cut -d "=" -f 2 | sed 's/://g' | awk '{print tolower($0)}')
 
-if [ "${api_version}" == "classic" ]; then
-    get_share_path="gov/encrypted_recovery_share/${member_id}"
-    share_field="encrypted_share"
-    submit_share_path="gov/recovery_share"
-else
-    get_share_path="gov/recovery/encrypted-shares/${member_id}?api-version=${api_version}"
-    share_field="encryptedShare"
-    submit_share_path="gov/recovery/members/${member_id}:recover?api-version=${api_version}"
-fi
+get_share_path="gov/recovery/encrypted-shares/${member_id}?api-version=${api_version}"
+share_field="encryptedShare"
+submit_share_path="gov/recovery/members/${member_id}:recover?api-version=${api_version}"
 
 # First, retrieve the encrypted recovery share
 encrypted_share=$(curl -sS --fail -X GET "${node_rpc_address}/${get_share_path}" "${@}" | jq -r ".${share_field}")

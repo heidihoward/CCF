@@ -1,23 +1,22 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import tempfile
 import http
-import os
 import json
+import os
 import shutil
+import tempfile
+import urllib.parse
+
+import infra.crypto
+import infra.e2e_args
+import infra.net
 import infra.network
 import infra.path
 import infra.proc
-import infra.net
-import infra.e2e_args
-import infra.crypto
 import suite.test_requirements as reqs
-import urllib.parse
 from e2e_logging import test_multi_auth
-
-from npm_tests import build_npm_app, deploy_npm_app, test_npm_app, validate_openapi
-
 from loguru import logger as LOG
+from npm_tests import build_npm_app, deploy_npm_app, test_npm_app, validate_openapi
 
 THIS_DIR = os.path.dirname(__file__)
 PARENT_DIR = os.path.normpath(os.path.join(THIS_DIR, os.path.pardir))
@@ -39,6 +38,52 @@ def test_module_import(network, args):
     return network
 
 
+def compare_app_metadata(expected, actual, api_key_renames, route=None):
+    if route is None:
+        route = []
+    path = ".".join(route)
+    assert isinstance(
+        actual, type(actual)
+    ), f"Expected same type of values at {path}, found {type(expected)} vs {type(actual)}"
+
+    if isinstance(expected, dict):
+        for orig_k, v_expected in expected.items():
+            k = orig_k
+            if k in api_key_renames:
+                k = api_key_renames[k]
+
+            assert (
+                k in actual
+            ), f"Expected key {k} (normalised from {orig_k}) at {path}, found: {actual}"
+            v_actual = actual[k]
+
+            compare_app_metadata(v_expected, v_actual, api_key_renames, route + [k])
+    else:
+        if not isinstance(expected, list) and expected in api_key_renames:
+            k = api_key_renames[expected]
+            assert (
+                k == actual
+            ), f"Mismatch at {path}, expected {k} (normalised from {expected}) and found {actual}"
+        else:
+            assert (
+                expected == actual
+            ), f"Mismatch at {path}, expected {expected} and found {actual}"
+
+
+def canonicalise(orig, renames):
+    if isinstance(orig, dict):
+        o = {}
+        for k, v in orig.items():
+            if k in renames:
+                k = renames[k]
+            o[k] = canonicalise(v, renames)
+        return o
+    elif isinstance(orig, str) and orig in renames:
+        return renames[orig]
+    else:
+        return orig
+
+
 @reqs.description("Test module access")
 def test_module_access(network, args):
     primary, _ = network.find_nodes()
@@ -48,8 +93,56 @@ def test_module_access(network, args):
     network.consortium.set_js_app_from_bundle(primary, bundle)
 
     expected_modules = bundle["modules"]
+    expected_metadata = bundle["metadata"]
+
+    http_methods_renamed = {
+        method: method.upper() for method in ("post", "get", "put", "delete")
+    }
+    module_names_prefixed = {
+        module["name"]: f"/{module['name']}"
+        for module in expected_modules
+        if not module["name"].startswith("/")
+    }
+    endpoint_def_camelcased = {
+        "js_module": "jsModule",
+        "js_function": "jsFunction",
+        "forwarding_required": "forwardingRequired",
+        "redirection_strategy": "redirectionStrategy",
+        "authn_policies": "authnPolicies",
+        "openapi": "openApi",
+    }
 
     with primary.api_versioned_client(api_version=args.gov_api_version) as c:
+        # The response with ?case=original should be almost exactly what was
+        # submitted (including exactly which fields are present/omitted). The
+        # only changes are the casing of HTTP verbs, and the prefixing of module
+        # names.
+        r = c.get("/gov/service/javascript-app?case=original", validate_openapi=False)
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        actual = r.body.json()
+        expected = canonicalise(
+            expected_metadata,
+            {
+                **http_methods_renamed,
+                **module_names_prefixed,
+            },
+        )
+        assert (
+            expected == actual
+        ), f"{json.dumps(expected, indent=2)}\nvs\n{json.dumps(actual, indent=2)}"
+
+        r = c.get("/gov/service/javascript-app")
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        compare_app_metadata(
+            expected_metadata,
+            r.body.json(),
+            {
+                **http_methods_renamed,
+                **module_names_prefixed,
+                **endpoint_def_camelcased,
+            },
+        )
+
         r = c.get("/gov/service/javascript-modules")
         assert r.status_code == http.HTTPStatus.OK, r.status_code
 
@@ -75,7 +168,7 @@ def test_module_access(network, args):
 
 
 @reqs.description("Test module bytecode caching")
-@reqs.installed_package("libjs_generic")
+@reqs.installed_package("js_generic")
 def test_bytecode_cache(network, args):
     primary, _ = network.find_nodes()
 
@@ -177,7 +270,7 @@ def test_app_bundle(network, args):
     # Testing the bundle archive support of the Python client here.
     # Plain bundle folders are tested in the npm-based app tests.
     bundle_dir = os.path.join(PARENT_DIR, "js-app-bundle")
-    raw_module_name = "/math.js".encode()
+    raw_module_name = b"/math.js"
     with tempfile.TemporaryDirectory(prefix="ccf") as tmp_dir:
         bundle_path = shutil.make_archive(
             os.path.join(tmp_dir, "bundle"), "zip", bundle_dir
@@ -383,7 +476,7 @@ def test_js_exception_output(network, args):
         assert body["error"]["details"][0]["message"] == "Error: test error: 42"
         assert (
             body["error"]["details"][0]["trace"]
-            == "    at nested (/endpoints/rpc.js:27)\n    at throwError (/endpoints/rpc.js:29)\n"
+            == "    at nested (/endpoints/rpc.js:27:24)\n    at throwError (/endpoints/rpc.js:29:11)\n"
         )
 
         network.consortium.set_js_runtime_options(
@@ -447,7 +540,7 @@ def test_user_cose_authentication(network, args):
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 

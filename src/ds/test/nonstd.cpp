@@ -52,21 +52,21 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
       {
         INFO("split(max_splits=3)");
         {
-          auto v = ccf::nonstd::split(s, " ", 3);
+          auto parts = ccf::nonstd::split(s, " ", 3);
           // NB: max_splits=3 => 4 returned segments
-          REQUIRE(v.size() == 4);
-          REQUIRE(v[0] == "Good");
-          REQUIRE(v[1] == "afternoon,");
-          REQUIRE(v[2] == "good");
-          REQUIRE(v[3] == "evening, and good night!");
+          REQUIRE(parts.size() == 4);
+          REQUIRE(parts[0] == "Good");
+          REQUIRE(parts[1] == "afternoon,");
+          REQUIRE(parts[2] == "good");
+          REQUIRE(parts[3] == "evening, and good night!");
         }
 
         {
-          auto v = ccf::nonstd::split(s, "afternoon", 3);
+          auto parts = ccf::nonstd::split(s, "afternoon", 3);
           // NB: max_splits=3, but only 1 split possible => 2 returned segments
-          REQUIRE(v.size() == 2);
-          REQUIRE(v[0] == "Good ");
-          REQUIRE(v[1] == ", good evening, and good night!");
+          REQUIRE(parts.size() == 2);
+          REQUIRE(parts[0] == "Good ");
+          REQUIRE(parts[1] == ", good evening, and good night!");
         }
       }
 
@@ -264,4 +264,20 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
       }
     }
   }
+}
+
+TEST_CASE("trim" * doctest::test_suite("nonstd"))
+{
+  REQUIRE(ccf::nonstd::trim("  hello world  ") == "hello world");
+  REQUIRE(
+    ccf::nonstd::trim(" \r\n\t\nhello world\n\n\r\t\t\n\t \n\t") ==
+    "hello world");
+  REQUIRE(ccf::nonstd::trim("..hello..") == "..hello..");
+  REQUIRE(ccf::nonstd::trim("..hello..", ".") == "hello");
+
+  REQUIRE(ccf::nonstd::trim("hello") == "hello");
+  REQUIRE(ccf::nonstd::trim(" h") == "h");
+  REQUIRE(ccf::nonstd::trim("h ") == "h");
+  REQUIRE(ccf::nonstd::trim(" ") == "");
+  REQUIRE(ccf::nonstd::trim("") == "");
 }

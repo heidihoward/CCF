@@ -1,26 +1,29 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.network
+import datetime
+import json
+import os
+import shutil
+import time
+
+import ccf.ledger
+import infra.crypto
 import infra.e2e_args
-import infra.proc
-import infra.logging_app as app
-import infra.utils
 import infra.github
 import infra.jwt_issuer
-import infra.crypto
+import infra.logging_app as app
+import infra.network
 import infra.node
+import infra.platform_detection
+import infra.proc
+import infra.utils
 import suite.test_requirements as reqs
-import ccf.ledger
-import os
-import json
-import datetime
+from ccf.tx_id import TxID
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 from e2e_logging import test_random_receipts
 from governance import test_all_nodes_cert_renewal, test_service_cert_renewal
-from infra.snp import IS_SNP
-from distutils.dir_util import copy_tree
-
 from loguru import logger as LOG
-
 
 # Assumption:
 # By default, this assumes that the local checkout is not a non-release branch (e.g. main)
@@ -39,11 +42,19 @@ LOCAL_CHECKOUT_DIRECTORY = "."
 DEFAULT_NODE_CERTIFICATE_VALIDITY_DAYS = 365
 
 
+def disable_openapi_validation(network):
+    def skip_openapi_validation(_node):
+        pass
+
+    network._start_openapi_validation = skip_openapi_validation
+    return network
+
+
 def update_gov_authn(version):
     rv = None
-    if not infra.node.version_after(version, "ccf-3.0.0"):
+    if not infra.node.CCFVersion(version) > infra.node.CCFVersion("ccf-3.0.0"):
         rv = False
-    if infra.node.version_after(version, "ccf-4.0.0-rc0"):
+    if infra.node.CCFVersion(version) > infra.node.CCFVersion("ccf-4.0.0-rc0"):
         rv = "COSE"
     LOG.info(f"Setting gov authn to {rv} because version is {version}")
     return rv
@@ -76,7 +87,7 @@ def get_new_constitution_for_install(args, install_path):
         args.constitution[:] = [
             (
                 os.path.join(constitution_directory, fragment_name)
-                if fragment_name in f
+                if os.path.basename(f) == fragment_name
                 else f
             )
             for f in args.constitution
@@ -98,8 +109,10 @@ def test_new_service(
     binary_dir,
     library_dir,
     version,
+    expected_subject_name=None,
+    test_jwt_cleanup=False,
 ):
-    if IS_SNP:
+    if infra.platform_detection.is_snp():
         LOG.info(
             "Skipping backwards compatibility test for AMD nodes until either we patch 2.x or we confirm that we don't need to do a live upgrade"
         )
@@ -124,17 +137,28 @@ def test_new_service(
 
     LOG.info("Add node to new service")
 
-    valid_from = str(infra.crypto.datetime_to_X509time(datetime.datetime.utcnow()))
+    valid_from = str(
+        infra.crypto.datetime_to_X509time(datetime.datetime.now(datetime.timezone.utc))
+    )
 
     kwargs = {}
     kwargs["reconfiguration_type"] = "OneTransaction"
 
+    if infra.node.CCFVersion(version) < infra.node.CCFVersion("ccf-6.0.0"):
+        primary, _ = network.find_primary()
+        snapshots_dir = network.get_committed_snapshots(primary)
+        kwargs["from_snapshot"] = True
+        kwargs["snapshots_dir"] = snapshots_dir
+    else:
+        kwargs["from_snapshot"] = False
+        kwargs["fetch_recent_snapshot"] = True
+
     new_node = network.create_node(
-        "local://localhost",
         binary_dir=binary_dir,
         library_dir=library_dir,
         version=version,
     )
+
     network.join_node(new_node, args.package, args, **kwargs)
     network.trust_node(
         new_node,
@@ -149,12 +173,83 @@ def test_new_service(
     test_all_nodes_cert_renewal(network, args, valid_from=valid_from)
     test_service_cert_renewal(network, args, valid_from=valid_from)
 
+    if expected_subject_name:
+        LOG.info(f"Confirming subject name == {expected_subject_name}")
+        with primary.client() as c:
+            r = c.get("/node/network")
+            assert r.status_code == 200, r
+            cert_pem = r.body.json()["service_certificate"]
+            cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+            assert cert.subject.rfc4514_string() == expected_subject_name, cert
+
     LOG.info("Apply transactions to new nodes only")
     issue_activity_on_live_service(network, args)
     test_random_receipts(network, args, lts=True, log_capture=[])
     # Setting from_seqno=1 as open ranges do not work with older ledgers
     # that did not record the now-deprecated "public:first_write_version" table
     network.txs.verify_range(log_capture=[], from_seqno=1)
+
+    if test_jwt_cleanup:
+
+        def get_fresh_public_state():
+            with primary.client() as c:
+                r = c.get("/node/commit")
+                target_seqno = TxID.from_str(r.body.json()["transaction_id"]).seqno
+            network.consortium.force_ledger_chunk(primary)
+            for _ in range(10):
+                ledger = ccf.ledger.Ledger(
+                    primary.remote.ledger_paths(),
+                    committed_only=True,
+                    contiguous_suffix=True,
+                )
+                public_state, last_seqno = ledger.get_latest_public_state()
+                if last_seqno >= target_seqno:
+                    return public_state
+
+                time.sleep(0.1)
+            assert (
+                False
+            ), f"Failed to up-to-date ledger state, seqno needed: {target_seqno}, last seqno: {last_seqno}"
+
+        def table_has_entries(table_name, public_state):
+            rows = public_state.get(table_name, None)
+            return rows is not None and len(rows) > 0
+
+        legacy_tables = [
+            "public:ccf.gov.jwt.public_signing_keys",
+            "public:ccf.gov.jwt.public_signing_keys_metadata",
+            "public:ccf.gov.jwt.public_signing_key_issuer",
+        ]
+        new_table = "public:ccf.gov.jwt.public_signing_keys_metadata_v2"
+
+        public_state = get_fresh_public_state()
+        assert all(table_has_entries(table, public_state) for table in legacy_tables)
+        assert table_has_entries(new_table, public_state)
+
+        network.consortium.cleanup_legacy_jwt_records(
+            primary, ensure_new_records_exist=True
+        )
+
+        public_state = get_fresh_public_state()
+        assert all(
+            not table_has_entries(table, public_state) for table in legacy_tables
+        )
+
+        # Cannot remove legacy if the current table is not populated but required to be
+        network.consortium.remove_jwt_issuer(primary, network.jwt_issuer.issuer_url)
+        public_state = get_fresh_public_state()
+        assert not table_has_entries(new_table, public_state)
+        try:
+            network.consortium.cleanup_legacy_jwt_records(
+                primary, ensure_new_records_exist=True
+            )
+        except infra.proposal.ProposalNotAccepted:
+            pass
+
+        # Although can remove it if not ensuring explicitly new records exist
+        network.consortium.cleanup_legacy_jwt_records(
+            primary, ensure_new_records_exist=False
+        )
 
 
 # Local build and install bin/ and lib/ directories differ
@@ -191,7 +286,7 @@ def run_code_upgrade_from(
     to_version=None,
     from_container_image=None,
 ):
-    if IS_SNP:
+    if infra.platform_detection.is_snp():
         LOG.info(
             "Skipping backwards compatibility test for AMD nodes until either we patch 2.x or we confirm that we don't need to do a live upgrade"
         )
@@ -206,9 +301,18 @@ def run_code_upgrade_from(
 
     set_js_args(args, from_install_path, to_install_path)
 
+    service_subject_name = "CN=LTS custom service name"
+
     jwt_issuer = infra.jwt_issuer.JwtIssuer(
         "https://localhost", refresh_interval=args.jwt_key_refresh_interval_s
     )
+
+    # pre 6.0.21 nodes may not always set the chunking flags in the ledger
+    # This arrived in #7640, the backport of #7097
+    ccf621 = infra.node.CCFVersion("ccf-6.0.21")
+    fv_skip_verify_chunking = infra.node.CCFVersion(from_version) < ccf621
+    tv_skip_verify_chunking = infra.node.CCFVersion(to_version) < ccf621
+
     with jwt_issuer.start_openid_server():
         txs = app.LoggingTxs(jwt_issuer=jwt_issuer)
         with infra.network.network(
@@ -219,13 +323,20 @@ def run_code_upgrade_from(
             txs=txs,
             jwt_issuer=jwt_issuer,
             version=from_version,
+            skip_verify_chunking=fv_skip_verify_chunking or tv_skip_verify_chunking,
         ) as network:
+            disable_openapi_validation(network)
             kwargs = {}
-            if not infra.node.version_after(from_version, "ccf-4.0.0-rc1"):
+            if not infra.node.CCFVersion(from_version) > infra.node.CCFVersion(
+                "ccf-4.0.0-rc1"
+            ):
                 kwargs["reconfiguration_type"] = "OneTransaction"
 
             network.start_and_open(
-                args, node_container_image=from_container_image, **kwargs
+                args,
+                node_container_image=from_container_image,
+                service_subject_name=service_subject_name,
+                **kwargs,
             )
 
             old_nodes = network.get_joined_nodes()
@@ -234,37 +345,64 @@ def run_code_upgrade_from(
             LOG.info("Apply transactions to old service")
             issue_activity_on_live_service(network, args)
 
-            new_code_id = infra.utils.get_code_id(
-                args.enclave_type,
-                args.enclave_platform,
-                args.oe_binary,
-                args.package,
-                library_dir=to_library_dir,
-            )
-            network.consortium.add_new_code(primary, new_code_id)
-
             LOG.info("Update constitution")
             new_constitution = get_new_constitution_for_install(args, to_install_path)
             network.consortium.set_constitution(primary, new_constitution)
 
+            new_measurement = infra.utils.get_measurement(
+                infra.platform_detection.get_platform(),
+                args.package,
+                library_dir=to_library_dir,
+            )
+            network.consortium.add_measurement(
+                primary, infra.platform_detection.get_platform(), new_measurement
+            )
+
+            new_host_data = None
+            try:
+                new_host_data, new_security_policy = (
+                    infra.utils.get_host_data_and_security_policy(
+                        infra.platform_detection.get_platform(),
+                        args.package,
+                        library_dir=to_library_dir,
+                        binary_dir=to_binary_dir,
+                        version=to_version,
+                    )
+                )
+                network.consortium.add_host_data(
+                    primary,
+                    infra.platform_detection.get_platform(),
+                    new_host_data,
+                    new_security_policy,
+                )
+            except ValueError as e:
+                LOG.warning(f"Not setting host data/security policy for new nodes: {e}")
+
             # Note: alternate between joining from snapshot and replaying entire ledger
             new_nodes = []
-            from_snapshot = True
-            for _ in range(0, len(old_nodes)):
+            fetch_recent_snapshot = True
+            for _ in range(len(old_nodes)):
                 new_node = network.create_node(
-                    "local://localhost",
                     binary_dir=to_binary_dir,
                     library_dir=to_library_dir,
                     version=to_version,
                 )
+
+                kwargs = {}
+                kwargs["fetch_recent_snapshot"] = fetch_recent_snapshot
+                if not fetch_recent_snapshot:
+                    kwargs["copy_ledger"] = True
+
                 network.join_node(
-                    new_node, args.package, args, from_snapshot=from_snapshot
+                    new_node, args.package, args, from_snapshot=False, **kwargs
                 )
                 network.trust_node(
                     new_node,
                     args,
                     valid_from=str(  # Pre-2.0 nodes require X509 time format
-                        infra.crypto.datetime_to_X509time(datetime.datetime.utcnow())
+                        infra.crypto.datetime_to_X509time(
+                            datetime.datetime.now(datetime.timezone.utc)
+                        )
                     ),
                 )
                 # For 2.x nodes joining a 1.x service before the constitution is updated,
@@ -274,7 +412,7 @@ def run_code_upgrade_from(
                     expected_validity_period_days=DEFAULT_NODE_CERTIFICATE_VALIDITY_DAYS,
                     ignore_proposal_valid_from=True,
                 )
-                from_snapshot = not from_snapshot
+                fetch_recent_snapshot = not fetch_recent_snapshot
                 new_nodes.append(new_node)
 
             # Verify that all nodes run the expected CCF version
@@ -287,18 +425,59 @@ def run_code_upgrade_from(
                         version == expected_version
                     ), f"For node {node.local_node_id}, expect version {expected_version}, got {version}"
 
+            # Verify that either custom service_subject_name was applied,
+            # or that a default name is used
+            primary, _ = network.find_primary()
+            with primary.client() as c:
+                r = c.get("/node/network")
+                assert r.status_code == 200, r
+                cert_pem = r.body.json()["service_certificate"]
+                cert = x509.load_pem_x509_certificate(
+                    cert_pem.encode(), default_backend()
+                )
+                version = primary.version or args.ccf_version
+                if not infra.node.CCFVersion(version) > infra.node.CCFVersion(
+                    "ccf-5.0.0-dev14"
+                ):
+                    service_subject_name = cert.subject.rfc4514_string()
+                    LOG.info(
+                        f"Custom subject name not supported on {version}, so falling back to default {service_subject_name}"
+                    )
+                else:
+                    LOG.info(f"Custom subject name should be supported on {version}")
+                    assert cert.subject.rfc4514_string() == service_subject_name, cert
+
             LOG.info("Apply transactions to hybrid network, with primary as old node")
             issue_activity_on_live_service(network, args)
 
-            old_code_id = infra.utils.get_code_id(
-                args.enclave_type,
-                args.enclave_platform,
-                args.oe_binary,
+            primary, _ = network.find_primary()
+
+            old_measurement = infra.utils.get_measurement(
+                infra.platform_detection.get_platform(),
                 args.package,
                 library_dir=from_library_dir,
             )
-            primary, _ = network.find_primary()
-            network.consortium.retire_code(primary, old_code_id)
+            if old_measurement != new_measurement:
+                network.consortium.remove_measurement(
+                    primary, infra.platform_detection.get_platform(), old_measurement
+                )
+
+            # If host_data was found for original nodes, check if it's different on new nodes, in which case old should be removed
+            if new_host_data is not None:
+                old_host_data, _old_security_policy = (
+                    infra.utils.get_host_data_and_security_policy(
+                        infra.platform_detection.get_platform(),
+                        args.package,
+                        library_dir=from_library_dir,
+                        binary_dir=from_binary_dir,
+                        version=from_version,
+                    )
+                )
+
+                if old_host_data != new_host_data:
+                    network.consortium.remove_host_data(
+                        primary, infra.platform_detection.get_platform(), old_host_data
+                    )
 
             for index, node in enumerate(old_nodes):
                 network.retire_node(primary, node)
@@ -357,12 +536,8 @@ def run_code_upgrade_from(
 
             # Rollover JWKS so that new primary must read historical CA bundle table
             # and retrieve new keys via auto refresh
-            if not os.getenv("CONTAINER_NODES"):
-                jwt_issuer.refresh_keys()
-                jwt_issuer.wait_for_refresh(network, args)
-            else:
-                # https://github.com/microsoft/CCF/issues/2608#issuecomment-924785744
-                LOG.warning("Skipping JWT refresh as running nodes in container")
+            jwt_issuer.refresh_keys()
+            jwt_issuer.wait_for_refresh(network, args)
 
             test_new_service(
                 network,
@@ -371,6 +546,7 @@ def run_code_upgrade_from(
                 to_binary_dir,
                 to_library_dir,
                 to_version,
+                expected_subject_name=service_subject_name,
             )
             network.get_latest_ledger_public_state()
 
@@ -392,7 +568,7 @@ def run_live_compatibility_with_latest(
         lts_version, lts_install_path = repo.install_latest_lts_for_branch(
             os.getenv(ENV_VAR_LATEST_LTS_BRANCH_NAME, local_branch),
             this_release_branch_only,
-            platform=args.enclave_platform,
+            platform=infra.platform_detection.get_platform(),
         )
     else:
         lts_version = infra.github.get_version_from_install(lts_install_path)
@@ -417,7 +593,9 @@ def run_live_compatibility_with_latest(
 
 
 @reqs.description("Run ledger compatibility since first LTS")
-def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
+def run_ledger_compatibility_since_first(
+    args, local_branch, use_snapshot, test_jwt_cleanup
+):
     """
     Tests that a service from the very first LTS can be recovered
     to the next LTS, and so forth, until the version of the local checkout.
@@ -438,21 +616,22 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
     # Note: dicts are ordered from Python3.7
     lts_releases[None] = None
 
+    # These variables are the previous service's info
     ledger_dir = None
     committed_ledger_dirs = None
     snapshots_dir = None
+    previous_version = None
 
     jwt_issuer = infra.jwt_issuer.JwtIssuer(
         "https://localhost", refresh_interval=args.jwt_key_refresh_interval_s
     )
-    previous_version = None
     with jwt_issuer.start_openid_server():
         txs = app.LoggingTxs(jwt_issuer=jwt_issuer)
         for idx, (_, lts_release) in enumerate(lts_releases.items()):
             if lts_release:
                 version, install_path = repo.install_release(
                     lts_release,
-                    platform=args.enclave_platform,
+                    platform=infra.platform_detection.get_platform(),
                 )
                 lts_versions.append(version)
                 set_js_args(args, install_path)
@@ -473,9 +652,12 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
                     "txs": txs,
                     "jwt_issuer": jwt_issuer,
                     "version": version,
+                    "skip_verify_chunking": True,  # Old ledger files will have incorrect chunking
                 }
                 kwargs = {}
-                if not infra.node.version_after(version, "ccf-4.0.0-rc1"):
+                if not infra.node.CCFVersion(version) > infra.node.CCFVersion(
+                    "ccf-4.0.0-rc1"
+                ):
                     kwargs["reconfiguration_type"] = "OneTransaction"
 
                 if idx == 0:
@@ -494,16 +676,30 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
                     new_common = infra.network.get_common_folder_name(
                         args.workspace, args.label
                     )
-                    copy_tree(os.path.join(service_dir, "common"), new_common)
+                    shutil.copytree(
+                        os.path.join(service_dir, "common"),
+                        new_common,
+                        dirs_exist_ok=True,
+                    )
 
                     new_ledger = os.path.join(new_common, "ledger")
-                    copy_tree(os.path.join(service_dir, "ledger"), new_ledger)
+                    shutil.copytree(
+                        os.path.join(service_dir, "ledger"),
+                        new_ledger,
+                        dirs_exist_ok=True,
+                    )
 
                     if use_snapshot:
                         new_snapshots = os.path.join(new_common, "snapshots")
-                        copy_tree(os.path.join(service_dir, "snapshots"), new_snapshots)
+                        shutil.copytree(
+                            os.path.join(service_dir, "snapshots"),
+                            new_snapshots,
+                            dirs_exist_ok=True,
+                        )
 
-                    network = infra.network.Network(**network_args)
+                    network = disable_openapi_validation(
+                        infra.network.Network(**network_args)
+                    )
 
                     args.previous_service_identity_file = os.path.join(
                         service_dir, "common", "service_cert.pem"
@@ -511,7 +707,6 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
 
                     network.start_in_recovery(
                         args,
-                        ledger_dir=new_ledger,
                         committed_ledger_dirs=[new_ledger],
                         snapshots_dir=new_snapshots if use_snapshot else None,
                         common_dir=new_common,
@@ -526,8 +721,8 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
                     jwt_issuer.register(network)
                 else:
                     LOG.info(f"Recovering service (new version: {version})")
-                    network = infra.network.Network(
-                        **network_args, existing_network=network
+                    network = disable_openapi_validation(
+                        infra.network.Network(**network_args, existing_network=network)
                     )
 
                     network.start_in_recovery(
@@ -543,14 +738,11 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
                         args,
                         expected_recovery_count=(
                             1
-                            if not infra.node.version_after(
-                                previous_version, "ccf-2.0.3"
-                            )
+                            if not infra.node.CCFVersion(previous_version)
+                            > infra.node.CCFVersion("ccf-2.0.3")
                             else None
                         ),
                     )
-
-                previous_version = version
 
                 nodes = network.get_joined_nodes()
                 primary, _ = network.find_primary()
@@ -582,6 +774,7 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
                         binary_dir,
                         library_dir,
                         version,
+                        test_jwt_cleanup=test_jwt_cleanup,
                     )
 
                 snapshots_dir = (
@@ -589,23 +782,34 @@ def run_ledger_compatibility_since_first(args, local_branch, use_snapshot):
                 )
 
                 network.save_service_identity(args)
-                # We accept ledger chunk file differences during upgrades
-                # from 1.x to 2.x post rc7 ledger. This is necessary because
-                # the ledger files may not be chunked at the same interval
-                # between those versions (see https://github.com/microsoft/ccf/issues/3613;
-                # 1.x ledgers do not contain the header flags to synchronize ledger chunks).
-                # This can go once 2.0 is released.
-                network.stop_all_nodes(skip_verification=True, accept_ledger_diff=True)
+
+                # Ledger file chunking changed from 1.x to 2.x and if it does not join from a snapshot the eol ledger files will be re-chunked differently on the joining node
+                check_file_invariants = use_snapshot
+
+                skip_verification = test_jwt_cleanup
+
+                LOG.info(
+                    f"Stopping network recovering from version {previous_version} to {version}"
+                )
+                network.stop_all_nodes(
+                    check_file_invariants=check_file_invariants,
+                    skip_verification=skip_verification,
+                )
+
                 ledger_dir, committed_ledger_dirs = primary.get_ledger()
 
                 # Check that ledger and snapshots can be parsed
-                ccf.ledger.Ledger(committed_ledger_dirs).get_latest_public_state()
+                ccf.ledger.Ledger(
+                    committed_ledger_dirs, contiguous_suffix=True
+                ).get_latest_public_state()
                 if snapshots_dir:
                     for s in os.listdir(snapshots_dir):
                         with ccf.ledger.Snapshot(
                             os.path.join(snapshots_dir, s)
                         ) as snapshot:
                             snapshot.get_public_domain()
+
+                previous_version = version
 
     return lts_versions
 
@@ -625,29 +829,18 @@ if __name__ == "__main__":
             help='Absolute path to existing CCF release, e.g. "/opt/ccf"',
             default=None,
         )
-        parser.add_argument(
-            "--release-install-image",
-            type=str,
-            help="If --release-install-path is set, specify a docker image to run release in (only if CONTAINER_NODES envvar is set) ",
-            default=None,
-        )
         parser.add_argument("--dry-run", action="store_true")
 
     args = infra.e2e_args.cli_args(add)
 
     # JS generic is the only app included in CCF install
-    args.package = "libjs_generic"
+    args.package = "js_generic"
     args.nodes = infra.e2e_args.max_nodes(args, f=0)
     args.jwt_key_refresh_interval_s = 3
-    args.sig_ms_interval = 1000  # Set to cchost default value
+    args.sig_ms_interval = 1000  # Set to node default value
 
     # Hardcoded because host only accepts info log on release builds
-    args.host_log_level = "info"
-
-    # For compatibility with <= 2.x versions as enclave platform
-    # was introduced in 3.x
-    if args.enclave_platform == "virtual":
-        args.enclave_type = "virtual"
+    args.log_level = "info"
 
     repo = infra.github.Repository()
     local_branch = infra.github.GitEnv.local_branch()
@@ -691,13 +884,19 @@ if __name__ == "__main__":
         if args.check_ledger_compatibility:
             compatibility_report["data compatibility"] = {}
             lts_versions = run_ledger_compatibility_since_first(
-                args, local_branch, use_snapshot=False
+                args,
+                local_branch,
+                use_snapshot=False,
+                test_jwt_cleanup=False,
             )
             compatibility_report["data compatibility"].update(
                 {"with previous ledger": lts_versions}
             )
             lts_versions = run_ledger_compatibility_since_first(
-                args, local_branch, use_snapshot=True
+                args,
+                local_branch,
+                use_snapshot=True,
+                test_jwt_cleanup=True,
             )
             compatibility_report["data compatibility"].update(
                 {"with previous snapshots": lts_versions}

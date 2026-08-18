@@ -8,34 +8,35 @@
 namespace ccf::js::core
 {
   JSWrappedValue::JSWrappedValue() :
-    ctx(NULL),
+    ctx(nullptr),
     val(ccf::js::core::constants::Null)
   {}
+
   JSWrappedValue::JSWrappedValue(JSContext* ctx, JSValue&& val) :
     ctx(ctx),
-    val(std::move(val))
+    val(val)
   {}
 
   JSWrappedValue::JSWrappedValue(JSContext* ctx, const JSValue& value) :
-    ctx(ctx)
-  {
-    val = JS_DupValue(ctx, value);
-  }
+    ctx(ctx),
+    val(JS_DupValue(ctx, value))
+  {}
 
-  JSWrappedValue::JSWrappedValue(const JSWrappedValue& other) : ctx(other.ctx)
-  {
-    val = JS_DupValue(ctx, other.val);
-  }
+  JSWrappedValue::JSWrappedValue(const JSWrappedValue& other) :
+    ctx(other.ctx),
+    val(JS_DupValue(ctx, other.val))
+  {}
 
-  JSWrappedValue::JSWrappedValue(JSWrappedValue&& other) : ctx(other.ctx)
+  JSWrappedValue::JSWrappedValue(JSWrappedValue&& other) noexcept :
+    ctx(other.ctx),
+    val(other.val)
   {
-    val = other.val;
     other.val = ccf::js::core::constants::Null;
   }
 
   JSWrappedValue::~JSWrappedValue()
   {
-    if (ctx && JS_VALUE_GET_TAG(val) != JS_TAG_MODULE)
+    if (ctx != nullptr)
     {
       JS_FreeValue(ctx, val);
     }
@@ -43,14 +44,21 @@ namespace ccf::js::core
 
   JSWrappedValue& JSWrappedValue::operator=(const JSWrappedValue& other)
   {
-    ctx = other.ctx;
-    val = JS_DupValue(ctx, other.val);
+    if (this != &other)
+    {
+      if (ctx != nullptr)
+      {
+        JS_FreeValue(ctx, val);
+      }
+      ctx = other.ctx;
+      val = JS_DupValue(ctx, other.val);
+    }
     return *this;
   }
 
   JSWrappedValue JSWrappedValue::operator[](const char* prop) const
   {
-    return JSWrappedValue(ctx, JS_GetPropertyStr(ctx, val, prop));
+    return {ctx, JS_GetPropertyStr(ctx, val, prop)};
   }
 
   JSWrappedValue JSWrappedValue::operator[](const std::string& prop) const
@@ -60,7 +68,7 @@ namespace ccf::js::core
 
   JSWrappedValue JSWrappedValue::operator[](uint32_t i) const
   {
-    return JSWrappedValue(ctx, JS_GetPropertyUint32(ctx, val, i));
+    return {ctx, JS_GetPropertyUint32(ctx, val, i)};
   }
 
   int JSWrappedValue::set(const char* prop, JSWrappedValue&& value) const
@@ -104,7 +112,7 @@ namespace ccf::js::core
     return set(prop.c_str(), std::move(value));
   }
 
-  int JSWrappedValue::set(const std::string& prop, JSValue&& value) const
+  int JSWrappedValue::set(const std::string& prop, JSValue value) const
   {
     return JS_SetPropertyStr(ctx, val, prop.c_str(), value);
   }
@@ -127,10 +135,11 @@ namespace ccf::js::core
 
   int JSWrappedValue::set_bool(const std::string& prop, bool b) const
   {
-    return JS_SetPropertyStr(ctx, val, prop.c_str(), JS_NewBool(ctx, b));
+    return JS_SetPropertyStr(
+      ctx, val, prop.c_str(), JS_NewBool(ctx, static_cast<int>(b)));
   }
 
-  int JSWrappedValue::set_at_index(uint32_t index, JSWrappedValue&& value)
+  int JSWrappedValue::set_at_index(uint32_t index, JSWrappedValue&& value) const
   {
     int rc =
       JS_DefinePropertyValueUint32(ctx, val, index, value.val, JS_PROP_C_W_E);
@@ -143,22 +152,22 @@ namespace ccf::js::core
 
   bool JSWrappedValue::is_exception() const
   {
-    return JS_IsException(val);
+    return JS_IsException(val) != 0;
   }
 
   bool JSWrappedValue::is_error() const
   {
-    return JS_IsError(ctx, val);
+    return JS_IsError(ctx, val) != 0;
   }
 
   bool JSWrappedValue::is_obj() const
   {
-    return JS_IsObject(val);
+    return JS_IsObject(val) != 0;
   }
 
   bool JSWrappedValue::is_str() const
   {
-    return JS_IsString(val);
+    return JS_IsString(val) != 0;
   }
 
   bool JSWrappedValue::is_true() const
@@ -169,7 +178,7 @@ namespace ccf::js::core
 
   bool JSWrappedValue::is_undefined() const
   {
-    return JS_IsUndefined(val);
+    return JS_IsUndefined(val) != 0;
   }
 
   JSValue JSWrappedValue::take()

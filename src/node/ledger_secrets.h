@@ -5,6 +5,8 @@
 #include "ccf/crypto/symmetric_key.h"
 #include "ccf/pal/locking.h"
 #include "ccf/tx.h"
+#include "ds/ccf_assert.h"
+#include "ds/internal_logger.h"
 #include "kv/kv_types.h"
 #include "ledger_secret.h"
 #include "service/tables/secrets.h"
@@ -100,7 +102,9 @@ namespace ccf
       // another tx. To prevent conflicts, accessing the ledger secrets
       // require access to a tx object, which must take a dependency on the
       // secrets table.
-      auto secrets = tx.ro<Secrets>(Tables::ENCRYPTED_LEDGER_SECRETS);
+      // This must run before acquiring lock: local KV hooks run with map locks
+      // held and acquire lock when they install a rekeyed secret.
+      auto* secrets = tx.ro<Secrets>(Tables::ENCRYPTED_LEDGER_SECRETS);
       secrets->get();
     }
 
@@ -168,9 +172,9 @@ namespace ccf
 
     VersionedLedgerSecret get_latest(ccf::kv::ReadOnlyTx& tx)
     {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
-
       take_dependency_on_secrets(tx);
+
+      std::lock_guard<ccf::pal::Mutex> guard(lock);
 
       if (ledger_secrets.empty())
       {
@@ -184,9 +188,9 @@ namespace ccf
     std::pair<VersionedLedgerSecret, std::optional<VersionedLedgerSecret>>
     get_latest_and_penultimate(ccf::kv::ReadOnlyTx& tx)
     {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
-
       take_dependency_on_secrets(tx);
+
+      std::lock_guard<ccf::pal::Mutex> guard(lock);
 
       if (ledger_secrets.empty())
       {
@@ -207,9 +211,9 @@ namespace ccf
       ccf::kv::ReadOnlyTx& tx,
       std::optional<ccf::kv::Version> up_to = std::nullopt)
     {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
-
       take_dependency_on_secrets(tx);
+
+      std::lock_guard<ccf::pal::Mutex> guard(lock);
 
       if (!up_to.has_value())
       {
@@ -223,7 +227,7 @@ namespace ccf
           fmt::format("No ledger secrets at {}", up_to.has_value()));
       }
 
-      return LedgerSecretsMap(ledger_secrets.begin(), ++search);
+      return {ledger_secrets.begin(), ++search};
     }
 
     void restore_historical(LedgerSecretsMap&& restored_ledger_secrets)

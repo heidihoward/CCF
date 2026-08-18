@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 namespace ccf::ds
@@ -28,7 +29,7 @@ namespace ccf::ds
     {
       using iterator_category = std::random_access_iterator_tag;
       using value_type = size_t;
-      using difference_type = size_t;
+      using difference_type = ptrdiff_t;
       using pointer = const size_t*;
       using reference = size_t;
 
@@ -37,7 +38,7 @@ namespace ccf::ds
       RangeIt it;
       size_t offset = 0;
 
-      ConstIterator(RangeIt i, size_t o = 0) : it(i), offset(o) {}
+      ConstIterator(RangeIt i, size_t o = 0) : it(std::move(i)), offset(o) {}
 
       T operator*() const
       {
@@ -97,30 +98,30 @@ namespace ccf::ds
       {
         if (n_ < 0)
         {
-          return (*this) -= (size_t)-n_;
+          // Avoid signed overflow: compute magnitude safely via unsigned
+          // arithmetic (two's complement negation).
+          return (*this) -= static_cast<size_t>(-(n_ + 1)) + 1;
         }
-        else
+        auto n = static_cast<size_t>(n_);
+        while (offset + n > it->second)
         {
-          size_t n = n_;
-          while (offset + n > it->second)
-          {
-            n -= (it->second - offset + 1);
-            it = std::next(it);
-            offset = 0;
-          }
-          offset += n;
-          return (*this);
+          n -= (it->second - offset + 1);
+          it = std::next(it);
+          offset = 0;
         }
+        offset += n;
+        return (*this);
       }
 
-      ConstIterator operator+(size_t n) const
+      ConstIterator operator+(difference_type n) const
       {
         ConstIterator copy(it, offset);
         copy += n;
         return copy;
       }
 
-      friend ConstIterator operator+(size_t n, const ConstIterator& other)
+      friend ConstIterator operator+(
+        difference_type n, const ConstIterator& other)
       {
         return other + n;
       }
@@ -137,10 +138,10 @@ namespace ccf::ds
         return (*this);
       }
 
-      ConstIterator operator-(size_t n) const
+      ConstIterator operator-(difference_type n) const
       {
         ConstIterator copy(it, offset);
-        copy -= n;
+        copy += -n;
         return copy;
       }
 
@@ -149,27 +150,49 @@ namespace ccf::ds
         if (it == other.it)
         {
           // In same range, simple diff
-          return offset - other.offset;
+          return static_cast<difference_type>(offset) -
+            static_cast<difference_type>(other.offset);
         }
-        else if (it < other.it)
+
+        if (it < other.it)
         {
           return -(other - (*this));
         }
-        else
+
+        // it > other.it
+        // Walk from this->it to other.it, summing all of the ranges that are
+        // passed
+        size_t sum = std::accumulate(
+          std::reverse_iterator(it),
+          std::prev(std::reverse_iterator(other.it)),
+          offset + 1,
+          [](size_t acc, const auto& range) { return acc + range.second + 1; });
+        sum += other.it->second - other.offset;
+        return static_cast<difference_type>(sum);
+      }
+
+      bool operator<(const ConstIterator& other) const
+      {
+        if (it != other.it)
         {
-          // it > other.it
-          // Walk from this->it to other.it, summing all of the ranges that are
-          // passed
-          difference_type sum = std::accumulate(
-            std::reverse_iterator(it),
-            std::prev(std::reverse_iterator(other.it)),
-            offset + 1,
-            [](difference_type acc, const auto& range) {
-              return acc + range.second + 1;
-            });
-          sum += other.it->second - other.offset;
-          return sum;
+          return it < other.it;
         }
+        return offset < other.offset;
+      }
+
+      bool operator<=(const ConstIterator& other) const
+      {
+        return !(other < *this);
+      }
+
+      bool operator>(const ConstIterator& other) const
+      {
+        return other < *this;
+      }
+
+      bool operator>=(const ConstIterator& other) const
+      {
+        return !(*this < other);
       }
     };
 
@@ -234,7 +257,7 @@ namespace ccf::ds
         auto next_it = std::next(it);
         if (next_it != ranges.end())
         {
-          if (it->first + it->second + 1 == next_it->first)
+          if (it->first + static_cast<T>(it->second) + 1 == next_it->first)
           {
             it->second = it->second + 1 + next_it->second;
             ranges.erase(next_it);
@@ -251,7 +274,8 @@ namespace ccf::ds
       }
     }
 
-    typename Ranges::const_iterator find_internal(const T& t) const
+    [[nodiscard]] typename Ranges::const_iterator find_internal(
+      const T& t) const
     {
       Range estimated_range{t, 0};
       auto it = std::lower_bound(ranges.begin(), ranges.end(), estimated_range);
@@ -304,12 +328,12 @@ namespace ccf::ds
       return !(*this == other);
     }
 
-    const Ranges& get_ranges() const
+    [[nodiscard]] const Ranges& get_ranges() const
     {
       return ranges;
     }
 
-    size_t size() const
+    [[nodiscard]] size_t size() const
     {
       return std::accumulate(
         ranges.begin(), ranges.end(), 0u, [](size_t n, const Range& r) {
@@ -317,7 +341,7 @@ namespace ccf::ds
         });
     }
 
-    bool empty() const
+    [[nodiscard]] bool empty() const
     {
       return ranges.empty();
     }
@@ -341,14 +365,16 @@ namespace ccf::ds
           // Already present
           return false;
         }
-        else if (from + additional + 1 == t)
+
+        if (from + additional + 1 == t)
         {
           // Adjacent to the end of the existing range
           it->second++;
           maybe_merge_with_following(it);
           return true;
         }
-        else if (t + 1 == from)
+
+        if (t + 1 == from)
         {
           // Precedes directly, extend this range by 1
           it->first = t;
@@ -406,31 +432,27 @@ namespace ccf::ds
               ranges.erase(it);
               return true;
             }
-            else
-            {
-              // Shrink start of range
-              ++it->first;
-              --it->second;
-              return true;
-            }
+            // Shrink start of range
+            ++it->first;
+            --it->second;
+            return true;
           }
-          else if (t == from + additional)
+
+          if (t == from + additional)
           {
             // Shrink end of range
             --it->second;
             return true;
           }
-          else
-          {
-            const auto before = t - it->first - 1;
-            const auto after = it->first + it->second - t - 1;
 
-            it->second = before;
+          const auto before = t - it->first - 1;
+          const auto after = it->first + it->second - t - 1;
 
-            auto next_it = std::next(it);
-            ranges.emplace(next_it, t + 1, after);
-            return true;
-          }
+          it->second = before;
+
+          auto next_it = std::next(it);
+          ranges.emplace(next_it, t + 1, after);
+          return true;
         }
       }
 
@@ -441,16 +463,16 @@ namespace ccf::ds
     {
       for (auto n = from; n <= from + additional; ++n)
       {
-        const auto b = insert(n);
+        insert(n);
       }
     }
 
-    bool contains(const T& t) const
+    [[nodiscard]] bool contains(const T& t) const
     {
-      return find_internal(t) != end();
+      return find_internal(t) != end().it;
     }
 
-    ConstIterator find(const T& t) const
+    [[nodiscard]] ConstIterator find(const T& t) const
     {
       auto it = find_internal(t);
       if (it != ranges.end())
@@ -461,12 +483,12 @@ namespace ccf::ds
       return end();
     }
 
-    ConstIterator lower_bound(const T& t) const
+    [[nodiscard]] ConstIterator lower_bound(const T& t) const
     {
       return std::lower_bound(begin(), end(), t);
     }
 
-    ConstIterator upper_bound(const T& t) const
+    [[nodiscard]] ConstIterator upper_bound(const T& t) const
     {
       return std::upper_bound(begin(), end(), t);
     }
@@ -476,23 +498,23 @@ namespace ccf::ds
       ranges.clear();
     }
 
-    T front() const
+    [[nodiscard]] T front() const
     {
       return ranges.front().first;
     }
 
-    T back() const
+    [[nodiscard]] T back() const
     {
       const auto back = ranges.back();
       return back.first + back.second;
     }
 
-    ConstIterator begin() const
+    [[nodiscard]] ConstIterator begin() const
     {
       return ConstIterator(ranges.begin());
     }
 
-    ConstIterator end() const
+    [[nodiscard]] ConstIterator end() const
     {
       return ConstIterator(ranges.end());
     }

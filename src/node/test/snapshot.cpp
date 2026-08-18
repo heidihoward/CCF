@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 
-#include "ccf/crypto/key_pair.h"
+#include "ccf/crypto/ec_key_pair.h"
 #include "ccf/service/tables/nodes.h"
 #include "crypto/openssl/hash.h"
 #include "kv/test/null_encryptor.h"
@@ -14,9 +14,6 @@
 #undef FAIL
 #include <string>
 
-std::unique_ptr<threading::ThreadMessaging>
-  threading::ThreadMessaging::singleton = nullptr;
-
 TEST_CASE("Snapshot with merkle tree" * doctest::test_suite("snapshot"))
 {
   auto source_consensus = std::make_shared<ccf::kv::test::StubConsensus>();
@@ -25,16 +22,17 @@ TEST_CASE("Snapshot with merkle tree" * doctest::test_suite("snapshot"))
   source_store.set_encryptor(encryptor);
   source_store.set_consensus(source_consensus);
 
-  auto service_kp = std::dynamic_pointer_cast<ccf::crypto::KeyPair_OpenSSL>(
-    ccf::crypto::make_key_pair());
+  auto service_kp = std::dynamic_pointer_cast<ccf::crypto::ECKeyPair_OpenSSL>(
+    ccf::crypto::make_ec_key_pair());
 
   ccf::NodeId source_node_id = ccf::kv::test::PrimaryNodeId;
-  auto source_node_kp = ccf::crypto::make_key_pair();
+  auto source_node_kp = ccf::crypto::make_ec_key_pair();
 
   auto source_history = std::make_shared<ccf::MerkleTxHistory>(
     source_store, source_node_id, *source_node_kp);
   source_history->set_endorsed_certificate({});
-  source_history->set_service_kp(service_kp);
+  source_history->set_service_signing_identity(
+    service_kp, ccf::COSESignaturesConfig{});
   source_store.set_history(source_history);
   source_store.initialise_term(2);
 
@@ -93,16 +91,17 @@ TEST_CASE("Snapshot with merkle tree" * doctest::test_suite("snapshot"))
   INFO("Snapshot at signature");
   {
     ccf::kv::Store target_store;
-    auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
-    target_store.set_encryptor(encryptor);
+    auto target_encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
+    target_store.set_encryptor(target_encryptor);
     INFO("Setup target store");
     {
-      auto target_node_kp = ccf::crypto::make_key_pair();
+      auto target_node_kp = ccf::crypto::make_ec_key_pair();
 
       auto target_history = std::make_shared<ccf::MerkleTxHistory>(
         target_store, ccf::kv::test::PrimaryNodeId, *target_node_kp);
       target_history->set_endorsed_certificate({});
-      target_history->set_service_kp(service_kp);
+      target_history->set_service_signing_identity(
+        service_kp, ccf::COSESignaturesConfig{});
       target_store.set_history(target_history);
     }
 
@@ -179,12 +178,9 @@ TEST_CASE("Snapshot with merkle tree" * doctest::test_suite("snapshot"))
 
 int main(int argc, char** argv)
 {
-  threading::ThreadMessaging::init(1);
-  ccf::crypto::openssl_sha256_init();
   doctest::Context context;
   context.applyCommandLine(argc, argv);
   int res = context.run();
-  ccf::crypto::openssl_sha256_shutdown();
   if (context.shouldExit())
     return res;
   return res;

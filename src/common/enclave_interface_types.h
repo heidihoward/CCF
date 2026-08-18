@@ -4,7 +4,7 @@
 
 #include "ccf/ds/logger_level.h"
 
-enum CreateNodeStatus
+enum CreateNodeStatus : std::uint8_t
 {
   /** Call was successful and the node was successfully created */
   OK = 0,
@@ -27,23 +27,14 @@ enum CreateNodeStatus
   /** Enclave initialisation failed */
   EnclaveInitFailed = 6,
 
-  /** Open Enclave Verifier initialisation failed */
-  OEVerifierInitFailed = 7,
-
-  /** Open Enclave Attester initialisation failed */
-  OEAttesterInitFailed = 8,
-
   /** OpenSSL RDRAND Init Failed */
-  OpenSSLRDRANDInitFailed = 9,
+  OpenSSLRDRANDInitFailed = 7,
 
   /** The reconfiguration method is not supported */
-  ReconfigurationMethodNotSupported = 10,
-
-  /** Host and enclave versions must match */
-  VersionMismatch = 11,
+  ReconfigurationMethodNotSupported = 8,
 
   /** When reading from host memory, the source must be 8-byte aligned **/
-  UnalignedArguments = 12,
+  UnalignedArguments = 10,
 };
 
 constexpr char const* create_node_result_to_str(CreateNodeStatus result)
@@ -78,14 +69,6 @@ constexpr char const* create_node_result_to_str(CreateNodeStatus result)
     {
       return "EnclaveInitFailed";
     }
-    case CreateNodeStatus::OEVerifierInitFailed:
-    {
-      return "OEVerifierInitFailed";
-    }
-    case CreateNodeStatus::OEAttesterInitFailed:
-    {
-      return "OEAttesterInitFailed";
-    }
     case CreateNodeStatus::OpenSSLRDRANDInitFailed:
     {
       return "OpenSSLRDRANDInitFailed";
@@ -93,10 +76,6 @@ constexpr char const* create_node_result_to_str(CreateNodeStatus result)
     case CreateNodeStatus::ReconfigurationMethodNotSupported:
     {
       return "ReconfigurationMethodNotSupported";
-    }
-    case CreateNodeStatus::VersionMismatch:
-    {
-      return "VersionMismatch";
     }
     case CreateNodeStatus::UnalignedArguments:
     {
@@ -109,7 +88,7 @@ constexpr char const* create_node_result_to_str(CreateNodeStatus result)
   }
 }
 
-enum StartType
+enum StartType : std::uint8_t
 {
   Start = 1,
   Join = 2,

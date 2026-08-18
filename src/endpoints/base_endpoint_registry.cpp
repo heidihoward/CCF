@@ -6,7 +6,7 @@
 #include "ccf/service/tables/members.h"
 #include "ccf/service/tables/nodes.h"
 #include "ccf/service/tables/users.h"
-#include "enclave/enclave_time.h"
+#include "ds/internal_logger.h"
 #include "kv/kv_types.h"
 
 namespace ccf
@@ -24,20 +24,22 @@ namespace ccf
   {
     try
     {
-      if (consensus != nullptr)
+      auto* current_consensus = get_consensus();
+      if (current_consensus != nullptr)
       {
         if (since < 1)
         {
           reason = ccf::InvalidArgsReason::ViewSmallerThanOne;
           return ApiResult::InvalidArgs;
         }
-        auto latest_view = consensus->get_view();
+        auto latest_view = current_consensus->get_view();
         if (since > latest_view)
         {
           // asking for something in the future
           return ApiResult::NotFound;
         }
-        const auto view_history = consensus->get_view_history_since(since);
+        const auto view_history =
+          current_consensus->get_view_history_since(since);
         for (ccf::View i = 0; i < view_history.size(); i++)
         {
           const auto view = i + since;
@@ -58,7 +60,7 @@ namespace ccf
   ApiResult BaseEndpointRegistry::get_view_history_v1(
     std::vector<ccf::TxID>& history, ccf::View since)
   {
-    ccf::InvalidArgsReason ignored;
+    ccf::InvalidArgsReason ignored = {};
     return get_view_history_v2(history, since, ignored);
   }
 
@@ -67,14 +69,10 @@ namespace ccf
   {
     try
     {
-      if (consensus != nullptr)
+      auto* current_consensus = get_consensus();
+      if (current_consensus != nullptr)
       {
-        const auto tx_view = consensus->get_view(seqno);
-        const auto committed_seqno = consensus->get_committed_seqno();
-        const auto committed_view = consensus->get_view(committed_seqno);
-
-        tx_status = ccf::evaluate_tx_status(
-          view, seqno, tx_view, committed_view, committed_seqno);
+        tx_status = current_consensus->evaluate_tx_status(view, seqno);
       }
       else
       {
@@ -93,11 +91,12 @@ namespace ccf
   ApiResult BaseEndpointRegistry::get_last_committed_txid_v1(
     ccf::View& view, ccf::SeqNo& seqno)
   {
-    if (consensus != nullptr)
+    auto* current_consensus = get_consensus();
+    if (current_consensus != nullptr)
     {
       try
       {
-        const auto [v, s] = consensus->get_committed_txid();
+        const auto [v, s] = current_consensus->get_committed_txid();
         view = v;
         seqno = s;
         return ApiResult::OK;
@@ -141,7 +140,7 @@ namespace ccf
     try
     {
       const auto node_id = context.get_node_id();
-      auto nodes = tx.ro<ccf::Nodes>(Tables::NODES);
+      auto* nodes = tx.ro<ccf::Nodes>(Tables::NODES);
       const auto node_info = nodes->get(node_id);
 
       if (!node_info.has_value())
@@ -180,7 +179,7 @@ namespace ccf
     try
     {
       std::map<NodeId, QuoteInfo> tmp;
-      auto nodes = tx.ro<ccf::Nodes>(Tables::NODES);
+      auto* nodes = tx.ro<ccf::Nodes>(Tables::NODES);
       nodes->foreach([&tmp](const NodeId& node_id, const NodeInfo& ni) {
         if (ni.status == ccf::NodeStatus::TRUSTED)
         {
@@ -204,23 +203,18 @@ namespace ccf
   {
     try
     {
-      if (consensus != nullptr)
+      auto* current_consensus = get_consensus();
+      if (current_consensus != nullptr)
       {
-        const auto v = consensus->get_view(seqno);
+        const auto v = current_consensus->get_view(seqno);
         if (v != ccf::VIEW_UNKNOWN)
         {
           view = v;
           return ApiResult::OK;
         }
-        else
-        {
-          return ApiResult::NotFound;
-        }
+        return ApiResult::NotFound;
       }
-      else
-      {
-        return ApiResult::Uninitialised;
-      }
+      return ApiResult::Uninitialised;
     }
     catch (const std::exception& e)
     {
@@ -234,7 +228,7 @@ namespace ccf
   {
     try
     {
-      auto users_data = tx.ro<ccf::UserInfo>(Tables::USER_INFO);
+      auto* users_data = tx.ro<ccf::UserInfo>(Tables::USER_INFO);
       auto ui = users_data->get(user_id);
       if (!ui.has_value())
       {
@@ -258,7 +252,7 @@ namespace ccf
   {
     try
     {
-      auto member_info = tx.ro<ccf::MemberInfo>(Tables::MEMBER_INFO);
+      auto* member_info = tx.ro<ccf::MemberInfo>(Tables::MEMBER_INFO);
       auto mi = member_info->get(member_id);
       if (!mi.has_value())
       {
@@ -282,7 +276,7 @@ namespace ccf
   {
     try
     {
-      auto user_certs = tx.ro<ccf::UserCerts>(Tables::USER_CERTS);
+      auto* user_certs = tx.ro<ccf::UserCerts>(Tables::USER_CERTS);
       auto uc = user_certs->get(user_id);
       if (!uc.has_value())
       {
@@ -306,7 +300,7 @@ namespace ccf
   {
     try
     {
-      auto member_certs = tx.ro<ccf::MemberCerts>(Tables::MEMBER_CERTS);
+      auto* member_certs = tx.ro<ccf::MemberCerts>(Tables::MEMBER_CERTS);
       auto mc = member_certs->get(member_id);
       if (!mc.has_value())
       {
@@ -325,12 +319,11 @@ namespace ccf
 
   ApiResult BaseEndpointRegistry::get_untrusted_host_time_v1(::timespec& time)
   {
-    const std::chrono::microseconds now_us = ccf::get_enclave_time();
-
-    constexpr auto us_per_s = 1'000'000;
-    time.tv_sec = now_us.count() / us_per_s;
-    time.tv_nsec = (now_us.count() % us_per_s) * 1'000;
-
+    auto base = ::timespec_get(&time, TIME_UTC);
+    if (base == -1)
+    {
+      return ApiResult::InternalError;
+    }
     return ApiResult::OK;
   }
 }

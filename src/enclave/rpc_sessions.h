@@ -2,28 +2,27 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ds/logger.h"
-#include "ccf/http_responder.h"
 #include "ccf/pal/locking.h"
 #include "ccf/service/node_info_network.h"
+#include "ds/internal_logger.h"
 #include "ds/serialized.h"
 #include "enclave/session.h"
 #include "forwarder_types.h"
 #include "http/http2_session.h"
+#include "http/http_responder.h"
 #include "http/http_session.h"
-#include "node/session_metrics.h"
-// NB: This should be HTTP3 including QUIC, but this is
-// ok for now, as we only have an echo service for now
-#include "http/responder_lookup.h"
 #include "node/rpc/custom_protocol_subsystem.h"
-#include "quic/quic_session.h"
+#include "node/session_metrics.h"
 #include "rpc_handler.h"
 #include "tls/cert.h"
-#include "tls/client.h"
 #include "tls/context.h"
 #include "tls/plaintext_server.h"
 #include "tls/server.h"
 #include "udp/msg_types.h"
+
+// NB: This should be HTTP3 including QUIC, but this is
+// ok for now, as we only have an echo service for now
+#include "quic/quic_session.h"
 
 #include <limits>
 #include <map>
@@ -36,24 +35,22 @@ namespace ccf
 
   static constexpr size_t max_open_sessions_soft_default = 1000;
   static constexpr size_t max_open_sessions_hard_default = 1010;
-  static const ccf::Endorsement endorsement_default = {
-    ccf::Authority::SERVICE, std::nullopt};
+  static const ccf::Endorsement endorsement_default = {ccf::Authority::SERVICE};
 
   class RPCSessions : public std::enable_shared_from_this<RPCSessions>,
                       public AbstractRPCResponder,
-                      public ::http::ErrorReporter,
-                      public ::http::ResponderLookup
+                      public ::http::ErrorReporter
   {
   private:
     struct ListenInterface
     {
-      size_t open_sessions;
-      size_t peak_sessions;
-      size_t max_open_sessions_soft;
-      size_t max_open_sessions_hard;
-      ccf::Endorsement endorsement;
+      size_t open_sessions = 0;
+      size_t peak_sessions = 0;
+      size_t max_open_sessions_soft = 0;
+      size_t max_open_sessions_hard = 0;
+      ccf::Endorsement endorsement{};
       http::ParserConfiguration http_configuration;
-      ccf::SessionMetrics::Errors errors;
+      ccf::SessionMetrics::Errors errors{};
       ccf::ApplicationProtocol app_protocol;
     };
     std::map<ListenInterfaceID, ListenInterface> listening_interfaces;
@@ -62,7 +59,10 @@ namespace ccf
     ringbuffer::WriterPtr to_host = nullptr;
     std::shared_ptr<RPCMap> rpc_map;
     std::unordered_map<ListenInterfaceID, std::shared_ptr<::tls::Cert>> certs;
-    std::shared_ptr<CustomProtocolSubsystem> custom_protocol_subsystem;
+    std::shared_ptr<CustomProtocolSubsystem> custom_protocol_subsystem =
+      nullptr;
+    std::shared_ptr<CommitCallbackSubsystem> commit_callbacks_subsystem =
+      nullptr;
 
     ccf::pal::Mutex lock;
     std::unordered_map<
@@ -70,10 +70,6 @@ namespace ccf
       std::pair<ListenInterfaceID, std::shared_ptr<ccf::Session>>>
       sessions;
     size_t sessions_peak = 0;
-
-    // Negative sessions are reserved for those originating from
-    // the enclave via create_client().
-    std::atomic<ccf::tls::ConnID> next_client_session_id = -1;
 
     template <typename Base>
     class NoMoreSessionsImpl : public Base
@@ -100,31 +96,6 @@ namespace ccf
         }
       }
     };
-
-    ccf::tls::ConnID get_next_client_id()
-    {
-      auto id = next_client_session_id--;
-      const auto initial = id;
-
-      if (next_client_session_id > 0)
-        next_client_session_id = -1;
-
-      while (sessions.find(id) != sessions.end())
-      {
-        id--;
-
-        if (id > 0)
-          id = -1;
-
-        if (id == initial)
-        {
-          throw std::runtime_error(
-            "Exhausted all IDs for enclave client sessions");
-        }
-      }
-
-      return id;
-    }
 
     ListenInterface& get_interface_from_interface_id(
       const ccf::ListenInterfaceID& id)
@@ -155,10 +126,9 @@ namespace ccf
           writer_factory,
           std::move(ctx),
           parser_configuration,
-          shared_from_this(),
-          *this);
+          shared_from_this());
       }
-      else if (app_protocol == "HTTP1")
+      if (app_protocol == "HTTP1")
       {
         return std::make_shared<::http::HTTPServerSession>(
           rpc_map,
@@ -167,19 +137,18 @@ namespace ccf
           writer_factory,
           std::move(ctx),
           parser_configuration,
-          shared_from_this());
+          shared_from_this(),
+          commit_callbacks_subsystem);
       }
-      else if (custom_protocol_subsystem)
+      if (custom_protocol_subsystem)
       {
         return custom_protocol_subsystem->create_session(
           app_protocol, id, std::move(ctx));
       }
-      else
-      {
-        throw std::runtime_error(fmt::format(
-          "unknown protocol '{}' and custom protocol subsystem missing",
-          app_protocol));
-      }
+
+      throw std::runtime_error(fmt::format(
+        "unknown protocol '{}' and custom protocol subsystem missing",
+        app_protocol));
     }
 
   public:
@@ -187,8 +156,7 @@ namespace ccf
       ringbuffer::AbstractWriterFactory& writer_factory,
       std::shared_ptr<RPCMap> rpc_map_) :
       writer_factory(writer_factory),
-      rpc_map(rpc_map_),
-      custom_protocol_subsystem(nullptr)
+      rpc_map(std::move(rpc_map_))
     {
       to_host = writer_factory.create_writer_to_outside();
     }
@@ -197,6 +165,12 @@ namespace ccf
       std::shared_ptr<CustomProtocolSubsystem> cpss)
     {
       custom_protocol_subsystem = cpss;
+    }
+
+    void set_commit_callbacks_subsystem(
+      std::shared_ptr<CommitCallbackSubsystem> fcss)
+    {
+      commit_callbacks_subsystem = fcss;
     }
 
     void report_parsing_error(const ccf::ListenInterfaceID& id) override
@@ -302,8 +276,7 @@ namespace ccf
     void set_cert(
       ccf::Authority authority,
       const ccf::crypto::Pem& cert_,
-      const ccf::crypto::Pem& pk,
-      const std::string& acme_configuration = "")
+      const ccf::crypto::Pem& pk)
     {
       // Caller authentication is done by each frontend by looking up
       // the caller's certificate in the relevant store table. The caller
@@ -318,13 +291,7 @@ namespace ccf
       {
         if (interface.endorsement.authority == authority)
         {
-          if (
-            interface.endorsement.authority != Authority::ACME ||
-            (interface.endorsement.acme_configuration &&
-             *interface.endorsement.acme_configuration == acme_configuration))
-          {
-            certs.insert_or_assign(listen_interface_id, cert);
-          }
+          certs.insert_or_assign(listen_interface_id, cert);
         }
       }
     }
@@ -406,8 +373,7 @@ namespace ccf
               writer_factory,
               std::move(ctx),
               per_listen_interface.http_configuration,
-              shared_from_this(),
-              *this);
+              shared_from_this());
         }
         else
         {
@@ -419,7 +385,8 @@ namespace ccf
               writer_factory,
               std::move(ctx),
               per_listen_interface.http_configuration,
-              shared_from_this());
+              shared_from_this(),
+              commit_callbacks_subsystem);
         }
         sessions.insert(std::make_pair(
           id, std::make_pair(listen_interface_id, std::move(capped_session))));
@@ -524,7 +491,7 @@ namespace ccf
 
       LOG_DEBUG_FMT("Replying to session {}", id);
 
-      session->send_data(data);
+      session->send_data(std::move(data));
 
       if (terminate_after_send)
       {
@@ -556,52 +523,6 @@ namespace ccf
       }
     }
 
-    std::shared_ptr<ClientSession> create_client(
-      const std::shared_ptr<::tls::Cert>& cert,
-      const std::string& app_protocol = "HTTP1")
-    {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
-      auto ctx = std::make_unique<::tls::Client>(cert);
-      auto id = get_next_client_id();
-
-      LOG_DEBUG_FMT("Creating a new client session inside the enclave: {}", id);
-
-      // There are no limits on outbound client sessions (we do not check any
-      // session caps here). We expect this type of session to be rare and
-      // want it to succeed even when we are busy.
-      if (app_protocol == "HTTP2")
-      {
-        auto session = std::make_shared<::http::HTTP2ClientSession>(
-          id, writer_factory, std::move(ctx));
-        sessions.insert(std::make_pair(id, std::make_pair("", session)));
-        sessions_peak = std::max(sessions_peak, sessions.size());
-        return session;
-      }
-      else if (app_protocol == "HTTP1")
-      {
-        auto session = std::make_shared<::http::HTTPClientSession>(
-          id, writer_factory, std::move(ctx));
-        sessions.insert(std::make_pair(id, std::make_pair("", session)));
-        sessions_peak = std::max(sessions_peak, sessions.size());
-        return session;
-      }
-      else
-      {
-        throw std::runtime_error("unsupported client application protocol");
-      }
-    }
-
-    std::shared_ptr<ClientSession> create_unencrypted_client()
-    {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
-      auto id = get_next_client_id();
-      auto session = std::make_shared<::http::UnencryptedHTTPClientSession>(
-        id, writer_factory);
-      sessions.insert(std::make_pair(id, std::make_pair("", session)));
-      sessions_peak = std::max(sessions_peak, sessions.size());
-      return session;
-    }
-
     void register_message_handlers(
       messaging::Dispatcher<ringbuffer::Message>& disp)
     {
@@ -616,15 +537,15 @@ namespace ccf
         disp, ::tcp::tcp_inbound, [this](const uint8_t* data, size_t size) {
           auto id = serialized::peek<ccf::tls::ConnID>(data, size);
 
-          auto search = sessions.find(id);
-          if (search == sessions.end())
+          auto session = find_session(id);
+          if (session == nullptr)
           {
             LOG_DEBUG_FMT(
               "Ignoring tls_inbound for unknown or refused session: {}", id);
             return;
           }
 
-          search->second.second->handle_incoming_data({data, size});
+          session->handle_incoming_data({data, size});
         });
 
       DISPATCHER_SET_MESSAGE_HANDLER(
@@ -644,58 +565,67 @@ namespace ccf
         disp, udp::udp_inbound, [this](const uint8_t* data, size_t size) {
           auto id = serialized::peek<int64_t>(data, size);
 
-          auto search = sessions.find(id);
-          if (search == sessions.end())
+          std::shared_ptr<Session> session;
           {
-            LOG_DEBUG_FMT(
-              "Ignoring udp::udp_inbound for unknown or refused session: {}",
-              id);
-            return;
-          }
-          else if (!search->second.second && custom_protocol_subsystem)
-          {
-            LOG_DEBUG_FMT("Creating custom UDP session {}", id);
+            std::lock_guard<ccf::pal::Mutex> guard(lock);
 
-            try
+            auto search = sessions.find(id);
+            if (search == sessions.end())
             {
-              const auto& conn_id = search->first;
-              const auto& interface_id = search->second.first;
+              LOG_DEBUG_FMT(
+                "Ignoring udp::udp_inbound for unknown or refused session: {}",
+                id);
+              return;
+            }
 
-              auto iit = listening_interfaces.find(interface_id);
-              if (iit == listening_interfaces.end())
+            if (!search->second.second && custom_protocol_subsystem)
+            {
+              LOG_DEBUG_FMT("Creating custom UDP session {}", id);
+
+              try
               {
-                LOG_DEBUG_FMT(
-                  "Failure to create custom protocol session because of "
-                  "unknown interface '{}', ignoring udp::udp_inbound for "
-                  "session: "
-                  "{}",
-                  interface_id,
-                  id);
+                const auto& conn_id = search->first;
+                const auto& interface_id = search->second.first;
+
+                auto iit = listening_interfaces.find(interface_id);
+                if (iit == listening_interfaces.end())
+                {
+                  LOG_DEBUG_FMT(
+                    "Failure to create custom protocol session because of "
+                    "unknown interface '{}', ignoring udp::udp_inbound for "
+                    "session: "
+                    "{}",
+                    interface_id,
+                    id);
+                }
+
+                const auto& interface = iit->second;
+
+                search->second.second =
+                  custom_protocol_subsystem->create_session(
+                    interface.app_protocol, conn_id, nullptr);
+
+                if (!search->second.second)
+                {
+                  LOG_DEBUG_FMT(
+                    "Failure to create custom protocol session, ignoring "
+                    "udp::udp_inbound for session: {}",
+                    id);
+                  return;
+                }
               }
-
-              const auto& interface = iit->second;
-
-              search->second.second = custom_protocol_subsystem->create_session(
-                interface.app_protocol, conn_id, nullptr);
-
-              if (!search->second.second)
+              catch (const std::exception& ex)
               {
                 LOG_DEBUG_FMT(
-                  "Failure to create custom protocol session, ignoring "
-                  "udp::udp_inbound for session: {}",
-                  id);
+                  "Failure to create custom protocol session: {}", ex.what());
                 return;
               }
             }
-            catch (const std::exception& ex)
-            {
-              LOG_DEBUG_FMT(
-                "Failure to create custom protocol session: {}", ex.what());
-              return;
-            }
+
+            session = search->second.second;
           }
 
-          search->second.second->handle_incoming_data({data, size});
+          session->handle_incoming_data({data, size});
         });
     }
   };

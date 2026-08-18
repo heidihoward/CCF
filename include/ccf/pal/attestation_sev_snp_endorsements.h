@@ -3,6 +3,8 @@
 #pragma once
 
 #include "ccf/ds/json.h"
+#include "ccf/ds/unit_strings.h"
+#include "ccf/pal/sev_snp_cpuid.h"
 
 #include <list>
 #include <map>
@@ -14,8 +16,6 @@
 
 namespace ccf::pal::snp
 {
-  constexpr auto product_name = "Milan";
-
   struct ACIReportEndorsements
   {
     std::string cache_control;
@@ -45,9 +45,10 @@ namespace ccf::pal::snp
       std::map<std::string, std::string> params;
       bool response_is_der = false;
       bool response_is_thim_json = false;
-      std::map<std::string, std::string> headers = {};
+      std::map<std::string, std::string> headers;
       bool tls = true;
       size_t max_retries_count = 3;
+      size_t max_client_response_size = SIZE_MAX;
 
       bool operator==(const EndpointInfo&) const = default;
     };
@@ -58,7 +59,7 @@ namespace ccf::pal::snp
     std::list<Server> servers;
   };
 
-  enum EndorsementsEndpointType
+  enum EndorsementsEndpointType : uint8_t
   {
     Azure = 0,
     AMD = 1,
@@ -75,13 +76,14 @@ namespace ccf::pal::snp
     EndorsementsEndpointType type = Azure;
     std::optional<std::string> url = std::nullopt;
     std::optional<size_t> max_retries_count = std::nullopt;
+    std::optional<ccf::ds::SizeString> max_client_response_size = std::nullopt;
 
     bool operator==(const EndorsementsServer&) const = default;
   };
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(EndorsementsServer);
   DECLARE_JSON_REQUIRED_FIELDS(EndorsementsServer);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    EndorsementsServer, type, url, max_retries_count);
+    EndorsementsServer, type, url, max_retries_count, max_client_response_size);
   using EndorsementsServers = std::vector<EndorsementsServer>;
 
   struct HostPort
@@ -98,17 +100,21 @@ namespace ccf::pal::snp
     const HostPort& endpoint,
     const std::string& chip_id_hex,
     const std::string& reported_tcb,
-    size_t max_retries_count)
+    size_t max_retries_count,
+    size_t max_client_response_size)
   {
     std::map<std::string, std::string> params;
     params["api-version"] = "2020-10-15-preview";
     EndorsementEndpointsConfiguration::EndpointInfo info{
-      endpoint.host,
-      endpoint.port,
-      fmt::format("/SevSnpVM/certificates/{}/{}", chip_id_hex, reported_tcb),
-      params};
+      .host = endpoint.host,
+      .port = endpoint.port,
+      .uri =
+        fmt::format("/SevSnpVM/certificates/{}/{}", chip_id_hex, reported_tcb),
+      .params = params,
+      .headers = {}};
 
     info.max_retries_count = max_retries_count;
+    info.max_client_response_size = max_client_response_size;
 
     return {info};
   }
@@ -125,29 +131,40 @@ namespace ccf::pal::snp
     const std::string& tee,
     const std::string& snp,
     const std::string& microcode,
-    size_t max_retries_count)
+    const ProductName& product_name,
+    size_t max_retries_count,
+    size_t max_client_response_size,
+    const std::optional<std::string>& fmc_version = std::nullopt)
   {
     std::map<std::string, std::string> params;
     params["blSPL"] = boot_loader;
     params["teeSPL"] = tee;
     params["snpSPL"] = snp;
     params["ucodeSPL"] = microcode;
+    if (fmc_version.has_value())
+    {
+      params["fmcSPL"] = fmc_version.value();
+    }
 
     EndorsementEndpointsConfiguration::Server server;
     EndorsementEndpointsConfiguration::EndpointInfo leaf{
-      endpoint.host,
-      endpoint.port,
-      fmt::format("/vcek/v1/{}/{}", product_name, chip_id_hex),
-      params,
-      true // DER
-    };
+      .host = endpoint.host,
+      .port = endpoint.port,
+      .uri =
+        fmt::format("/vcek/v1/{}/{}", to_string(product_name), chip_id_hex),
+      .params = params,
+      .response_is_der = true,
+      .headers = {}};
     leaf.max_retries_count = max_retries_count;
+    leaf.max_client_response_size = max_client_response_size;
     EndorsementEndpointsConfiguration::EndpointInfo chain{
-      endpoint.host,
-      endpoint.port,
-      fmt::format("/vcek/v1/{}/cert_chain", product_name),
-      {}};
+      .host = endpoint.host,
+      .port = endpoint.port,
+      .uri = fmt::format("/vcek/v1/{}/cert_chain", to_string(product_name)),
+      .params = {},
+      .headers = {}};
     chain.max_retries_count = max_retries_count;
+    chain.max_client_response_size = max_client_response_size;
 
     server.push_back(leaf);
     server.push_back(chain);
@@ -162,7 +179,8 @@ namespace ccf::pal::snp
     const HostPort& endpoint,
     const std::string& chip_id_hex,
     const std::string& reported_tcb,
-    size_t max_retries_count)
+    size_t max_retries_count,
+    size_t max_client_response_size)
   {
     std::map<std::string, std::string> params;
     params["tcbVersion"] = reported_tcb;
@@ -178,6 +196,7 @@ namespace ccf::pal::snp
       false // No TLS
     };
     info.max_retries_count = max_retries_count;
+    info.max_client_response_size = max_client_response_size;
 
     return {info};
   }

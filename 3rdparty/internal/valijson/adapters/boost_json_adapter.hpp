@@ -29,9 +29,9 @@
 
 #include <boost/json.hpp>
 
-#include <valijson/adapters/adapter.hpp>
-#include <valijson/adapters/basic_adapter.hpp>
-#include <valijson/adapters/frozen_value.hpp>
+#include <valijson/internal/adapter.hpp>
+#include <valijson/internal/basic_adapter.hpp>
+#include <valijson/internal/frozen_value.hpp>
 
 namespace valijson {
 namespace adapters {
@@ -268,7 +268,7 @@ public:
       : m_value(emptyObject()) { }
 
     /**
-     * @brief  Construct a BoostJsonValue for for a specific Boost.JSON value
+     * @brief  Construct a BoostJsonValue for a specific Boost.JSON value
      */
     BoostJsonValue(const boost::json::value &value)
       : m_value(value) { }
@@ -485,12 +485,16 @@ class BoostJsonAdapter:
 {
 public:
 
+    // deleted to avoid holding references to temporaries
+    BoostJsonAdapter(boost::json::array &) = delete;
+    BoostJsonAdapter(boost::json::object &) = delete;
+
     /// Construct a BoostJsonAdapter that contains an empty object
     BoostJsonAdapter()
       : BasicAdapter() { }
 
     /// Construct a BoostJsonAdapter using a specific Boost.JSON value
-    BoostJsonAdapter(const boost::json::value &value)
+    explicit BoostJsonAdapter(const boost::json::value &value)
       : BasicAdapter(value) { }
 };
 
@@ -669,7 +673,7 @@ public:
 
 private:
 
-    /// Iternal copy of the original Boost.JSON iterator
+    /// Internal copy of the original Boost.JSON iterator
     boost::json::object::const_iterator m_itr;
 };
 

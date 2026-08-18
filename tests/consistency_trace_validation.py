@@ -1,18 +1,19 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import infra.e2e_args
+import os
+import signal
 import subprocess
 import sys
 import time
-import os
 
+import infra.e2e_args
 from loguru import logger as LOG
 
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         targets = [
@@ -43,14 +44,14 @@ def run(args):
             time.sleep(5)
             tvc.poll()
             if tvc.returncode is not None:
-                raise Exception(f"tvc failed with rc {tvc.returncode}")
-            tvc.send_signal(subprocess.signal.SIGINT)
+                raise RuntimeError(f"tvc failed with rc {tvc.returncode}")
+            tvc.send_signal(signal.SIGINT)
             tvc.wait()
 
 
 if __name__ == "__main__":
     args = infra.e2e_args.cli_args()
-    args.package = "libjs_generic"
+    args.package = "js_generic"
     args.js_app_bundle = "../samples/apps/basic_tv/js/"
     args.nodes = infra.e2e_args.nodes(args, 3)
     # Long signature interval to maximise the chance of an InvalidStatus transaction

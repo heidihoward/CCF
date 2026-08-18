@@ -37,7 +37,9 @@ namespace ccf
   {
     std::string code;
     std::string message;
-    std::vector<nlohmann::json> details = {};
+    std::vector<nlohmann::json> details;
+
+    bool operator==(const ODataError&) const = default;
   };
 
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(ODataError);
@@ -54,7 +56,7 @@ namespace ccf
 
   struct ErrorDetails
   {
-    http_status status;
+    http_status status = HTTP_STATUS_BAD_REQUEST;
     std::string code;
     std::string msg;
   };
@@ -117,6 +119,7 @@ namespace ccf
     ERROR(TooManyPendingTransactions)
     ERROR(MissingApiVersionParameter)
     ERROR(UnsupportedApiVersionValue)
+    ERROR(EmptyFile)
 
     // node-to-node (/join and /create):
     ERROR(ConsensusTypeMismatch)

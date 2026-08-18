@@ -35,7 +35,7 @@ TEST_CASE("basic macro parser generation")
   j["c"] = 100;
   const Bar bar_1 = j;
   REQUIRE(bar_1.a == j["a"]);
-  REQUIRE(bar_1.b == j["b"]);
+  REQUIRE(bar_1.b == j["b"].get<std::string>());
   REQUIRE(bar_1.c == j["c"]);
 }
 
@@ -89,7 +89,7 @@ TEST_CASE("macro parser generation with base classes")
   j["e"] = 101;
   const Baz baz_1 = j;
   REQUIRE(baz_1.a == j["a"]);
-  REQUIRE(baz_1.b == j["b"]);
+  REQUIRE(baz_1.b == j["b"].get<std::string>());
   REQUIRE(baz_1.c == j["c"]);
   REQUIRE(baz_1.d == j["d"]);
   REQUIRE(baz_1.e == j["e"]);
@@ -132,7 +132,7 @@ TEST_CASE("schema generation")
   {
     auto j_max = nlohmann::json::object();
     auto j_min = nlohmann::json::object();
-    for (const std::string& required : *required_it)
+    for (const std::string required : *required_it)
     {
       const auto property_it = properties_it->find(required);
       REQUIRE(property_it != properties_it->end());
@@ -385,7 +385,7 @@ DECLARE_JSON_ENUM(
   EnumStruct::SampleEnum,
   {{EnumStruct::SampleEnum::One, "one"},
    {EnumStruct::SampleEnum::Two, "two"},
-   {EnumStruct::SampleEnum::Three, "three"}})
+   {EnumStruct::SampleEnum::Three, "three"}});
 DECLARE_JSON_TYPE(EnumStruct);
 DECLARE_JSON_REQUIRED_FIELDS(EnumStruct, se);
 
@@ -539,32 +539,32 @@ namespace examples
   {
     int a, b;
   };
-  DECLARE_JSON_TYPE(X)
-  DECLARE_JSON_REQUIRED_FIELDS(X, a, b)
+  DECLARE_JSON_TYPE(X);
+  DECLARE_JSON_REQUIRED_FIELDS(X, a, b);
 
   struct Y
   {
     bool c;
     std::string d;
   };
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(Y)
-  DECLARE_JSON_REQUIRED_FIELDS(Y, c)
-  DECLARE_JSON_OPTIONAL_FIELDS(Y, d)
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(Y);
+  DECLARE_JSON_REQUIRED_FIELDS(Y, c);
+  DECLARE_JSON_OPTIONAL_FIELDS(Y, d);
 
   struct X_A : X
   {
     int m;
   };
-  DECLARE_JSON_TYPE_WITH_BASE(X_A, X)
-  DECLARE_JSON_REQUIRED_FIELDS(X_A, m)
+  DECLARE_JSON_TYPE_WITH_BASE(X_A, X);
+  DECLARE_JSON_REQUIRED_FIELDS(X_A, m);
 
   struct X_B : X
   {
     int n;
   };
-  DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(X_B, X)
-  DECLARE_JSON_REQUIRED_FIELDS(X_B)
-  DECLARE_JSON_OPTIONAL_FIELDS(X_B, n)
+  DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(X_B, X);
+  DECLARE_JSON_REQUIRED_FIELDS(X_B);
+  DECLARE_JSON_OPTIONAL_FIELDS(X_B, n);
 }
 
 namespace renamed
@@ -579,11 +579,11 @@ namespace renamed
     size_t b;
     size_t c;
   };
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(Foo)
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(Foo);
   DECLARE_JSON_REQUIRED_FIELDS_WITH_RENAMES(
-    Foo, x, "X", y, "SOMETHING_ELSE", z, "z-z!?(),;")
+    Foo, x, "X", y, "SOMETHING_ELSE", z, "z-z!?(),;");
   DECLARE_JSON_OPTIONAL_FIELDS_WITH_RENAMES(
-    Foo, a, "A", b, "OTHER_NAME", c, "c")
+    Foo, a, "A", b, "OTHER_NAME", c, "c");
 }
 
 TEST_CASE("JSON with different field names")

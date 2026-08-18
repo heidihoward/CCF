@@ -1,22 +1,24 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-from enum import Enum
-import infra.proc
-import infra.proposal
-import infra.crypto
-import infra.clients
-import http
-import os
 import base64
+import http
 import json
+import os
+from enum import Enum
 
 from loguru import logger as LOG
+
+import infra.clients
+import infra.crypto
+import infra.proc
+import infra.proposal
+from infra.node import CCFVersion
 
 
 class MemberEndpointException(Exception):
     def __init__(self, response, *args, **kwargs):
-        super(MemberEndpointException, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.response = response
 
 
@@ -35,6 +37,12 @@ class AckException(MemberEndpointException):
 class MemberStatus(Enum):
     ACCEPTED = "Accepted"
     ACTIVE = "Active"
+
+
+class RecoveryRole(Enum):
+    NonParticipant = "NonParticipant"
+    Participant = "Participant"
+    Owner = "Owner"
 
 
 class MemberAPI:
@@ -137,93 +145,21 @@ class MemberAPI:
     class v1(v1_Base):
         API_VERSION = infra.clients.API_VERSION_01
 
-    class Classic:
-        API_VERSION = infra.clients.API_VERSION_CLASSIC
-
-        def propose(self, member, remote_node, proposal):
-            with remote_node.client(*member.auth(write=True)) as mc:
-                r = mc.post("/gov/proposals", proposal)
-                if r.status_code != http.HTTPStatus.OK.value:
-                    raise infra.proposal.ProposalNotCreated(r)
-
-                return infra.proposal.Proposal(
-                    proposer_id=member.local_id,
-                    proposal_id=r.body.json()["proposal_id"],
-                    state=infra.proposal.ProposalState(r.body.json()["state"]),
-                    view=r.view,
-                    seqno=r.seqno,
-                )
-
-        def get_proposal_raw(self, remote_node, proposal_id):
-            with remote_node.client() as c:
-                r = c.get(f"/gov/proposals/{proposal_id}")
-                if r.status_code != http.HTTPStatus.OK.value:
-                    raise MemberEndpointException(r)
-
-                return r.body.json()
-
-        def get_proposal(self, remote_node, proposal_id):
-            body = self.get_proposal_raw(remote_node, proposal_id)
-            return infra.proposal.Proposal(
-                proposer_id=body["proposer_id"],
-                proposal_id=proposal_id,
-                state=infra.proposal.ProposalState(body["state"]),
-            )
-
-        def vote(self, member, remote_node, proposal, ballot):
-            with remote_node.client(*member.auth(write=True)) as mc:
-                r = mc.post(
-                    f"/gov/proposals/{proposal.proposal_id}/ballots",
-                    body=ballot,
-                )
-                return r
-
-        def withdraw(self, member, remote_node, proposal):
-            with remote_node.client(*member.auth(write=True)) as c:
-                r = c.post(f"/gov/proposals/{proposal.proposal_id}/withdraw")
-                if (
-                    r.status_code == http.HTTPStatus.OK.value
-                    and r.body.json()["state"] == "Withdrawn"
-                ):
-                    proposal.state = infra.proposal.ProposalState.WITHDRAWN
-                return r
-
-        def update_ack_state_digest(self, member, remote_node):
-            with remote_node.client(*member.auth()) as mc:
-                return mc.post("/gov/ack/update_state_digest")
-
-        def ack(self, member, remote_node, state_digest):
-            with remote_node.client(*member.auth(write=True)) as mc:
-                r = mc.post("/gov/ack", body=state_digest)
-                if r.status_code == http.HTTPStatus.UNAUTHORIZED:
-                    raise UnauthenticatedMember(
-                        f"Failed to ack member {member.local_id}: {r.status_code}"
-                    )
-                assert r.status_code == http.HTTPStatus.NO_CONTENT, r
-                member.status = MemberStatus.ACTIVE
-                return r
-
-        def get_recovery_share(self, member, remote_node):
-            with remote_node.client() as mc:
-                r = mc.get(f"/gov/encrypted_recovery_share/{member.service_id}")
-                if r.status_code != http.HTTPStatus.OK.value:
-                    raise NoRecoveryShareFound(r)
-                return r.body.json()["encrypted_share"]
-
     # A special client used only for lts_compatibility tests. Attempts to use latest
     # API by default, but checks node version to fallback to a supported older API
     # where required
     class LtsCompat:
         def __init__(self):
             self._preview_v1 = MemberAPI.Preview_v1()
-            self._classic = MemberAPI.Classic()
 
         def _by_node_version(self, remote_node):
             min_version = "4.0.0"
-            if remote_node.version_after(min_version):
+            if CCFVersion(remote_node.version) > CCFVersion(min_version):
                 return self._preview_v1
             else:
-                return self._classic
+                raise ValueError(
+                    f"No longer support speaking to nodes using the classic governance API. Min supported version is {min_version}"
+                )
 
         def propose(self, member, remote_node, proposal):
             return self._by_node_version(remote_node).propose(
@@ -265,16 +201,19 @@ class MemberAPI:
                 member, remote_node
             )
 
+        def api_version(self, remote_node):
+            return self._by_node_version(remote_node).API_VERSION
+
 
 class Member:
     def __init__(
         self,
         local_id,
-        curve,
         common_dir,
         share_script,
-        is_recovery_member=True,
+        recovery_role=RecoveryRole.Participant,
         key_generator=None,
+        curve=None,
         member_data=None,
         authenticate_session=True,
         gov_api_impl=None,
@@ -284,7 +223,7 @@ class Member:
         self.status = MemberStatus.ACCEPTED
         self.share_script = share_script
         self.member_data = member_data
-        self.is_recovery_member = is_recovery_member
+        self.recovery_role = recovery_role
         self.is_retired = False
         self.authenticate_session = authenticate_session
         assert self.authenticate_session == "COSE", self.authenticate_session
@@ -298,13 +237,19 @@ class Member:
         self.member_info = {}
         self.member_info["certificate_file"] = f"{self.local_id}_cert.pem"
         self.member_info["encryption_public_key_file"] = (
-            f"{self.local_id}_enc_pubk.pem" if is_recovery_member else None
+            f"{self.local_id}_enc_pubk.pem"
+            if recovery_role != RecoveryRole.NonParticipant
+            else None
         )
         self.member_info["data_json_file"] = (
             f"{self.local_id}_data.json" if member_data else None
         )
+        if recovery_role == RecoveryRole.Owner:
+            self.member_info["recovery_role"] = "Owner"
 
         if key_generator is not None:
+            assert curve is not None
+
             key_generator_args = [
                 "--name",
                 self.local_id,
@@ -312,7 +257,7 @@ class Member:
                 f"{curve.name}",
             ]
 
-            if is_recovery_member:
+            if recovery_role != RecoveryRole.NonParticipant:
                 key_generator_args += [
                     "--gen-enc-key",
                 ]
@@ -418,7 +363,7 @@ class Member:
             )
 
     def get_and_submit_recovery_share(self, remote_node):
-        if not self.is_recovery_member:
+        if self.recovery_role == RecoveryRole.NonParticipant:
             raise ValueError(f"Member {self.local_id} does not have a recovery share")
 
         help_res = infra.proc.ccall(self.share_script, "--help", log_output=False)
@@ -429,7 +374,7 @@ class Member:
 
         cmd = [
             self.share_script,
-            f"https://{remote_node.get_public_rpc_host()}:{remote_node.get_public_rpc_port()}",
+            f"https://{remote_node.get_public_rpc_address()}",
             "--member-enc-privk",
             os.path.join(self.common_dir, f"{self.local_id}_enc_privk.pem"),
         ]
@@ -445,10 +390,12 @@ class Member:
             ]
 
         if supports_api_version:
-            cmd += [
-                "--api-version",
-                self.gov_api_impl_inst.API_VERSION,
-            ]
+            api_version = (
+                self.gov_api_impl_inst.API_VERSION
+                if hasattr(self.gov_api_impl_inst, "API_VERSION")
+                else self.gov_api_impl_inst.api_version(remote_node)
+            )
+            cmd += ["--api-version", api_version]
 
         # Versions of the script that do not support --member-id arguments use
         # client certificates (forward to curl) to authenticate with the service.
@@ -473,4 +420,19 @@ class Member:
             env=os.environ,
         )
         res.check_returncode()
-        return infra.clients.Response.from_raw(res.stdout)
+        response = infra.clients.Response.from_raw(res.stdout)
+
+        if supports_api_version and support_member_id_cert:
+            path = infra.clients.APIVersionedCCFClient.add_query_arg_to_path(
+                f"/gov/recovery/members/{self.service_id}:recover",
+                "api-version",
+                api_version,
+            )
+            remote_node.openapi_validator.validate(
+                infra.clients.Request(path, None, "POST", {}),
+                response,
+                host_url=f"https://{remote_node.get_public_rpc_address()}",
+                cose=True,
+            )
+
+        return response

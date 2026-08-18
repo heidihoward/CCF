@@ -4,6 +4,7 @@
 
 #include "ccf/crypto/base64.h"
 #include "ccf/crypto/verifier.h"
+#include "ccf/ds/json.h"
 #include "ccf/http_consts.h"
 #include "http_parser.h"
 
@@ -14,30 +15,34 @@
 
 namespace http
 {
-  enum class JwtCryptoAlgorithm
+  enum class JwtCryptoAlgorithm : uint8_t
   {
-    RS256
+    RS256,
+    ES256,
   };
-  DECLARE_JSON_ENUM(JwtCryptoAlgorithm, {{JwtCryptoAlgorithm::RS256, "RS256"}});
+  DECLARE_JSON_ENUM(
+    JwtCryptoAlgorithm,
+    {{JwtCryptoAlgorithm::RS256, "RS256"},
+     {JwtCryptoAlgorithm::ES256, "ES256"}});
 
   struct JwtHeader
   {
-    JwtCryptoAlgorithm alg;
+    JwtCryptoAlgorithm alg{};
     std::string kid;
   };
-  DECLARE_JSON_TYPE(JwtHeader)
-  DECLARE_JSON_REQUIRED_FIELDS(JwtHeader, alg, kid)
+  DECLARE_JSON_TYPE(JwtHeader);
+  DECLARE_JSON_REQUIRED_FIELDS(JwtHeader, alg, kid);
 
   struct JwtPayload
   {
-    size_t nbf;
-    size_t exp;
+    size_t exp{};
     std::string iss;
+    std::optional<size_t> nbf;
     std::optional<std::string> tid;
   };
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(JwtPayload)
-  DECLARE_JSON_REQUIRED_FIELDS(JwtPayload, nbf, exp, iss);
-  DECLARE_JSON_OPTIONAL_FIELDS(JwtPayload, tid)
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(JwtPayload);
+  DECLARE_JSON_REQUIRED_FIELDS(JwtPayload, exp, iss);
+  DECLARE_JSON_OPTIONAL_FIELDS(JwtPayload, nbf, tid);
 
   class JwtVerifier
   {
@@ -55,7 +60,7 @@ namespace http
     static bool parse_auth_scheme(
       std::string_view& auth_header_value, std::string& error_reason)
     {
-      auto next_space = auth_header_value.find(" ");
+      auto next_space = auth_header_value.find(' ');
       if (next_space == std::string::npos)
       {
         error_reason = "Authorization header only contains one field";
@@ -71,6 +76,27 @@ namespace http
       }
       auth_header_value = auth_header_value.substr(next_space + 1);
       return true;
+    }
+
+    static std::vector<uint8_t> parse_jwt_b64url(
+      std::string_view b64url, std::string_view part, std::string& error_reason)
+    {
+      try
+      {
+        auto raw = ccf::crypto::raw_from_b64url(b64url);
+        if (raw.empty())
+        {
+          error_reason = fmt::format("JWT part is empty ({})", part);
+          return {};
+        }
+        return raw;
+      }
+      catch (const std::exception& e)
+      {
+        error_reason =
+          fmt::format("Failed to parse base64url in JWT ({})", part);
+        return {};
+      }
     }
 
     static std::optional<Token> parse_token(
@@ -101,16 +127,41 @@ namespace http
       std::string_view payload_b64url =
         token.substr(first_dot + 1, payload_size);
       std::string_view signature_b64url = token.substr(second_dot + 1);
-      auto header_raw = ccf::crypto::raw_from_b64url(header_b64url);
-      auto payload_raw = ccf::crypto::raw_from_b64url(payload_b64url);
-      auto signature_raw = ccf::crypto::raw_from_b64url(signature_b64url);
+
+      auto header_raw = parse_jwt_b64url(header_b64url, "header", error_reason);
+      if (header_raw.empty())
+      {
+        return std::nullopt;
+      }
+
+      auto payload_raw =
+        parse_jwt_b64url(payload_b64url, "payload", error_reason);
+      if (payload_raw.empty())
+      {
+        return std::nullopt;
+      }
+
+      auto signature_raw =
+        parse_jwt_b64url(signature_b64url, "signature", error_reason);
+      if (signature_raw.empty())
+      {
+        return std::nullopt;
+      }
+
       auto signed_content = token.substr(0, second_dot);
       nlohmann::json header;
       nlohmann::json payload;
       try
       {
-        header = nlohmann::json::parse(header_raw);
-        payload = nlohmann::json::parse(payload_raw);
+        header = ccf::parse_json_safe(header_raw);
+        payload = ccf::parse_json_safe(payload_raw);
+      }
+      catch (const ccf::JsonParseError& e)
+      {
+        error_reason = fmt::format(
+          "JWT header or payload exceeds permitted JSON nesting depth: {}",
+          e.what());
+        return std::nullopt;
       }
       catch (const nlohmann::json::parse_error& e)
       {
@@ -172,17 +223,6 @@ namespace http
       }
       auto parsed = parse_token(token, error_reason);
       return parsed;
-    }
-
-    static bool validate_token_signature(
-      const Token& token, const ccf::crypto::VerifierPtr& verifier)
-    {
-      return verifier->verify(
-        (uint8_t*)token.signed_content.data(),
-        token.signed_content.size(),
-        token.signature.data(),
-        token.signature.size(),
-        ccf::crypto::MDType::SHA256);
     }
   };
 }

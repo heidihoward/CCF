@@ -3,13 +3,14 @@
 #pragma once
 
 #include "ccf/base_endpoint_registry.h"
+#include "ccf/ds/json.h"
 #include "node/gov/api_version.h"
 #include "node/gov/handlers/helpers.h"
 #include "node/share_manager.h"
 
 namespace ccf::gov::endpoints
 {
-  void init_recovery_handlers(
+  inline void init_recovery_handlers(
     ccf::BaseEndpointRegistry& registry,
     ShareManager& share_manager,
     ccf::AbstractNodeContext& node_context)
@@ -111,7 +112,7 @@ namespace ccf::gov::endpoints
           const auto& cose_ident =
             ctx.template get_caller<ccf::MemberCOSESign1AuthnIdentity>();
 
-          auto params = nlohmann::json::parse(cose_ident.content);
+          auto params = ccf::parse_json_safe(cose_ident.content);
           if (cose_ident.member_id != member_id)
           {
             detail::set_gov_error(
@@ -130,10 +131,13 @@ namespace ccf::gov::endpoints
             params["share"].template get<std::string>());
 
           size_t submitted_shares_count = 0;
+          bool full_key_submitted = false;
           try
           {
             submitted_shares_count = share_manager.submit_recovery_share(
               ctx.tx, member_id, raw_recovery_share);
+
+            full_key_submitted = ShareManager::is_full_key(raw_recovery_share);
 
             OPENSSL_cleanse(
               raw_recovery_share.data(), raw_recovery_share.size());
@@ -157,14 +161,22 @@ namespace ccf::gov::endpoints
           const auto threshold =
             InternalTablesAccess::get_recovery_threshold(ctx.tx);
 
-          // Same format of message, whether this is sufficient to trigger
-          // recovery or not
-          std::string message = fmt::format(
-            "{}/{} recovery shares successfully submitted",
-            submitted_shares_count,
-            threshold);
+          std::string message;
+          if (full_key_submitted)
+          {
+            message = "Full recovery key successfully submitted";
+          }
+          else
+          {
+            // Same format of message, whether this is sufficient to trigger
+            // recovery or not
+            message = fmt::format(
+              "{}/{} recovery shares successfully submitted",
+              submitted_shares_count,
+              threshold);
+          }
 
-          if (submitted_shares_count >= threshold)
+          if (submitted_shares_count >= threshold || full_key_submitted)
           {
             message += "\nEnd of recovery procedure initiated";
             GOV_INFO_FMT("{} - initiating recovery", message);
@@ -196,6 +208,7 @@ namespace ccf::gov::endpoints
           response_body["message"] = message;
           response_body["submittedCount"] = submitted_shares_count;
           response_body["recoveryThreshold"] = threshold;
+          response_body["fullKeySubmitted"] = full_key_submitted;
 
           ctx.rpc_ctx->set_response_json(response_body, HTTP_STATUS_OK);
           return;

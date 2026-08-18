@@ -45,7 +45,7 @@ These endpoints can read or mutate the state of a unique :ref:`build_apps/kv/ind
     :doc:`js_app_ts`
     ^^^^^^^^^^^^^^^
 
-    Sample CCF application written in TypeScript, using the API specified in :typedoc:package:`ccf-app`.
+    Sample CCF application written in TypeScript, using the API specified in :typedoc-package:`ccf-app`.
 
     ---
 
@@ -96,6 +96,13 @@ These endpoints can read or mutate the state of a unique :ref:`build_apps/kv/ind
 
     CCF release cadence and compatibility commitments.
 
+    ---
+
+    :fa:`mail-forward ` :doc:`fwd_to_redirect`
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    Migrate from forwarding (deprecated) to redirect (recommended) endpoints.
+
 
 .. toctree::
     :hidden:
@@ -113,3 +120,4 @@ These endpoints can read or mutate the state of a unique :ref:`build_apps/kv/ind
     api
     crypto
     release_policy
+    fwd_to_redirect
