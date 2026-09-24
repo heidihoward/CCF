@@ -8,7 +8,6 @@ import time
 from contextlib import contextmanager
 
 import ca_certs
-import ccf.ledger
 import infra.clients
 import infra.crypto
 import infra.e2e_args
@@ -411,9 +410,12 @@ def get_jwt_refresh_endpoint_metrics(primary) -> dict:
 
 @contextmanager
 def reserve_unlistened_local_port():
+    # The socket is bound but never listened on, so connections to it are
+    # refused. It is yielded rather than just its port number so that callers
+    # can release the reservation early, e.g. to let a server bind that port.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
-        yield s.getsockname()[1]
+        yield s
 
 
 def add_auto_refresh_jwt_issuer(network, primary, issuer, ca_cert_bundle_name):
@@ -452,9 +454,11 @@ def test_jwt_key_auto_refresh_connection_failure(network, args):
     remove_all_jwt_issuers(network, args, primary)
     failures_before = get_jwt_refresh_endpoint_metrics(primary)["failures"]
     issuer_host = "127.0.0.1"
+    kid = "connection_failure"
 
     LOG.info("Add JWT issuer with auto-refresh pointing at an unavailable endpoint")
-    with reserve_unlistened_local_port() as issuer_port:
+    with reserve_unlistened_local_port() as reserved_socket:
+        issuer_port = reserved_socket.getsockname()[1]
         issuer = infra.jwt_issuer.JwtIssuer(
             f"https://{issuer_host}:{issuer_port}", cn=issuer_host
         )
@@ -464,6 +468,18 @@ def test_jwt_key_auto_refresh_connection_failure(network, args):
                 lambda: check_refresh_failures_increased(primary, failures_before),
                 timeout=5,
             )
+
+            LOG.info("Start the OpenID endpoint and check that the refresh is retried")
+            # Only release the port now, so that nothing else can claim it while
+            # the initial refresh failures are observed.
+            reserved_socket.close()
+            with issuer.start_openid_server(issuer_port, kid):
+                with_timeout(
+                    lambda: check_kv_jwt_key_matches(
+                        args, network, kid, issuer.key_pub_pem
+                    ),
+                    timeout=15,
+                )
         finally:
             network.consortium.remove_jwt_issuer(primary, issuer.name)
 
@@ -803,30 +819,27 @@ def test_jwt_key_auto_refresh_entries(network, args):
             timeout=max(5, args.jwt_key_refresh_interval_s * 5),
         )
 
-        # Force chunking
-        network.get_latest_ledger_public_state()
+        target_seqno = network.create_and_wait_for_ledger_chunk(primary)
         # Check that despite refreshing JWTs multiple times, only a single
         # transaction was created for this kid.
-        ledger_directories = primary.remote.ledger_paths()
-        ledger = ccf.ledger.Ledger(ledger_directories, contiguous_suffix=True)
-
-        last_key_refresh = None
-        for chunk in ledger:
-            for tx in chunk:
-                txid = TxID(tx.gcm_header.view, tx.gcm_header.seqno)
-                tables = tx.get_public_domain().get_tables()
-                if "public:ccf.gov.jwt.public_signing_keys_metadata_v2" in tables:
-                    pub_keys = tables[
-                        "public:ccf.gov.jwt.public_signing_keys_metadata_v2"
-                    ]
-                    if kid.encode() in pub_keys:
-                        if last_key_refresh is None:
-                            LOG.info(f"Refresh found for kid: {kid} at {txid}")
-                            last_key_refresh = txid
-                        else:
-                            assert (
-                                last_key_refresh == txid
-                            ), "Duplicate JWT refresh transaction"
+        with primary.get_ledger_from_api(target_seqno) as ledger:
+            last_key_refresh = None
+            for chunk in ledger:
+                for tx in chunk:
+                    txid = TxID(tx.gcm_header.view, tx.gcm_header.seqno)
+                    tables = tx.get_public_domain().get_tables()
+                    if "public:ccf.gov.jwt.public_signing_keys_metadata_v2" in tables:
+                        pub_keys = tables[
+                            "public:ccf.gov.jwt.public_signing_keys_metadata_v2"
+                        ]
+                        if kid.encode() in pub_keys:
+                            if last_key_refresh is None:
+                                LOG.info(f"Refresh found for kid: {kid} at {txid}")
+                                last_key_refresh = txid
+                            else:
+                                assert (
+                                    last_key_refresh == txid
+                                ), "Duplicate JWT refresh transaction"
         assert last_key_refresh, "Missing JWT refresh transaction"
 
     return network

@@ -38,6 +38,7 @@ from infra.log_capture import flush_info
 
 API_VERSION_PREVIEW_01 = "2023-06-01-preview"
 API_VERSION_01 = "2024-07-01"
+API_VERSION_LATEST = "latest"
 
 
 class OffSettableSecondsSinceEpoch:
@@ -636,7 +637,7 @@ class HttpxClient:
     def __init__(
         self,
         hostname: str,
-        ca: str,
+        ca: str | None,
         session_auth: Identity | None = None,
         signing_auth: Identity | None = None,
         cose_signing_auth: Identity | None = None,
@@ -650,14 +651,23 @@ class HttpxClient:
         self.cose_signing_auth = cose_signing_auth
         self.common_headers = common_headers
         self.key_id = None
-        cert = None
+        if self.ca is None:
+            # ca=None means server certificate verification is disabled.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        else:
+            context = ssl.create_default_context(cafile=self.ca)
         if self.session_auth:
-            cert = (self.session_auth.cert, self.session_auth.key)
+            context.load_cert_chain(
+                certfile=self.session_auth.cert,
+                keyfile=self.session_auth.key,
+            )
         self.protocol = "https"
         if "protocol" in kwargs:
             self.protocol = kwargs.get("protocol")
             kwargs.pop("protocol")
-        self.session = httpx.Client(verify=self.ca, cert=cert, **kwargs)
+        self.session = httpx.Client(verify=context, **kwargs)
         sig_auth = signing_auth or cose_signing_auth
         if sig_auth:
             with open(sig_auth.cert, encoding="utf-8") as cert_file:
@@ -883,6 +893,7 @@ class RawSocketClient:
                     )
 
                 sock = socket.create_connection((hostname, port))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 ssl_socket = context.wrap_socket(
                     sock, server_side=False, server_hostname=hostname
                 )
@@ -1334,8 +1345,10 @@ class CCFClient:
 @contextlib.contextmanager
 def client(*args, **kwargs):
     c = CCFClient(*args, **kwargs)
-    yield c
-    c.close()
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 class APIVersionedCCFClient(CCFClient):
@@ -1345,6 +1358,7 @@ class APIVersionedCCFClient(CCFClient):
         if self.api_version in (
             API_VERSION_PREVIEW_01,
             API_VERSION_01,
+            API_VERSION_LATEST,
         ):
             self.client_impl.cose_header_builder = cose_protected_headers_api_v1
         else:
@@ -1368,5 +1382,7 @@ class APIVersionedCCFClient(CCFClient):
 @contextlib.contextmanager
 def api_versioned_client(*args, api_version=None, **kwargs):
     c = APIVersionedCCFClient(*args, api_version=api_version, **kwargs)
-    yield c
-    c.close()
+    try:
+        yield c
+    finally:
+        c.close()

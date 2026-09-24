@@ -10,8 +10,8 @@
 #include "ds/files.h"
 #include "ds/internal_logger.h"
 #include "kv/test/null_encryptor.h"
+#include "kv/test/null_tx_history.h"
 #include "kv/test/stub_consensus.h"
-#include "node/history.h"
 #include "node/rpc/member_frontend.h"
 #include "node/rpc/user_frontend.h"
 #include "node_stub.h"
@@ -73,7 +73,7 @@ void check_error(const TResponse& r, ccf::http_status expected)
 void check_error_message(const TResponse& r, const std::string& msg)
 {
   const std::string body_s(r.body.begin(), r.body.end());
-  CHECK(body_s.find(msg) != std::string::npos);
+  CHECK(body_s.contains(msg));
 }
 
 std::vector<uint8_t> create_request(

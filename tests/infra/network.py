@@ -31,7 +31,6 @@ import infra.node
 import infra.openapi
 import infra.path
 import infra.proc
-import infra.service_load
 from infra.clients import CCFConnectionException, CCFIOException, flush_info
 from infra.consortium import slurp_file
 from infra.node import CCFVersion
@@ -192,8 +191,10 @@ class Network:
         "log_format_json",
         "constitution",
         "join_timer_s",
+        "pending_node_timeout",
         "worker_threads",
         "ledger_chunk_bytes",
+        "ledger_max_transaction_bytes",
         "subject_alt_names",
         "snapshot_tx_interval",
         "snapshot_min_tx_interval",
@@ -2028,7 +2029,7 @@ class Network:
             time.sleep(0.5)
         if not success:
             raise TimeoutError(
-                f'Node {node_id} is not in expected state: {node_status or "absent"})'
+                f'Node {node_id} is not in expected state: {node_status or "absent"}'
             )
 
     def wait_for_all_nodes_to_be_trusted(self, remote_node, timeout=3):
@@ -2162,6 +2163,111 @@ class Network:
         )
         return primary
 
+    def wait_for_stability(
+        self, nodes=None, timeout_multiplier=DEFAULT_TIMEOUT_MULTIPLIER, min_view=None
+    ):
+        """Wait for primary/backup connectivity and leadership for two election timeouts.
+
+        All selected nodes must agree on the primary and view, with matching
+        leader/follower roles and recent ACKs from every selected backup. Any
+        unhealthy observation or leadership change restarts the stability window.
+        This is a readiness check, not a guarantee against future elections.
+        """
+        nodes = self.get_joined_nodes() if nodes is None else nodes
+        nodes_by_id = {node.node_id: node for node in nodes}
+        if not nodes_by_id:
+            raise ValueError("Cannot wait for stability without any joined nodes")
+
+        # ACK timers reset on election, so one healthy snapshot is not enough.
+        stable_duration = 2 * self.election_duration
+        timeout = self.observed_election_duration * timeout_multiplier
+        if timeout <= 0:
+            raise ValueError("Stability timeout must be positive")
+        LOG.info(
+            f"Waiting up to {timeout}s for {stable_duration}s of stable leadership "
+            f"and ACKs from every backup among {len(nodes_by_id)} nodes"
+        )
+
+        start_time = time.monotonic()
+        end_time = start_time + timeout
+        stable_since = None
+        stable_primary_view = None
+        details = {}
+        logs = []
+        while time.monotonic() < end_time:
+            details = {}
+            logs = []
+            for node_id, node in nodes_by_id.items():
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    break
+                request_timeout = min(1, remaining)
+                try:
+                    with node.client(connection_timeout=request_timeout) as c:
+                        r = c.get(
+                            "/node/consensus",
+                            timeout=request_timeout,
+                            log_capture=logs,
+                        )
+                        assert r.status_code == http.HTTPStatus.OK, r
+                        details[node_id] = r.body.json()["details"]
+                except (CCFConnectionException, TimeoutError) as e:
+                    LOG.debug(f"Could not query consensus on {node_id}: {e}")
+                    break
+
+            primary_views = {
+                (d["primary_id"], d["current_view"]) for d in details.values()
+            }
+            primary_view = (
+                next(iter(primary_views)) if len(primary_views) == 1 else None
+            )
+            primary_id = primary_view[0] if primary_view is not None else None
+            healthy = (
+                len(details) == len(nodes_by_id)
+                and primary_id in details
+                and (min_view is None or primary_view[1] >= min_view)
+                and all(
+                    d["leadership_state"]
+                    == ("Leader" if node_id == primary_id else "Follower")
+                    for node_id, d in details.items()
+                )
+            )
+            if healthy:
+                acks = details[primary_id]["acks"]
+                healthy = all(
+                    node_id in acks
+                    and acks[node_id]["seqno"] > 0
+                    and acks[node_id]["last_received_ms"]
+                    < self.election_duration * 1000
+                    for node_id in nodes_by_id
+                    if node_id != primary_id
+                )
+
+            now = time.monotonic()
+            if now >= end_time:
+                break
+            if not healthy:
+                stable_since = None
+                stable_primary_view = None
+            elif primary_view != stable_primary_view:
+                stable_since = now
+                stable_primary_view = primary_view
+            elif now - stable_since >= stable_duration:
+                primary = nodes_by_id[primary_id]
+                LOG.info(
+                    f"Network stable after {now - start_time:.2f}s: primary "
+                    f"{primary.local_node_id} in view {primary_view[1]}"
+                )
+                return primary
+            time.sleep(min(0.1, max(0, end_time - now)))
+
+        flush_info(logs)
+        raise TimeoutError(
+            f"Network did not remain stable for {stable_duration}s within {timeout}s. "
+            f"Missing responses from: {sorted(nodes_by_id.keys() - details.keys())}. "
+            f"Last consensus details: {pprint.pformat(details)}"
+        )
+
     def get_committed_snapshots(
         self,
         node=None,
@@ -2218,24 +2324,63 @@ class Network:
 
         return node.get_committed_snapshots(wait_for_snapshots_to_be_committed)
 
-    def _get_ledger_public_view_at(self, node, call, seqno, timeout):
-        end_time = time.time() + timeout
-        self.consortium.force_ledger_chunk(node)
-        while time.time() < end_time:
-            try:
-                return call(seqno)
-            except Exception as ex:
-                LOG.info(f"Exception: {ex}")
-                time.sleep(0.1)
-        raise TimeoutError(
-            f"Could not read transaction at seqno {seqno} from ledger {node.remote.ledger_paths()} after {timeout}s"
+    @staticmethod
+    def _supports_operator_feature(node, feature):
+        file_serving_interface = node.host.rpc_interfaces.get(
+            infra.interfaces.FILE_SERVING_RPC_INTERFACE
         )
+        if file_serving_interface is None:
+            return False
+        operator_features = file_serving_interface.enabled_operator_features
+        return operator_features is not None and feature in operator_features
+
+    def create_and_wait_for_ledger_chunk(self, node=None, timeout=5):
+        """Create a chunk boundary and return a seqno in the committed chunk."""
+        if node is None:
+            node, _ = self.find_primary()
+
+        if self._supports_operator_feature(node, "SnapshotCreate"):
+            snapshot_txid = node.trigger_snapshot()
+            # A signature whose seqno was reserved before this request may consume
+            # the snapshot flag after the request commits. In that case the chunk
+            # ends immediately before the request; otherwise it ends at a later
+            # signature. The preceding seqno is covered in either ordering.
+            target_seqno = snapshot_txid.seqno
+            if target_seqno > 1:
+                target_seqno -= 1
+        else:
+            proposal = self.consortium.force_ledger_chunk(node)
+            target_seqno = proposal.completed_seqno
+
+        if self._supports_operator_feature(node, "LedgerChunkRead"):
+            node.wait_for_ledger_chunk(target_seqno, timeout=timeout)
+        else:
+            end_time = time.time() + timeout
+            while time.time() < end_time:
+                try:
+                    node.get_ledger_public_tables_at(target_seqno)
+                    break
+                except (AssertionError, ccf.ledger.UnknownTransaction):
+                    time.sleep(0.1)
+            else:
+                raise TimeoutError(
+                    f"Could not read transaction at seqno {target_seqno} from "
+                    f"ledger {node.remote.ledger_paths()} after {timeout}s"
+                )
+
+        return target_seqno
 
     def get_ledger_public_state_at(self, seqno, timeout=5):
         primary, _ = self.find_primary()
-        return self._get_ledger_public_view_at(
-            primary, primary.get_ledger_public_tables_at, seqno, timeout
+        self.create_and_wait_for_ledger_chunk(
+            node=primary,
+            timeout=timeout,
         )
+        if self._supports_operator_feature(primary, "LedgerChunkRead"):
+            with primary.get_ledger_chunk_from_api(seqno, timeout=timeout) as ledger:
+                return ledger.get_transaction(seqno).get_public_domain().get_tables()
+
+        return primary.get_ledger_public_tables_at(seqno)
 
     def get_latest_ledger_public_state(self, timeout=5):
         primary, _ = self.find_primary()
@@ -2243,9 +2388,19 @@ class Network:
             resp = nc.get("/node/commit")
             body = resp.body.json()
             tx_id = TxID.from_str(body["transaction_id"])
-        return self._get_ledger_public_view_at(
-            primary, primary.get_ledger_public_state_at, tx_id.seqno, timeout
+        target_seqno = self.create_and_wait_for_ledger_chunk(
+            node=primary,
+            timeout=timeout,
         )
+        if self._supports_operator_feature(
+            primary, "LedgerChunkRead"
+        ) and self._supports_operator_feature(primary, "SnapshotRead"):
+            return primary.get_public_state_from_api(
+                target_seqno,
+                timeout=timeout,
+            )
+
+        return primary.get_ledger_public_state_at(tx_id.seqno)
 
     @functools.cached_property
     def cert_path(self):

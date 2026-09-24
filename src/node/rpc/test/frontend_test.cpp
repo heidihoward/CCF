@@ -5,6 +5,7 @@
 
 #define DOCTEST_CONFIG_IMPLEMENT
 #include "ccf/app_interface.h"
+#include "ccf/ds/locking.h"
 #include "ccf/json_handler.h"
 #include "ccf/kv/map.h"
 #include "crypto/openssl/hash.h"
@@ -13,19 +14,19 @@
 #include "frontend_test_infra.h"
 #include "kv/test/null_encryptor.h"
 #include "kv/test/stub_consensus.h"
-#include "node/history.h"
+#include "node/internal_tables_access.h"
 #include "node/network_state.h"
 #include "node/rpc/member_frontend.h"
 #include "node/rpc/node_frontend.h"
 #include "node/test/channel_stub.h"
 #include "node_stub.h"
-#include "service/internal_tables_access.h"
 
 #include <doctest/doctest.h>
 #include <iostream>
 #include <latch>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 using namespace ccf;
 using namespace std;
@@ -462,6 +463,10 @@ auto member_session =
 auto anonymous_session =
   make_shared<ccf::SessionContext>(ccf::InvalidSessionId, anonymous_caller_der);
 
+static_assert(
+  std::is_const_v<decltype(user_session->caller_cert)>,
+  "Session caller certificates must remain immutable");
+
 UserId user_id;
 
 MemberId member_id;
@@ -658,6 +663,11 @@ TEST_CASE("SignedReq to and from json")
 
 TEST_CASE("process with caller")
 {
+  CHECK(
+    user_session->caller_cert_sha256 ==
+    ccf::crypto::Sha256Hash(user_caller_der).hex_str());
+  CHECK(anonymous_session->caller_cert.empty());
+
   NetworkState network;
   prepare_callers(network);
   TestUserFrontend frontend(*network.tables);
@@ -729,9 +739,7 @@ TEST_CASE("process with caller")
       auto response = parse_response(serialized_response);
       REQUIRE(response.status == HTTP_STATUS_UNAUTHORIZED);
       const std::string error_msg(response.body.begin(), response.body.end());
-      CHECK(
-        error_msg.find("Could not find matching user certificate") !=
-        std::string::npos);
+      CHECK(error_msg.contains("Could not find matching user certificate"));
     }
 
     INFO("Anonymous caller");
@@ -741,7 +749,7 @@ TEST_CASE("process with caller")
       auto response = parse_response(serialized_response);
       REQUIRE(response.status == HTTP_STATUS_UNAUTHORIZED);
       const std::string error_msg(response.body.begin(), response.body.end());
-      CHECK(error_msg.find("No caller user certificate") != std::string::npos);
+      CHECK(error_msg.contains("No caller user certificate"));
     }
   }
 }
@@ -941,7 +949,7 @@ TEST_CASE("Restricted verbs")
         const auto it = response.headers.find(ccf::http::headers::ALLOW);
         REQUIRE(it != response.headers.end());
         const auto v = it->second;
-        CHECK(v.find(llhttp_method_name(HTTP_GET)) != std::string::npos);
+        CHECK(v.contains(llhttp_method_name(HTTP_GET)));
       }
     }
 
@@ -962,7 +970,7 @@ TEST_CASE("Restricted verbs")
         const auto it = response.headers.find(ccf::http::headers::ALLOW);
         REQUIRE(it != response.headers.end());
         const auto v = it->second;
-        CHECK(v.find(llhttp_method_name(HTTP_POST)) != std::string::npos);
+        CHECK(v.contains(llhttp_method_name(HTTP_POST)));
       }
     }
 
@@ -984,11 +992,11 @@ TEST_CASE("Restricted verbs")
         const auto it = response.headers.find(ccf::http::headers::ALLOW);
         REQUIRE(it != response.headers.end());
         const auto v = it->second;
-        CHECK(v.find(llhttp_method_name(HTTP_PUT)) != std::string::npos);
-        CHECK(v.find(llhttp_method_name(HTTP_DELETE)) != std::string::npos);
+        CHECK(v.contains(llhttp_method_name(HTTP_PUT)));
+        CHECK(v.contains(llhttp_method_name(HTTP_DELETE)));
         if (verb != HTTP_OPTIONS)
         {
-          CHECK(v.find(llhttp_method_name(verb)) == std::string::npos);
+          CHECK(!v.contains(llhttp_method_name(verb)));
         }
       }
     }
@@ -1236,6 +1244,48 @@ TEST_CASE("Decoded Templated paths")
   }
 }
 
+TEST_CASE("Forwarded request target limit" * doctest::test_suite("forwarding"))
+{
+  constexpr size_t forwarding_limit = 100 * 1024 * 1024;
+  auto target_size = forwarding_limit;
+  SUBCASE("At the forwarding limit") {}
+  SUBCASE("Above the forwarding limit")
+  {
+    target_size += 1;
+  }
+  const std::string prefix = "/app/empty_function?padding=";
+  const auto target = prefix + std::string(target_size - prefix.size(), 'a');
+  const auto packed = ::http::Request(target, HTTP_POST).build_request();
+
+  ccf::http::ParserConfiguration config;
+  config.max_request_target_size = "101MB";
+  {
+    ::http::SimpleRequestProcessor processor;
+    ::http::RequestParser ingress(processor, config);
+    ingress.execute(packed.data(), packed.size());
+    REQUIRE(processor.received.size() == 1);
+    CHECK(processor.received.front().url == target);
+  }
+
+  if (target_size > forwarding_limit)
+  {
+    CHECK_THROWS_AS(
+      ccf::make_fwd_rpc_context(user_session, packed, ccf::FrameFormat::http),
+      ::http::RequestTargetTooLongException);
+  }
+  else
+  {
+    auto forwarded =
+      ccf::make_fwd_rpc_context(user_session, packed, ccf::FrameFormat::http);
+    REQUIRE(forwarded != nullptr);
+    CHECK(forwarded->get_request_path() == "/app/empty_function");
+    CHECK(
+      forwarded->get_request_query() ==
+      std::string_view(target).substr(target.find('?') + 1));
+    CHECK(forwarded->get_serialised_request() == packed);
+  }
+}
+
 TEST_CASE("Forwarding" * doctest::test_suite("forwarding"))
 {
   NetworkState network_primary;
@@ -1468,7 +1518,17 @@ TEST_CASE("Userfrontend forwarding" * doctest::test_suite("forwarding"))
   publish_frontend_state(user_frontend_backup, network_backup);
 
   auto write_req = create_simple_request();
+  write_req.set_query_param(
+    "padding",
+    std::string(ccf::http::default_max_request_target_size.count_bytes(), 'a'));
   auto serialized_call = write_req.build_request();
+
+  ccf::http::ParserConfiguration ingress_config;
+  ingress_config.max_request_target_size = "32KB";
+  ::http::SimpleRequestProcessor ingress_processor;
+  ::http::RequestParser ingress_parser(ingress_processor, ingress_config);
+  ingress_parser.execute(serialized_call.data(), serialized_call.size());
+  REQUIRE(ingress_processor.received.size() == 1);
 
   auto ctx = ccf::make_rpc_context(user_session, serialized_call);
   user_frontend_backup.process(ctx);
@@ -1481,6 +1541,7 @@ TEST_CASE("Userfrontend forwarding" * doctest::test_suite("forwarding"))
       ccf::kv::test::FirstBackupNodeId,
       forwarded_msg.data(),
       forwarded_msg.size());
+  REQUIRE(fwd_ctx != nullptr);
 
   user_frontend_primary.process_forwarded(fwd_ctx);
   auto response = parse_response(fwd_ctx->serialise_response());
@@ -1648,23 +1709,29 @@ public:
 
   struct WaitPoint
   {
-    std::mutex m;
-    std::condition_variable cv;
-    bool ready = false;
+    ccf::ds::Mutex m;
+    ccf::ds::ConditionVariable cv;
+    bool ready CCF_GUARDED_BY(m) = false;
 
     void wait()
     {
-      std::unique_lock lock(m);
-      cv.wait(lock, [this] { return ready; });
+      ccf::ds::MutexGuard lock(m);
+      cv.wait(lock, [this]() CCF_REQUIRES(m) { return ready; });
     }
 
     void notify()
     {
       {
-        std::lock_guard lock(m);
+        ccf::ds::MutexGuard lock(m);
         ready = true;
       }
       cv.notify_one();
+    }
+
+    void reset()
+    {
+      ccf::ds::MutexGuard lock(m);
+      ready = false;
     }
   };
 
@@ -1805,10 +1872,10 @@ TEST_CASE("Manual conflicts")
                     std::function<void()>&& read_write_op,
                     std::shared_ptr<ccf::SessionContext> session = user_session,
                     ccf::http_status expected_status = HTTP_STATUS_OK) {
-    frontend.registry.before_read.ready = false;
-    frontend.registry.after_read.ready = false;
-    frontend.registry.before_write.ready = false;
-    frontend.registry.after_write.ready = false;
+    frontend.registry.before_read.reset();
+    frontend.registry.after_read.reset();
+    frontend.registry.before_write.reset();
+    frontend.registry.after_write.reset();
 
     std::thread worker(call_pausable, session, expected_status);
 

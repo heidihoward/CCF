@@ -78,6 +78,7 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   )
 endif()
 
+include(${CCF_DIR}/cmake/stacktrace.cmake)
 include(${CCF_DIR}/cmake/cpack_settings.cmake)
 
 message(STATUS "CMAKE_INSTALL_PREFIX is '${CMAKE_INSTALL_PREFIX}'")
@@ -131,26 +132,24 @@ option(BUILD_END_TO_END_TESTS "Build end to end tests" ON)
 option(COVERAGE "Enable coverage mapping" OFF)
 option(SHUFFLE_SUITE "Shuffle end to end test suite" OFF)
 option(LONG_TESTS "Enable long end-to-end tests" OFF)
+option(
+  TEST_MLDSA
+  "Run ML-DSA key tests, which require OpenSSL 3.5 or newer"
+  OFF
+)
 option(USE_SNMALLOC "Link against snmalloc" ON)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/snmalloc.cmake)
 
 option(CLANG_TIDY "Run clang-tidy on the codebase" OFF)
 
-option(
-  GLIBCXX_DEBUG
-  "Enable libstdc++ debug mode (_GLIBCXX_DEBUG). Disables the submit binary (which links against Arrow, not built with _GLIBCXX_DEBUG)."
-  OFF
-)
+option(GLIBCXX_DEBUG "Enable libstdc++ debug mode (_GLIBCXX_DEBUG)." OFF)
 if(GLIBCXX_DEBUG)
   add_compile_definitions(_GLIBCXX_DEBUG)
 endif()
 
 # Must happen before tools.cmake is included
 if(CLANG_TIDY)
-  find_program(
-    CLANG_TIDY_EXE
-    NAMES "clang-tidy" "clang-tidy-18" "clang-tidy-15"
-  )
+  find_program(CLANG_TIDY_EXE NAMES "clang-tidy-18" "clang-tidy" REQUIRED)
   message(STATUS "Using clang-tidy from: ${CLANG_TIDY_EXE}")
 endif()
 
@@ -171,9 +170,14 @@ include_directories(${CCF_DIR}/src)
 
 set(CCF_3RD_PARTY_EXPORTED_DIR "${CCF_DIR}/3rdparty/exported")
 set(CCF_3RD_PARTY_INTERNAL_DIR "${CCF_DIR}/3rdparty/internal")
+set(
+  TAV_INCLUDE_DIR
+  "${CCF_3RD_PARTY_INTERNAL_DIR}/tee-attestation-verification/ffi/include"
+)
 
 include_directories(SYSTEM ${CCF_3RD_PARTY_EXPORTED_DIR})
 include_directories(SYSTEM ${CCF_3RD_PARTY_INTERNAL_DIR})
+include_directories(SYSTEM ${TAV_INCLUDE_DIR})
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/tools.cmake)
 
@@ -230,7 +234,6 @@ include(${CCF_DIR}/cmake/ccf_rs.cmake)
 include(${CCF_DIR}/cmake/threading.cmake)
 include(${CCF_DIR}/cmake/crypto.cmake)
 include(${CCF_DIR}/cmake/quickjs.cmake)
-include(${CCF_DIR}/cmake/evercbor.cmake)
 
 # Launcher library
 list(
@@ -266,6 +269,10 @@ add_ccf_static_library(
   SRCS ${CCF_DIR}/src/pal/attestation.cpp
   LINK_LIBS ccfcrypto
 )
+target_include_directories(
+  ccf_pal
+  PRIVATE ${CCF_DIR}/3rdparty/internal/tee-attestation-verification/ffi/include
+)
 
 # CCF js lib
 add_ccf_static_library(
@@ -290,6 +297,7 @@ add_ccf_static_library(
     ${CCF_DIR}/src/js/extensions/ccf/rpc.cpp
     ${CCF_DIR}/src/js/extensions/ccf/request.cpp
     ${CCF_DIR}/src/js/registry.cpp
+    ${CCF_DIR}/src/node/uvm_endorsements.cpp
   LINK_LIBS ccfcrypto quickjs ccf_pal
 )
 
@@ -342,26 +350,27 @@ add_ccf_static_library(
   LINK_LIBS ccf_threading
 )
 
-find_library(BACKTRACE_LIBRARY backtrace)
-if(NOT BACKTRACE_LIBRARY)
-  message(
-    FATAL_ERROR
-    "libbacktrace (library 'backtrace') is required to build the CCF task "
-    "system (target ccf_tasks). Please install libbacktrace and retry "
-    "configuration."
+if(CCF_STACKTRACE_BACKEND_RESOLVED STREQUAL "STD")
+  target_compile_definitions(ccf_tasks PRIVATE CCF_STACKTRACE_USE_STD=1)
+  target_link_libraries(ccf_tasks PRIVATE ${CCF_STACKTRACE_SUPPORT_LIBRARY})
+else()
+  target_include_directories(ccf_tasks PRIVATE ${BACKTRACE_INCLUDE_DIR})
+  target_link_libraries(
+    ccf_tasks
+    PRIVATE
+      $<BUILD_INTERFACE:${BACKTRACE_LIBRARY}>
+      $<INSTALL_INTERFACE:backtrace>
   )
 endif()
-
-# libbacktrace reads DWARF debug info directly, providing file/line/function
-# resolution in stack traces.
-target_link_libraries(ccf_tasks PRIVATE ${CMAKE_DL_LIBS} ${BACKTRACE_LIBRARY})
+# Static-library private dependencies remain transitive link requirements.
+target_link_libraries(ccf_tasks PRIVATE ${CMAKE_DL_LIBS})
 
 # Common test args for Python scripts starting up CCF networks
 set(
   WORKER_THREADS
-  0
+  1
   CACHE STRING
-  "Number of worker threads to start on each CCF node"
+  "Configured worker_threads value; each CCF node starts one additional worker"
 )
 
 set(
@@ -512,12 +521,18 @@ install(
   PATTERN "*.inc"
 )
 
+install(
+  FILES ${TAV_INCLUDE_DIR}/tav/snp.h ${TAV_INCLUDE_DIR}/tav/utils.h
+  DESTINATION include/3rdparty/tav
+)
+
 # Install all private CCF headers, which may still be needed
 install(
   DIRECTORY src/
   DESTINATION include/ccf/_private
   FILES_MATCHING
   PATTERN "*.h"
+  PATTERN "msgpack/*" EXCLUDE
   PATTERN "*/test*" EXCLUDE
 )
 
@@ -532,10 +547,15 @@ install(
   PATTERN "*.py"
   PATTERN "*/__pycache__*" EXCLUDE
 )
+install(
+  FILES ${CCF_DIR}/doc/host_config_schema/host_config.json
+  DESTINATION bin/infra
+)
 
 install(PROGRAMS tests/sandbox/sandbox.sh DESTINATION bin)
 install(PROGRAMS tests/docker_wrap.sh DESTINATION bin)
 install(PROGRAMS scripts/ensure-snmalloc.sh DESTINATION bin)
+install(PROGRAMS scripts/install_uv.sh DESTINATION bin)
 install(FILES samples/constitutions/default/actions.js DESTINATION bin)
 install(FILES samples/constitutions/default/validate.js DESTINATION bin)
 install(FILES samples/constitutions/sandbox/resolve.js DESTINATION bin)
@@ -574,6 +594,25 @@ install(TARGETS verify_attestation DESTINATION bin)
 if(BUILD_TESTS)
   enable_testing()
 
+  set(
+    DOCS_PYTHON
+    ""
+    CACHE FILEPATH
+    "Python interpreter for the optional documentation test"
+  )
+  if(DOCS_PYTHON)
+    add_test(
+      NAME docs
+      COMMAND
+        "${DOCS_PYTHON}" -m sphinx --fail-on-warning -b html "${CCF_DIR}/doc"
+        "${CCF_DIR}/doc/html"
+    )
+    set_tests_properties(
+      docs
+      PROPERTIES LABELS "bucket_a;docs" WORKING_DIRECTORY "${CCF_DIR}"
+    )
+  endif()
+
   # Unit tests
   if(BUILD_UNIT_TESTS)
     add_test(
@@ -583,27 +622,22 @@ if(BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/tests/run_verify_uvm_attestation_and_endorsements.sh
         $<TARGET_FILE:verify_uvm_attestation_and_endorsements>
     )
-    set_property(
-      TEST verify_uvm_attestation_and_endorsements
-      APPEND
-      PROPERTY LABELS unit
-    )
+    add_test_label(verify_uvm_attestation_and_endorsements unit)
     add_san_test_properties(verify_uvm_attestation_and_endorsements)
 
     add_unit_test(
       snp_ioctl_test
       ${CMAKE_CURRENT_SOURCE_DIR}/src/pal/test/snp_ioctl_test.cpp
+      LABELS snp
     )
-    set_property(TEST snp_ioctl_test APPEND PROPERTY LABELS snp)
-    set_property(TEST snp_ioctl_test APPEND PROPERTY CONFIGURATIONS snp)
+    target_link_libraries(snp_ioctl_test PRIVATE ccf_pal)
 
     add_unit_test(
       snp_attestation_test
       ${CMAKE_CURRENT_SOURCE_DIR}/src/pal/test/snp_attestation_validation.cpp
+      LABELS snp
     )
     target_link_libraries(snp_attestation_test PRIVATE ccf_pal ccfcrypto)
-    set_property(TEST snp_attestation_test APPEND PROPERTY LABELS snp)
-    set_property(TEST snp_attestation_test APPEND PROPERTY CONFIGURATIONS snp)
 
     add_unit_test(map_test ${CMAKE_CURRENT_SOURCE_DIR}/src/ds/test/map_test.cpp)
 
@@ -622,6 +656,12 @@ if(BUILD_TESTS)
       parse_json_safe_test
       ${CMAKE_CURRENT_SOURCE_DIR}/src/ds/test/parse_json_safe.cpp
     )
+
+    add_unit_test(
+      public_header_helpers_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/ds/test/public_header_helpers.cpp
+    )
+    target_link_libraries(public_header_helpers_test PRIVATE http_parser)
 
     add_unit_test(
       state_machine_test
@@ -709,18 +749,32 @@ if(BUILD_TESTS)
     )
 
     add_unit_test(
-      rpc_connections_test
-      ${CMAKE_CURRENT_SOURCE_DIR}/src/host/test/rpc_connections.cpp
+      runtime_control_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/host/test/runtime_control.cpp
     )
-    target_link_libraries(rpc_connections_test PRIVATE uv)
+    target_link_libraries(runtime_control_test PRIVATE uv)
+
+    add_unit_test(
+      openssl_server_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/tls/test/openssl_server_test.cpp
+    )
+    target_link_libraries(openssl_server_test PRIVATE ccf_tasks http_parser uv)
+
+    add_unit_test(
+      node_connections_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/host/test/node_connections.cpp
+    )
+    target_link_libraries(node_connections_test PRIVATE uv)
 
     add_unit_test(
       raft_test
       ${CMAKE_CURRENT_SOURCE_DIR}/src/consensus/aft/test/main.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/src/consensus/aft/test/view_history.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/src/consensus/aft/test/committable_suffix.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/consensus/aft/test/view_straddling_rollback.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/consensus/aft/test/view_straddling_history.cpp
     )
-    target_link_libraries(raft_test PRIVATE ccfcrypto ccf_tasks)
+    target_link_libraries(raft_test PRIVATE ccfcrypto ccf_kv ccf_tasks)
 
     add_unit_test(
       raft_enclave_test
@@ -733,6 +787,12 @@ if(BUILD_TESTS)
       crypto_test
       ${CMAKE_CURRENT_SOURCE_DIR}/src/crypto/test/crypto.cpp
     )
+    if(TEST_MLDSA)
+      target_sources(
+        crypto_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/crypto/test/mldsa.cpp
+      )
+    endif()
     target_include_directories(crypto_test PRIVATE ${CCFCRYPTO_INC})
     target_link_libraries(crypto_test PRIVATE ccfcrypto)
 
@@ -746,10 +806,21 @@ if(BUILD_TESTS)
     if(FUZZING)
       add_fuzz_test(
         cbor_fuzz_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/crypto/cbor.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/crypto/test/cbor_fuzz.cpp
       )
-      target_link_libraries(cbor_fuzz_test PRIVATE evercbor)
+      target_link_libraries(cbor_fuzz_test PRIVATE ccfcrypto)
+    endif()
+
+    add_unit_test(
+      msgpack_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/msgpack/test/msgpack_unit.cpp
+    )
+
+    if(FUZZING)
+      add_fuzz_test(
+        msgpack_fuzz_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/msgpack/test/msgpack_fuzz.cpp
+      )
     endif()
 
     add_unit_test(
@@ -792,7 +863,11 @@ if(BUILD_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/node_client.cpp
     )
 
-    add_unit_test(js_test ${CMAKE_CURRENT_SOURCE_DIR}/src/js/test/js.cpp)
+    add_unit_test(
+      js_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/js/test/js.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/node/uvm_endorsements.cpp
+    )
     target_link_libraries(
       js_test
       PRIVATE ccf_js ccf_kv ccf_endpoints ccfcrypto http_parser
@@ -819,7 +894,6 @@ if(BUILD_TESTS)
         ENVIRONMENT
           "TEST_ENDORSEMENTS_PATH=${CMAKE_CURRENT_SOURCE_DIR}/tests/uvm_endorsements"
     )
-    target_link_libraries(endorsements_test PRIVATE evercbor)
 
     add_unit_test(
       historical_queries_test
@@ -832,6 +906,12 @@ if(BUILD_TESTS)
       historical_queries_test
       PRIVATE http_parser ccf_kv ccf_endpoints ccf_tasks
     )
+    add_unit_test(
+      open_service_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/open_service.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/node/local_sealing.cpp
+    )
+    target_link_libraries(open_service_test PRIVATE ccf_kv)
     add_unit_test(
       network_identity_subsystem_test
       ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/network_identity_subsystem.cpp
@@ -873,8 +953,10 @@ if(BUILD_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/node_info_json.cpp
     )
 
-    add_unit_test(tls_test ${CMAKE_CURRENT_SOURCE_DIR}/src/tls/test/main.cpp)
-    target_link_libraries(tls_test PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+    add_unit_test(
+      identity_types_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/identity_types.cpp
+    )
 
     add_unit_test(
       base64_test
@@ -962,6 +1044,15 @@ if(BUILD_TESTS)
     target_link_libraries(jwt_auth_test PRIVATE ccf_endpoints)
 
     add_unit_test(
+      jwt_key_auto_refresh_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/jwt_key_auto_refresh.cpp
+    )
+    target_link_libraries(
+      jwt_key_auto_refresh_test
+      PRIVATE http_parser ccf_endpoints ccf_kv ccf_tasks curl uv
+    )
+
+    add_unit_test(
       tx_status_test
       ${CMAKE_CURRENT_SOURCE_DIR}/src/node/rpc/test/tx_status_test.cpp
     )
@@ -1023,8 +1114,8 @@ if(BUILD_TESTS)
         ${PYTHON} ${CMAKE_SOURCE_DIR}/tests/raft_scenarios_runner.py
         ./raft_driver ${CMAKE_SOURCE_DIR}/tests/raft_scenarios/
     )
-    set_property(TEST raft_scenario_test PROPERTY LABELS raft_scenario)
-    set_property(TEST raft_scenario_test APPEND PROPERTY LABELS bucket_c)
+    add_test_target(raft_scenario_test raft_driver)
+    add_test_label(raft_scenario_test raft_scenario bucket_c)
 
     if(COVERAGE)
       # The scenario runner spawns raft_driver once per scenario file; give
@@ -1042,19 +1133,22 @@ if(BUILD_TESTS)
       NAME csr_test
       COMMAND ${PYTHON} ${CMAKE_SOURCE_DIR}/tests/certs.py ./kp_cert_test
     )
-    set_property(TEST csr_test APPEND PROPERTY LABELS unit_test)
+    add_test_target(csr_test kp_cert_test)
+    add_test_label(csr_test unit)
 
     add_test(
       NAME versionifier_test
       COMMAND ${PYTHON} ${CMAKE_SOURCE_DIR}/python/src/ccf/_versionifier.py
     )
-    set_property(TEST versionifier_test APPEND PROPERTY LABELS bucket_c)
+    add_test_target(versionifier_test)
+    add_test_label(versionifier_test bucket_c)
 
     add_test(
       NAME github_version_lts_test
       COMMAND ${PYTHON} ${CMAKE_SOURCE_DIR}/tests/infra/github.py
     )
-    set_property(TEST github_version_lts_test APPEND PROPERTY LABELS bucket_c)
+    add_test_target(github_version_lts_test)
+    add_test_label(github_version_lts_test bucket_c)
   endif()
 
   if(NOT TSAN)
@@ -1062,6 +1156,7 @@ if(BUILD_TESTS)
     add_picobench(map_bench SRCS src/ds/test/map_bench.cpp)
     add_picobench(logger_bench SRCS src/ds/test/logger_bench.cpp)
     add_picobench(json_bench SRCS src/ds/test/json_bench.cpp)
+    add_picobench(msgpack_bench SRCS src/msgpack/test/msgpack_bench.cpp)
     add_picobench(ring_buffer_bench SRCS src/ds/test/ring_buffer_bench.cpp)
     add_picobench(ledger_bench SRCS src/host/test/ledger_bench.cpp)
     add_picobench(crypto_bench SRCS src/crypto/test/bench.cpp LINK_LIBS)
@@ -1079,6 +1174,11 @@ if(BUILD_TESTS)
       http_bench
       SRCS src/http/test/http_bench.cpp
       LINK_LIBS http_parser
+    )
+    add_picobench(
+      js_interpreter_bench
+      SRCS src/js/test/interpreter_bench.cpp
+      LINK_LIBS ccf_js ccf_kv ccf_endpoints http_parser
     )
 
     add_picobench(
@@ -1102,6 +1202,11 @@ if(BUILD_TESTS)
     NAME recovery_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/recovery.py
     BUCKET bucket_b
+    BUILD_DEPENDS
+      logging
+      logging_cose_only
+      logging_cose_only_allow_join_dual
+      js_generic
     ADDITIONAL_ARGS
       ${ADDITIONAL_RECOVERY_ARGS}
       --constitution
@@ -1112,6 +1217,7 @@ if(BUILD_TESTS)
     NAME recovery_stale_snapshot_join_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/identity_recovery_snapshot.py
     BUCKET bucket_b
+    BUILD_DEPENDS logging
     ADDITIONAL_ARGS --regex ^recovery_stale_snapshot_join$
   )
 
@@ -1119,6 +1225,7 @@ if(BUILD_TESTS)
     NAME recovery_intermediate_snapshot_join_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/identity_recovery_snapshot.py
     BUCKET bucket_b
+    BUILD_DEPENDS logging
     ADDITIONAL_ARGS --regex ^recovery_intermediate_snapshot_join$
   )
 
@@ -1126,12 +1233,14 @@ if(BUILD_TESTS)
     NAME recovery_snapshot_endorsements_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/recovery_snapshot_endorsements.py
     BUCKET bucket_b
+    BUILD_DEPENDS logging
   )
 
   add_e2e_test(
     NAME recovery_test_suite
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_suite.py
     LABEL suite
+    BUILD_DEPENDS logging
     ADDITIONAL_ARGS
       --test-duration
       300
@@ -1147,6 +1256,7 @@ if(BUILD_TESTS)
     NAME reconfiguration_test_suite
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_suite.py
     LABEL suite
+    BUILD_DEPENDS logging
     ADDITIONAL_ARGS
       --test-duration
       300
@@ -1161,6 +1271,7 @@ if(BUILD_TESTS)
       NAME regression_test_suite
       PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_suite.py
       LABEL suite
+      BUILD_DEPENDS logging
       ADDITIONAL_ARGS --test-duration 300 --test-suite regression_5236
     )
   endif()
@@ -1169,6 +1280,7 @@ if(BUILD_TESTS)
     NAME full_test_suite
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_suite.py
     LABEL suite
+    BUILD_DEPENDS logging js_generic
     ADDITIONAL_ARGS
       --ledger-recovery-timeout
       20
@@ -1181,16 +1293,10 @@ if(BUILD_TESTS)
   )
 
   add_e2e_test(
-    NAME commit_latency
-    PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/commit_latency.py
-    LABEL perf
-    CONFIGURATIONS perf
-  )
-
-  add_e2e_test(
     NAME js_batched_stress_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_batched.py
     BUCKET bucket_c
+    BUILD_DEPENDS js_generic
     ADDITIONAL_ARGS
       --js-app-bundle
       ${CMAKE_SOURCE_DIR}/src/apps/batched
@@ -1203,6 +1309,7 @@ if(BUILD_TESTS)
     NAME modules_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/js-modules/modules.py
     BUCKET bucket_c
+    BUILD_DEPENDS js_generic
     ADDITIONAL_ARGS
       --package
       js_generic
@@ -1217,6 +1324,7 @@ if(BUILD_TESTS)
     PYTHON_SCRIPT
       ${CMAKE_SOURCE_DIR}/tests/js-custom-authorization/custom_authorization.py
     BUCKET bucket_c
+    BUILD_DEPENDS js_generic
     ADDITIONAL_ARGS
       --package
       js_generic
@@ -1243,6 +1351,7 @@ if(BUILD_TESTS)
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/governance.py
     CONSTITUTION ${CONSTITUTION_ARGS}
     BUCKET bucket_c
+    BUILD_DEPENDS logging js_generic
     DETECT_DEADLOCKS
     ADDITIONAL_ARGS
       --initial-operator-count
@@ -1255,6 +1364,7 @@ if(BUILD_TESTS)
     NAME code_update_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/code_update.py
     BUCKET bucket_c
+    BUILD_DEPENDS logging js_generic
     ADDITIONAL_ARGS
       --js-app-bundle
       ${CMAKE_SOURCE_DIR}/samples/apps/logging/js
@@ -1282,7 +1392,9 @@ if(BUILD_TESTS)
     NAME e2e_logging
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_logging.py
     BUCKET bucket_c
+    BUILD_DEPENDS logging logging_cose_only programmability js_generic
     DETECT_DEADLOCKS
+    TSAN_SUPPRESSIONS ${CCF_DIR}/tsan_e2e_logging_suppressions
     ADDITIONAL_ARGS --js-app-bundle ${CMAKE_SOURCE_DIR}/samples/apps/logging/js
   )
 
@@ -1306,6 +1418,7 @@ if(BUILD_TESTS)
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/programmability.py
     LABEL snp
     BUCKET bucket_c
+    BUILD_DEPENDS programmability logging js_generic
   )
 
   # This test uses large requests (so too slow for SAN)
@@ -1314,6 +1427,7 @@ if(BUILD_TESTS)
       NAME e2e_limits
       PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/limits.py
       BUCKET bucket_c
+      BUILD_DEPENDS logging
     )
   endif()
 
@@ -1321,13 +1435,15 @@ if(BUILD_TESTS)
     NAME e2e_redirects
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/redirects.py
     BUCKET bucket_c
+    BUILD_DEPENDS logging js_generic
     ADDITIONAL_ARGS --js-app-bundle ${CMAKE_SOURCE_DIR}/samples/apps/logging/js
   )
 
   add_e2e_test(
     NAME e2e_logging_http2
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_logging.py
-    BUCKET bucket_c
+    BUCKET bucket_b
+    BUILD_DEPENDS logging logging_cose_only programmability js_generic
     ADDITIONAL_ARGS
       --js-app-bundle
       ${CMAKE_SOURCE_DIR}/samples/apps/logging/js
@@ -1338,6 +1454,7 @@ if(BUILD_TESTS)
     NAME partitions
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/partitions_test.py
     LABEL partitions
+    BUILD_DEPENDS logging
     DETECT_DEADLOCKS
     CONFIGURATIONS partitions
   )
@@ -1352,12 +1469,14 @@ if(BUILD_TESTS)
     NAME tls_stress_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/connections.py
     BUCKET bucket_c
+    BUILD_DEPENDS logging
   )
 
   add_e2e_test(
     NAME tls_groups_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/tls_groups.py
     BUCKET bucket_a
+    BUILD_DEPENDS logging
   )
 
   if(CLIENT_PROTOCOLS_TEST)
@@ -1366,6 +1485,7 @@ if(BUILD_TESTS)
       PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/client_protocols.py
       LABEL protocolstest
       BUCKET bucket_c
+      BUILD_DEPENDS logging testssl
     )
   endif()
 
@@ -1373,6 +1493,11 @@ if(BUILD_TESTS)
     NAME schema_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/schema.py
     BUCKET bucket_b
+    BUILD_DEPENDS
+      logging
+      logging_cose_only
+      logging_cose_only_allow_join_dual
+      nobuiltins
     ADDITIONAL_ARGS
       --constitution
       ${CMAKE_SOURCE_DIR}/samples/constitutions/virtual/virtual_attestation_actions.js
@@ -1391,6 +1516,7 @@ if(BUILD_TESTS)
     NAME snp_platform_tests
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/amd_snp.py
     LABEL snp
+    BUILD_DEPENDS logging
     CONFIGURATIONS snp
   )
 
@@ -1405,6 +1531,7 @@ if(BUILD_TESTS)
       PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/lts_compatibility.py
       LABEL e2e
       BUCKET bucket_a
+      BUILD_DEPENDS js_generic
       ADDITIONAL_ARGS
         ${LTS_TEST_ARGS}
         --constitution
@@ -1415,11 +1542,12 @@ if(BUILD_TESTS)
       APPEND
       PROPERTY ENVIRONMENT "LTS_COMPAT_GOV_CLIENT=1"
     )
-    set_property(
-      TEST lts_compatibility
-      APPEND
-      PROPERTY LABELS lts_compatibility
-    )
+    add_test_label(lts_compatibility lts_compatibility)
+    if(LONG_TESTS)
+      # Full ledger and snapshot recovery across releases exceeds the default
+      # e2e timeout, particularly in coverage builds.
+      set_tests_properties(lts_compatibility PROPERTIES TIMEOUT 900)
+    endif()
   endif()
 
   if(LONG_TESTS)
@@ -1431,100 +1559,158 @@ if(BUILD_TESTS)
     NAME nodes_test
     PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/nodes.py
     BUCKET bucket_b
+    BUILD_DEPENDS logging
     ADDITIONAL_ARGS ${RECONFIG_TEST_ARGS} ${ROTATION_TEST_ARGS}
   )
 
-  add_piccolo_test(
-    NAME pi_ls
-    PYTHON_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/tests/infra/piccolo_driver.py
-    CLIENT_BIN ./submit
-    PERF_LABEL "Logging"
+  # Certificate-authenticated blocking logging workload, driven by locust so
+  # that the number of concurrent clients can be varied.
+  add_e2e_test(
+    NAME logging_cert_blocking_locust
+    PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/logging_cert_locust.py
+    LABEL perf
+    CONFIGURATIONS perf
+    BUILD_DEPENDS logging
     ADDITIONAL_ARGS
       --package
       "samples/apps/logging/logging"
-      --max-writes-ahead
-      1000
-      --repetitions
-      100000
+      --perf-label
+      "Logging Certificate Blocking"
+      --snapshot-tx-interval
+      10000
+      --users
+      640
+      --spawn-rate
+      640
+      --locust-processes
+      10
+      --measure-time-s
+      20
+      --sig-ms-intervals
+      20
   )
 
-  add_piccolo_test(
-    NAME pi_basic
-    PYTHON_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/tests/infra/basicperf.py
-    CLIENT_BIN ./submit
-    PERF_LABEL "Basic"
-    ADDITIONAL_ARGS
-      --package
-      "samples/apps/basic/basic"
-      --client-def
-      "1,write,3000000,primary"
-  )
-
-  add_piccolo_test(
-    NAME pi_basic_blocking
-    PYTHON_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/tests/infra/basicperf.py
-    CLIENT_BIN ./submit
-    PERF_LABEL "Basic Blocking"
-    ADDITIONAL_ARGS
-      --package
-      "samples/apps/basic/basic"
-      --client-def
-      "128,blocking_write,100,primary"
-      --max-writes-ahead
-      0
-  )
-
-  add_piccolo_test(
-    NAME pi_basic_js
-    PYTHON_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/tests/infra/basicperf.py
-    CLIENT_BIN ./submit
-    PERF_LABEL "Basic JS"
+  # JavaScript write workload driven by locust so that the number of
+  # concurrent clients can be varied.
+  add_e2e_test(
+    NAME basic_js_locust
+    PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/basicperf_locust.py
+    LABEL perf
+    CONFIGURATIONS perf
+    BUILD_DEPENDS js_generic
     ADDITIONAL_ARGS
       --js-app-bundle
       ${CMAKE_SOURCE_DIR}/samples/apps/basic/js
-      --client-def
-      "1,write,300000,primary"
+      --perf-label
+      "Basic JS"
+      --endpoint
+      "/records/{key}"
+      --snapshot-tx-interval
+      10000
+      --users
+      320
+      --spawn-rate
+      320
+      --locust-processes
+      10
+      --measure-time-s
+      20
+      --sig-ms-intervals
+      100
   )
 
-  if(WORKER_THREADS)
-    add_piccolo_test(
-      NAME pi_basic_mt
-      PYTHON_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/tests/infra/basicperf.py
-      CLIENT_BIN ./submit
-      PERF_LABEL "Basic Multi-Threaded"
-      ADDITIONAL_ARGS
-        --package
-        "samples/apps/basic/basic"
-        --client-def
-        "${WORKER_THREADS},write,2000000,primary"
-    )
-  endif()
+  # Blocking commit benchmark driven by locust. Its concurrent connections
+  # exercise every configured worker thread, so this also covers the
+  # multi-threaded basic workload.
+  add_e2e_test(
+    NAME basic_blocking_locust
+    PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/basicperf_locust.py
+    LABEL perf
+    CONFIGURATIONS perf
+    BUILD_DEPENDS basic
+    ADDITIONAL_ARGS
+      --package
+      "samples/apps/basic/basic"
+      --perf-label
+      "Basic Blocking"
+      # Keep snapshot disk activity out of the measurement.
+      --snapshot-tx-interval
+      10000
+      --users
+      320
+      --spawn-rate
+      320
+      --locust-processes
+      10
+      --measure-time-s
+      20
+      # Blocking writes return on commit, and commit cannot outpace the
+      # signature interval, so this sweeps from latency-bound to capacity-bound.
+      --sig-ms-intervals
+      2
+      20
+      100
+  )
 
-  add_piccolo_test(
-    NAME pi_ls_jwt
-    PYTHON_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/tests/infra/piccolo_driver.py
-    CLIENT_BIN ./submit
-    PERF_LABEL "Logging JWT"
+  # JWT-authenticated blocking logging workload, driven by locust so that the
+  # number of concurrent clients can be varied.
+  add_e2e_test(
+    NAME logging_jwt_blocking_locust
+    PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/logging_jwt_locust.py
+    LABEL perf
+    CONFIGURATIONS perf
+    BUILD_DEPENDS logging
     ADDITIONAL_ARGS
       --package
       "samples/apps/logging/logging"
-      --max-writes-ahead
-      1000
-      --repetitions
+      --perf-label
+      "Logging JWT Blocking"
+      --snapshot-tx-interval
       10000
-      --use-jwt
+      --users
+      320
+      --spawn-rate
+      320
+      --locust-processes
+      10
+      --measure-time-s
+      20
+      --sig-ms-intervals
+      20
   )
 
+  # Historical range query benchmark driven by locust against a backup.
   add_e2e_test(
-    NAME historical_query_perf_test
-    PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/historical_query_perf.py
+    NAME historical_query_locust
+    PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/historical_query_locust.py
     LABEL perf
     CONFIGURATIONS perf
+    BUILD_DEPENDS logging
+    ADDITIONAL_ARGS
+      --package
+      "samples/apps/logging/logging"
+      --perf-label
+      "Historical Queries"
+      --snapshot-tx-interval
+      10000
+      --entry-count
+      30000
+      --users
+      3
+      --spawn-rate
+      3
+      --locust-processes
+      3
+      --measure-time-s
+      20
+      --sig-ms-intervals
+      1000
   )
 
   add_test_bin(
     curl_test
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/http/test/curl_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/http_client/test/curl_header_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/http_client/test/curl_test.cpp
   )
   target_link_libraries(curl_test PRIVATE curl uv http_parser)
 
@@ -1533,18 +1719,21 @@ if(BUILD_TESTS)
       NAME e2e_curl
       PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/e2e_curl.py
       BUCKET bucket_c
+      BUILD_DEPENDS curl_test
     )
 
     add_e2e_test(
       NAME historical_query_cache_test
       PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/historical_query_cache.py
       BUCKET bucket_c
+      BUILD_DEPENDS logging
     )
 
     add_e2e_test(
       NAME consistency_trace_validation
       PYTHON_SCRIPT ${CMAKE_SOURCE_DIR}/tests/consistency_trace_validation.py
       BUCKET bucket_c
+      BUILD_DEPENDS js_generic
     )
   endif()
 
@@ -1583,9 +1772,3 @@ install(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cpack_versions_pin.cmake
   DESTINATION ${CMAKE_INSTALL_PREFIX}/cmake
 )
-
-# Perf tool executable (requires Arrow/Parquet, not compatible with GLIBCXX_DEBUG)
-if(NOT GLIBCXX_DEBUG)
-  include(${CCF_DIR}/tests/perf-system/submitter/CMakeLists.txt)
-  add_hardening(submit)
-endif()

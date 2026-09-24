@@ -4,7 +4,6 @@
 import base64
 import http
 import json
-import os
 
 import ccf.ledger
 import ccf.read_ledger
@@ -21,10 +20,11 @@ from infra.proposal import ProposalState
 from loguru import logger as LOG
 
 
-def check_operations(ledger, operations):
+def check_operations(ledger, operations, expect_detached_proposals=True):
     LOG.debug("Audit the ledger file for governance operations")
 
     members = {}
+    embedded_proposals = []
     for chunk in ledger:
         for tr in chunk:
             tables = tr.get_public_domain().get_tables()
@@ -69,18 +69,48 @@ def check_operations(ledger, operations):
                     assert member_id in members
                     cert = members[member_id]
 
+                    cose_sign1 = base64.b64decode(cose_sign1)
+                    msg = cwt.COSEMessage.loads(cose_sign1)
+                    assert msg.type == cwt.COSETypes.SIGN1, msg
+                    assert "ccf.gov.msg.type" in msg.protected, msg.protected
+                    msg_type = msg.protected["ccf.gov.msg.type"]
+
+                    # Proposal creation always writes the signed proposal
+                    # body to public:ccf.gov.proposals in the same
+                    # transaction. Proposal entries now detach their payload
+                    # to avoid storing it twice, so it must be supplied from
+                    # that table for verification. Ledgers written by older
+                    # versions embed the payload in the envelope as well.
+                    # Ballots and withdrawals always embed their payload, as
+                    # it is not recorded elsewhere.
+                    detached_payload = None
+                    if msg_type == "proposal":
+                        proposals = {
+                            proposal_id: proposal
+                            for proposal_id, proposal in tables[
+                                "public:ccf.gov.proposals"
+                            ].items()
+                            if proposal is not None
+                        }
+                        ((proposal_id, proposal_body),) = proposals.items()
+                        if msg.payload is None:
+                            detached_payload = proposal_body
+                        else:
+                            embedded_proposals.append(proposal_id.decode())
+                    else:
+                        assert msg.payload is not None, msg
+
                     cose_ctx = cwt.COSE.new()
                     cert_pem = cert.decode()
                     cose_key = cwt.COSEKey.from_pem(
                         cert_pem, kid=cert_fingerprint(cert_pem)
                     )
                     phdr, uhdr, payload = cose_ctx.decode_with_headers(
-                        base64.b64decode(cose_sign1), cose_key
+                        cose_sign1, cose_key, detached_payload=detached_payload
                     )
 
-                    assert "ccf.gov.msg.type" in phdr
-                    msg_type = phdr["ccf.gov.msg.type"]
                     if msg_type == "ballot":
+                        assert "ballot" in json.loads(payload), payload
                         op = (
                             phdr["ccf.gov.msg.proposal_id"],
                             member_id.decode(),
@@ -93,7 +123,9 @@ def check_operations(ledger, operations):
                             "withdraw",
                         )
                     elif msg_type == "proposal":
-                        (proposal_id,) = tables["public:ccf.gov.proposals"].keys()
+                        # Whether detached or embedded, the signed payload must
+                        # be the proposal body stored in the proposals table
+                        assert payload == proposal_body, (payload, proposal_body)
                         op = (proposal_id.decode(), member_id.decode(), "propose")
                     else:
                         assert False, (phdr, uhdr, payload)
@@ -102,6 +134,8 @@ def check_operations(ledger, operations):
                         operations.remove(op)
 
     assert operations == set(), operations
+    if expect_detached_proposals:
+        assert embedded_proposals == [], embedded_proposals
 
 
 def check_signatures(ledger):
@@ -206,25 +240,28 @@ def remove_prefix(s, prefix):
 @reqs.description("Check tables are documented")
 def test_tables_doc(network, args):
     primary, _ = network.find_primary()
-    ledger_directories = primary.remote.ledger_paths()
-    ledger = ccf.ledger.Ledger(ledger_directories, contiguous_suffix=True)
-    table_names_in_ledger = ledger.get_latest_public_state()[0].keys()
+    target_seqno = network.create_and_wait_for_ledger_chunk(primary)
+    public_state, _ = primary.get_public_state_from_api(target_seqno)
+    table_names_in_ledger = public_state.keys()
     check_all_tables_are_documented(
         table_names_in_ledger, "../doc/audit/builtin_maps.rst"
     )
     return network
 
 
-@reqs.description("Test that all nodes' ledgers can be read")
+@reqs.description("Test that all nodes' API-readable ledger chunks can be read")
 def test_ledger_is_readable(network, args):
     primary, backups = network.find_nodes()
+    target_seqno = network.create_and_wait_for_ledger_chunk(primary)
     for node in (primary, *backups):
-        ledger_dirs = node.remote.ledger_paths()
-        LOG.info(f"Reading ledger from {ledger_dirs}")
-        ledger = ccf.ledger.Ledger(ledger_dirs, contiguous_suffix=True)
-        for chunk in ledger:
-            for _ in chunk:
-                pass
+        with node.get_ledger_from_api(
+            target_seqno,
+            local_only=True,
+            timeout=args.ledger_recovery_timeout,
+        ) as ledger:
+            for chunk in ledger:
+                for _ in chunk:
+                    pass
     return network
 
 
@@ -236,20 +273,20 @@ def test_read_ledger_utility(network, args):
     format_rule = [(".*records.*", {"key": fmt_str, "value": fmt_str})]
 
     network.txs.issue(network, number_txs=args.snapshot_tx_interval)
-    network.get_latest_ledger_public_state()
+    target_seqno = network.create_and_wait_for_ledger_chunk()
 
     primary, backups = network.find_nodes()
     for node in (primary, *backups):
-        ledger_dirs = node.remote.ledger_paths()
-        assert ccf.read_ledger.run(
-            paths=ledger_dirs,
-            print_mode=ccf.read_ledger.PrintMode.Contents,
-            tables_format_rules=format_rule,
-        )
+        with node.download_ledger(target_seqno, local_only=True) as ledger_paths:
+            assert ccf.read_ledger.run(
+                paths=ledger_paths,
+                print_mode=ccf.read_ledger.PrintMode.Contents,
+                tables_format_rules=format_rule,
+            )
 
-    snapshot_dir = network.get_committed_snapshots(primary)
+    snapshot_path = primary.wait_for_snapshot(target_seqno)
     assert ccf.read_ledger.run(
-        paths=[os.path.join(snapshot_dir, os.listdir(snapshot_dir)[-1])],
+        paths=[snapshot_path],
         print_mode=ccf.read_ledger.PrintMode.Contents,
         is_snapshot=True,
         tables_format_rules=format_rule,
@@ -274,7 +311,6 @@ def run(args):
 
         network.consortium.set_authenticate_session(args.authenticate_session)
 
-        ledger_directories = primary.remote.ledger_paths()
         LOG.info("Add new member proposal (implicit vote)")
         (
             new_member_proposal,
@@ -323,12 +359,11 @@ def run(args):
             (new_member_proposal.proposal_id, member.service_id, "withdraw")
         )
 
-        # Force ledger flush of all transactions so far
-        network.get_latest_ledger_public_state()
+        target_seqno = network.create_and_wait_for_ledger_chunk(primary)
 
-        ledger = ccf.ledger.Ledger(ledger_directories, contiguous_suffix=True)
-        check_operations(ledger, governance_operations)
-        check_signatures(ledger)
+        with primary.get_ledger_from_api(target_seqno) as ledger:
+            check_operations(ledger, governance_operations)
+            check_signatures(ledger)
 
         test_ledger_is_readable(network, args)
         test_read_ledger_utility(network, args)

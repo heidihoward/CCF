@@ -2,9 +2,11 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/ds/locking.h"
+
 #include <atomic>
+#include <cassert>
 #include <deque>
-#include <mutex>
 
 namespace ccf::tasks
 {
@@ -16,8 +18,8 @@ namespace ccf::tasks
   class SubTaskQueue
   {
   protected:
-    std::mutex pending_mutex;
-    std::deque<T> pending;
+    ccf::ds::Mutex pending_mutex;
+    std::deque<T> pending CCF_GUARDED_BY(pending_mutex);
     std::atomic<bool> active;
     std::atomic<bool> paused;
 
@@ -29,7 +31,7 @@ namespace ccf::tasks
     // processing of this queue now" (eg, enqueue the parent runner).
     bool push(T&& t)
     {
-      std::lock_guard<std::mutex> lock(pending_mutex);
+      ccf::ds::MutexGuard lock(pending_mutex);
       const bool ret = pending.empty() && !active.load();
       pending.emplace_back(std::forward<T>(t));
       return ret;
@@ -40,7 +42,7 @@ namespace ccf::tasks
     {
       decltype(pending) local;
       {
-        std::lock_guard<std::mutex> lock(pending_mutex);
+        ccf::ds::MutexGuard lock(pending_mutex);
         active.store(true);
 
         std::swap(local, pending);
@@ -54,7 +56,7 @@ namespace ccf::tasks
       }
 
       {
-        std::lock_guard<std::mutex> lock(pending_mutex);
+        ccf::ds::MutexGuard lock(pending_mutex);
         if (it != local.end())
         {
           // Paused mid-execution - some actions remain that need to be
@@ -69,13 +71,13 @@ namespace ccf::tasks
 
     void pause()
     {
-      std::lock_guard<std::mutex> lock(pending_mutex);
+      ccf::ds::MutexGuard lock(pending_mutex);
       paused.store(true);
     }
 
     bool unpause()
     {
-      std::lock_guard<std::mutex> lock(pending_mutex);
+      ccf::ds::MutexGuard lock(pending_mutex);
       paused.store(false);
       return !pending.empty() && !active.load();
     }
@@ -83,10 +85,21 @@ namespace ccf::tasks
     void get_queue_summary(
       size_t& num_pending, bool& is_active, bool& is_paused)
     {
-      std::lock_guard<std::mutex> lock(pending_mutex);
+      ccf::ds::MutexGuard lock(pending_mutex);
       num_pending = pending.size();
       is_active = active.load();
       is_paused = paused.load();
+    }
+
+    // The caller has stopped execution, including any local batch held by
+    // pop_and_visit. Dispose of the returned items outside pending_mutex.
+    std::deque<T> take_pending()
+    {
+      std::deque<T> abandoned;
+      ccf::ds::MutexGuard lock(pending_mutex);
+      assert(!active.load());
+      abandoned.swap(pending);
+      return abandoned;
     }
   };
 }

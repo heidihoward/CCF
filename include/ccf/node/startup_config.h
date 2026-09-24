@@ -22,12 +22,22 @@ namespace ccf
 {
   struct CCFConfig
   {
-    size_t worker_threads = 0;
+    // One more worker than configured is started, in addition to the dispatch
+    // thread. A configured value of 0 logs a warning (see
+    // validate_and_coerce_worker_threads in src/host/run.cpp).
+    size_t worker_threads = 1;
 
     // 2**24.5 as per RFC8446 Section 5.5
     size_t node_to_node_message_limit = 23'726'566;
 
     ccf::ds::SizeString historical_cache_soft_limit = {"512MB"};
+
+    // How long an idle RPC (client TLS) connection is kept before it is closed.
+    // std::nullopt disables idle closure (connections are never closed for
+    // being idle).
+    std::optional<ccf::ds::TimeString> idle_connection_timeout =
+      ccf::ds::TimeString("60s");
+    ccf::ds::TimeString pending_node_timeout = {"1h"};
 
     ccf::consensus::Configuration consensus = {};
     ccf::NodeInfoNetwork network;
@@ -48,6 +58,7 @@ namespace ccf
       std::string directory = "ledger";
       std::vector<std::string> read_only_directories;
       ccf::ds::SizeString chunk_size = {"5MB"};
+      ccf::ds::SizeString max_transaction_size = {"32MB"};
 
       bool operator==(const Ledger&) const = default;
     };
