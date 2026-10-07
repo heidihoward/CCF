@@ -9,6 +9,9 @@ import «transition-systems».TowerOfHanoi.TowerOfHanoiB
 import «transition-systems».TowerOfHanoi.TowerOfHanoiC
 import «transition-systems».TransitionSystemRunner
 import «transition-systems».TransitionSystemC
+import «transition-systems».TwoPhaseCommit.TwoPhaseCommitA
+import «transition-systems».TwoPhaseCommit.TwoPhaseCommitB
+import «transition-systems».TwoPhaseCommit.TwoPhaseCommitC
 import «transition-systems».WaterPouring.WaterPouringA
 import «transition-systems».WaterPouring.WaterPouringB
 import «transition-systems».WaterPouring.WaterPouringC
