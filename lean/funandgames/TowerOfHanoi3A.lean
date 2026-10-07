@@ -8,19 +8,18 @@ inductive Peg where
   | right
 deriving DecidableEq
 
-inductive Disk where
-  | small
-  | medium
-  | large
-
 structure State where
   small : Peg
   medium : Peg
   large : Peg
 
-structure Action where
-  disk : Disk
-  target : Peg
+inductive Disk where
+  | small
+  | medium
+  | large
+
+inductive Action where
+  | moveDisk (disk : Disk) (target : Peg)
 
 def initial (state : State) : Prop :=
   state.small = .left /\
@@ -46,10 +45,10 @@ def moveLarge (before : State) (target : Peg) (after : State) : Prop :=
     after = { before with large := target }
 
 def next (before : State) (action : Action) (after : State) : Prop :=
-  match action.disk with
-  | .small => moveSmall before action.target after
-  | .medium => moveMedium before action.target after
-  | .large => moveLarge before action.target after
+  match action with
+  | .moveDisk .small target => moveSmall before target after
+  | .moveDisk .medium target => moveMedium before target after
+  | .moveDisk .large target => moveLarge before target after
 
 def goal (state : State) : Prop :=
   state.small = .right /\

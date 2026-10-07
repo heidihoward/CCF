@@ -11,9 +11,8 @@ deriving DecidableEq
 abbrev State (n : Nat) :=
   Fin n -> Peg
 
-structure Action (n : Nat) where
-  disk : Fin n
-  target : Peg
+inductive Action (n : Nat) where
+  | moveDisk (disk : Fin n) (target : Peg)
 
 def initial {n : Nat} (state : State n) : Prop :=
   forall disk, state disk = .left
@@ -34,9 +33,10 @@ def smallerDisksClear
       else
         false
 
-def legal {n : Nat} (state : State n) (action : Action n) : Bool :=
-  decide (action.target ≠ state action.disk) &&
-    smallerDisksClear state action.disk action.target action.disk.val
+def legal {n : Nat} (state : State n) : Action n -> Bool
+  | .moveDisk disk target =>
+      decide (target ≠ state disk) &&
+        smallerDisksClear state disk target disk.val
 
 def moveDisk
     {n : Nat}
@@ -46,10 +46,12 @@ def moveDisk
   fun current => if current = disk then target else state current
 
 def next {n : Nat} (state : State n) (action : Action n) : Option (State n) :=
-  if legal state action then
-    some (moveDisk state action.disk action.target)
-  else
-    none
+  match action with
+  | .moveDisk disk target =>
+      if legal state action then
+        some (moveDisk state disk target)
+      else
+        none
 
 def goal {n : Nat} (state : State n) : Prop :=
   forall disk, state disk = .right

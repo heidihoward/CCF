@@ -11,19 +11,19 @@ deriving DecidableEq
 abbrev State (n : Nat) :=
   Fin n -> Peg
 
-structure Action (n : Nat) where
-  disk : Fin n
-  target : Peg
+inductive Action (n : Nat) where
+  | moveDisk (disk : Fin n) (target : Peg)
 
 def initial {n : Nat} (state : State n) : Prop :=
   forall disk, state disk = .left
 
-def legal {n : Nat} (state : State n) (action : Action n) : Prop :=
-  action.target ≠ state action.disk /\
-    forall smaller,
-      smaller.val < action.disk.val ->
-        state smaller ≠ state action.disk /\
-          state smaller ≠ action.target
+def legal {n : Nat} (state : State n) : Action n -> Prop
+  | .moveDisk disk target =>
+      target ≠ state disk /\
+        forall smaller,
+          smaller.val < disk.val ->
+            state smaller ≠ state disk /\
+              state smaller ≠ target
 
 def moveDisk
     {n : Nat}
@@ -37,8 +37,10 @@ def next
     (before : State n)
     (action : Action n)
     (after : State n) : Prop :=
-  legal before action /\
-    after = moveDisk before action.disk action.target
+  match action with
+  | .moveDisk disk target =>
+      legal before action /\
+        after = moveDisk before disk target
 
 def goal {n : Nat} (state : State n) : Prop :=
   forall disk, state disk = .right
