@@ -3,6 +3,11 @@ version = "0.1.0"
 moreLeanArgs = ["-DwarningAsError=true"]
 defaultTargets = ["funandgames", "water-pouring", "tower-of-hanoi"]
 
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "v4.33.1"
+
 [[lean_lib]]
 name = "funandgames"
 

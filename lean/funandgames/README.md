@@ -1,6 +1,6 @@
 # Transition system examples
 
-This directory contains two small transition-system representations.
+This directory contains three small transition-system representations.
 
 ## `TransitionSystemA`
 
@@ -28,5 +28,18 @@ It returns one successor or `none` when an action is disabled. This makes the
 system deterministic and directly executable, but it cannot represent multiple
 possible successors for the same state and action.
 
-The interactive runner therefore uses `TransitionSystemB`. The paired examples
-show how the same puzzle can be expressed using either representation.
+## `TransitionSystemC`
+
+`TransitionSystemC.next` returns a finite set of successors:
+
+```lean
+State -> Action -> Finset State
+```
+
+It is executable and supports finite nondeterminism. Unlike
+`TransitionSystemA`, it cannot directly describe infinitely many successors.
+Unlike `TransitionSystemB`, the same state and action may produce several
+possible next states.
+
+The interactive runner therefore uses `TransitionSystemB`. The A, B, and C
+examples show how the same puzzle can be expressed using each representation.

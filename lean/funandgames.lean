@@ -1,9 +1,14 @@
 import funandgames.CounterA
 import funandgames.CounterB
+import funandgames.CounterC
 import funandgames.TowerOfHanoi3A
 import funandgames.TowerOfHanoi3B
+import funandgames.TowerOfHanoi3C
 import funandgames.TowerOfHanoiA
 import funandgames.TowerOfHanoiB
+import funandgames.TowerOfHanoiC
 import funandgames.TransitionSystemRunner
+import funandgames.TransitionSystemC
 import funandgames.WaterPouringA
 import funandgames.WaterPouringB
+import funandgames.WaterPouringC
