@@ -1,6 +1,6 @@
-import funandgames.TransitionSystemB
+import «transition-systems».TransitionSystemC
 
-namespace TowerOfHanoi3B
+namespace TowerOfHanoi3C
 
 inductive Peg where
   | left
@@ -12,6 +12,7 @@ structure State where
   small : Peg
   medium : Peg
   large : Peg
+deriving DecidableEq
 
 inductive Disk where
   | small
@@ -26,31 +27,31 @@ def initial (state : State) : Prop :=
     state.medium = .left /\
     state.large = .left
 
-def moveSmall (state : State) (target : Peg) : Option State :=
+def moveSmall (state : State) (target : Peg) : Finset State :=
   if target ≠ state.small then
-    some { state with small := target }
+    {{ state with small := target }}
   else
-    none
+    {}
 
-def moveMedium (state : State) (target : Peg) : Option State :=
+def moveMedium (state : State) (target : Peg) : Finset State :=
   if state.small ≠ state.medium /\
       target ≠ state.medium /\
       state.small ≠ target then
-    some { state with medium := target }
+    {{ state with medium := target }}
   else
-    none
+    {}
 
-def moveLarge (state : State) (target : Peg) : Option State :=
+def moveLarge (state : State) (target : Peg) : Finset State :=
   if state.small ≠ state.large /\
       state.medium ≠ state.large /\
       target ≠ state.large /\
       state.small ≠ target /\
       state.medium ≠ target then
-    some { state with large := target }
+    {{ state with large := target }}
   else
-    none
+    {}
 
-def next (state : State) (action : Action) : Option State :=
+def next (state : State) (action : Action) : Finset State :=
   match action with
   | .moveDisk .small target => moveSmall state target
   | .moveDisk .medium target => moveMedium state target
@@ -61,10 +62,10 @@ def goal (state : State) : Prop :=
     state.medium = .right /\
     state.large = .right
 
-def system : TransitionSystemB where
+def system : TransitionSystemC where
   State := State
   Action := Action
   initial := initial
   next := next
 
-end TowerOfHanoi3B
+end TowerOfHanoi3C

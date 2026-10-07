@@ -1,4 +1,4 @@
-import funandgames.TransitionSystemA
+import «transition-systems».TransitionSystemA
 
 namespace CounterA
 

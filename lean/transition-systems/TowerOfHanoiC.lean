@@ -1,5 +1,5 @@
 import Mathlib.Data.Fintype.Pi
-import funandgames.TransitionSystemC
+import «transition-systems».TransitionSystemC
 
 namespace TowerOfHanoiC
 

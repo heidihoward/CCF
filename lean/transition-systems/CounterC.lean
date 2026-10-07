@@ -1,4 +1,4 @@
-import funandgames.TransitionSystemC
+import «transition-systems».TransitionSystemC
 
 namespace CounterC
 

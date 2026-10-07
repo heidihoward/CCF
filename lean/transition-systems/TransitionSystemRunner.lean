@@ -1,4 +1,4 @@
-import funandgames.TransitionSystemB
+import «transition-systems».TransitionSystemB
 
 structure InteractiveSystem where
   system : TransitionSystemB

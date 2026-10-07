@@ -1,5 +1,5 @@
-import funandgames.TransitionSystemRunner
-import funandgames.WaterPouringB
+import «transition-systems».TransitionSystemRunner
+import «transition-systems».WaterPouringB
 
 namespace RunWaterPouringB
 

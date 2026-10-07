@@ -1,5 +1,5 @@
-import funandgames.TowerOfHanoiB
-import funandgames.TransitionSystemRunner
+import «transition-systems».TowerOfHanoiB
+import «transition-systems».TransitionSystemRunner
 
 namespace RunTowerOfHanoiB
 
