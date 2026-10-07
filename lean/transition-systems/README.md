@@ -43,3 +43,27 @@ possible next states.
 
 The interactive runner therefore uses `TransitionSystemB`. The A, B, and C
 examples show how the same puzzle can be expressed using each representation.
+
+## TLA+ examples
+
+Each model family has its own subdirectory containing the Lean variants, a
+TLA+ specification, and a small TLC configuration:
+
+- `Counter/`
+- `WaterPouring/`
+- `TowerOfHanoi3/`
+- `TowerOfHanoi/`
+
+The TLA+ modules mirror the transition relations in the corresponding Lean
+examples. `TowerOfHanoi.tla` is parameterized by `DiskCount`, which is set to
+three in `TowerOfHanoi.cfg`.
+
+After installing the repository's TLA+ dependencies, run TLC from the
+repository's `tla` directory. For example:
+
+```sh
+./tlc.py mc ../lean/transition-systems/Counter/Counter.tla
+./tlc.py mc ../lean/transition-systems/WaterPouring/WaterPouring.tla
+./tlc.py mc ../lean/transition-systems/TowerOfHanoi3/TowerOfHanoi3.tla
+./tlc.py mc ../lean/transition-systems/TowerOfHanoi/TowerOfHanoi.tla
+```

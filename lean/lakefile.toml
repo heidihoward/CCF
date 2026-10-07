@@ -13,8 +13,8 @@ name = "transition-systems"
 
 [[lean_exe]]
 name = "water-pouring"
-root = "\u00abtransition-systems\u00bb.RunWaterPouringB"
+root = "\u00abtransition-systems\u00bb.WaterPouring.RunWaterPouringB"
 
 [[lean_exe]]
 name = "tower-of-hanoi"
-root = "\u00abtransition-systems\u00bb.RunTowerOfHanoiB"
+root = "\u00abtransition-systems\u00bb.TowerOfHanoi.RunTowerOfHanoiB"

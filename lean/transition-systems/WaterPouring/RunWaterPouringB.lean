@@ -1,5 +1,5 @@
 import «transition-systems».TransitionSystemRunner
-import «transition-systems».WaterPouringB
+import «transition-systems».WaterPouring.WaterPouringB
 
 namespace RunWaterPouringB
 
