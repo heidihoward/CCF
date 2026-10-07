@@ -1,7 +1,12 @@
 name = "transition-systems"
 version = "0.1.0"
 moreLeanArgs = ["-DwarningAsError=true"]
-defaultTargets = ["transition-systems", "water-pouring", "tower-of-hanoi"]
+defaultTargets = [
+  "transition-systems",
+  "water-pouring",
+  "tower-of-hanoi",
+  "check-two-phase-commit",
+]
 
 [[require]]
 name = "mathlib"
@@ -18,3 +23,7 @@ root = "\u00abtransition-systems\u00bb.WaterPouring.RunWaterPouringB"
 [[lean_exe]]
 name = "tower-of-hanoi"
 root = "\u00abtransition-systems\u00bb.TowerOfHanoi.RunTowerOfHanoiB"
+
+[[lean_exe]]
+name = "check-two-phase-commit"
+root = "\u00abtransition-systems\u00bb.TwoPhaseCommit.CheckTwoPhaseCommitB"

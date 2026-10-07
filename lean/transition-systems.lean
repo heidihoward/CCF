@@ -8,6 +8,7 @@ import «transition-systems».TowerOfHanoi.TowerOfHanoiA
 import «transition-systems».TowerOfHanoi.TowerOfHanoiB
 import «transition-systems».TowerOfHanoi.TowerOfHanoiC
 import «transition-systems».TransitionSystemRunner
+import «transition-systems».TransitionSystemModelChecker
 import «transition-systems».TransitionSystemC
 import «transition-systems».TwoPhaseCommit.TwoPhaseCommitA
 import «transition-systems».TwoPhaseCommit.TwoPhaseCommitB

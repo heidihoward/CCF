@@ -44,6 +44,32 @@ possible next states.
 The interactive runner therefore uses `TransitionSystemB`. The A, B, and C
 examples show how the same puzzle can be expressed using each representation.
 
+## Exhaustive model checker
+
+`TransitionSystemModelChecker.lean` provides a breadth-first model checker for
+`TransitionSystemB`. It takes a concrete initial state, a complete list of
+actions, an executable state-equivalence function, and a Boolean invariant. It
+returns success only after exhausting the reachable state graph. If the
+invariant fails, it returns a shortest trace from the initial state to the
+failing state.
+
+The reachable state space must be finite, and `actions` must contain every
+action that should be checked. The checker is intentionally simple and stores
+visited states in a list, so it is intended for small examples rather than
+large state spaces.
+
+The two-phase commit example checks that commit follows two yes votes and abort
+follows at least one no vote:
+
+```sh
+cd lean
+lake exe check-two-phase-commit
+```
+
+Run `lake exe check-two-phase-commit -- --demo-counterexample` to check the
+deliberately false claim that commit is unreachable and print its shortest
+counterexample.
+
 ## TLA+ examples
 
 Each model family has its own subdirectory containing the Lean variants, a
