@@ -1,0 +1,15 @@
+name = "funandgames"
+version = "0.1.0"
+moreLeanArgs = ["-DwarningAsError=true"]
+defaultTargets = ["funandgames", "water-pouring", "tower-of-hanoi"]
+
+[[lean_lib]]
+name = "funandgames"
+
+[[lean_exe]]
+name = "water-pouring"
+root = "funandgames.RunWaterPouringB"
+
+[[lean_exe]]
+name = "tower-of-hanoi"
+root = "funandgames.RunTowerOfHanoiB"
