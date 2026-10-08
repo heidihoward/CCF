@@ -95,9 +95,9 @@ After installing the repository's TLA+ dependencies, run TLC from the
 repository's `tla` directory. For example:
 
 ```sh
-./tlc.py mc ../lean/transition-systems/Counter/Counter.tla
-./tlc.py mc ../lean/transition-systems/WaterPouring/WaterPouring.tla
-./tlc.py mc ../lean/transition-systems/TowerOfHanoi3/TowerOfHanoi3.tla
-./tlc.py mc ../lean/transition-systems/TowerOfHanoi/TowerOfHanoi.tla
-./tlc.py mc ../lean/transition-systems/TwoPhaseCommit/TwoPhaseCommit.tla
+./tlc.py mc ../lean/TransitionSystems/Counter/Counter.tla
+./tlc.py mc ../lean/TransitionSystems/WaterPouring/WaterPouring.tla
+./tlc.py mc ../lean/TransitionSystems/TowerOfHanoi3/TowerOfHanoi3.tla
+./tlc.py mc ../lean/TransitionSystems/TowerOfHanoi/TowerOfHanoi.tla
+./tlc.py mc ../lean/TransitionSystems/TwoPhaseCommit/TwoPhaseCommit.tla
 ```

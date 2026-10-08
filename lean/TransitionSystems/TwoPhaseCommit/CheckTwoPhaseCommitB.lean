@@ -1,5 +1,5 @@
-import «transition-systems».TransitionSystemModelChecker
-import «transition-systems».TwoPhaseCommit.TwoPhaseCommitB
+import TransitionSystems.TransitionSystemModelChecker
+import TransitionSystems.TwoPhaseCommit.TwoPhaseCommitB
 
 namespace CheckTwoPhaseCommitB
 

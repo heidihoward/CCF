@@ -1,4 +1,4 @@
-import «transition-systems».TransitionSystemA
+import TransitionSystems.TransitionSystemA
 
 namespace TowerOfHanoi3A
 

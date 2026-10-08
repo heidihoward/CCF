@@ -1,4 +1,4 @@
-import «transition-systems».TransitionSystemC
+import TransitionSystems.TransitionSystemC
 
 namespace CounterC
 

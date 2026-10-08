@@ -1,11 +1,16 @@
-import «transition-systems».TransitionSystemB
+import Mathlib.Data.Fintype.Pi
+import TransitionSystems.TransitionSystemC
 
-namespace TwoPhaseCommitB
+namespace TwoPhaseCommitC
 
 inductive Participant where
   | first
   | second
 deriving DecidableEq
+
+instance : Fintype Participant where
+  elems := {.first, .second}
+  complete participant := by cases participant <;> simp
 
 inductive Decision where
   | collecting
@@ -17,6 +22,7 @@ structure State where
   votes : Participant -> Option Bool
   decision : Decision
   acknowledged : Participant -> Bool
+deriving DecidableEq
 
 inductive Action where
   | vote (participant : Participant) (value : Bool)
@@ -32,44 +38,46 @@ def initial (state : State) : Prop :=
 def recordVote
     (state : State)
     (participant : Participant)
-    (value : Bool) : Option State :=
+    (value : Bool) : Finset State :=
   if state.decision = .collecting /\ state.votes participant = none then
-    some
-      { state with
-        votes := fun current =>
-          if current = participant then some value else state.votes current }
+    {{
+      state with
+      votes := fun current =>
+        if current = participant then some value else state.votes current
+    }}
   else
-    none
+    {}
 
-def decideCommit (state : State) : Option State :=
+def decideCommit (state : State) : Finset State :=
   if state.decision = .collecting /\
       state.votes .first = some true /\
       state.votes .second = some true then
-    some { state with decision := .commit }
+    {{ state with decision := .commit }}
   else
-    none
+    {}
 
-def decideAbort (state : State) : Option State :=
+def decideAbort (state : State) : Finset State :=
   if state.decision = .collecting /\
       (state.votes .first = some false \/
         state.votes .second = some false) then
-    some { state with decision := .abort }
+    {{ state with decision := .abort }}
   else
-    none
+    {}
 
 def acknowledge
     (state : State)
-    (participant : Participant) : Option State :=
+    (participant : Participant) : Finset State :=
   if state.decision != .collecting /\
       state.acknowledged participant = false then
-    some
-      { state with
-        acknowledged := fun current =>
-          if current = participant then true else state.acknowledged current }
+    {{
+      state with
+      acknowledged := fun current =>
+        if current = participant then true else state.acknowledged current
+    }}
   else
-    none
+    {}
 
-def next (state : State) : Action -> Option State
+def next (state : State) : Action -> Finset State
   | .vote participant value => recordVote state participant value
   | .decideCommit => decideCommit state
   | .decideAbort => decideAbort state
@@ -80,10 +88,10 @@ def completed (state : State) : Prop :=
     state.acknowledged .first = true /\
     state.acknowledged .second = true
 
-def system : TransitionSystemB where
+def system : TransitionSystemC where
   State := State
   Action := Action
   initial := initial
   next := next
 
-end TwoPhaseCommitB
+end TwoPhaseCommitC

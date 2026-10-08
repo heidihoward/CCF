@@ -2,7 +2,7 @@ name = "transition-systems"
 version = "0.1.0"
 moreLeanArgs = ["-DwarningAsError=true"]
 defaultTargets = [
-  "transition-systems",
+  "TransitionSystems",
   "water-pouring",
   "tower-of-hanoi",
   "check-two-phase-commit",
@@ -14,16 +14,16 @@ git = "https://github.com/leanprover-community/mathlib4.git"
 rev = "v4.33.1"
 
 [[lean_lib]]
-name = "transition-systems"
+name = "TransitionSystems"
 
 [[lean_exe]]
 name = "water-pouring"
-root = "\u00abtransition-systems\u00bb.WaterPouring.RunWaterPouringB"
+root = "TransitionSystems.WaterPouring.RunWaterPouringB"
 
 [[lean_exe]]
 name = "tower-of-hanoi"
-root = "\u00abtransition-systems\u00bb.TowerOfHanoi.RunTowerOfHanoiB"
+root = "TransitionSystems.TowerOfHanoi.RunTowerOfHanoiB"
 
 [[lean_exe]]
 name = "check-two-phase-commit"
-root = "\u00abtransition-systems\u00bb.TwoPhaseCommit.CheckTwoPhaseCommitB"
+root = "TransitionSystems.TwoPhaseCommit.CheckTwoPhaseCommitB"

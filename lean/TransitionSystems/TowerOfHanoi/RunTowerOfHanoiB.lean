@@ -1,5 +1,5 @@
-import «transition-systems».TowerOfHanoi.TowerOfHanoiB
-import «transition-systems».TransitionSystemRunner
+import TransitionSystems.TowerOfHanoi.TowerOfHanoiB
+import TransitionSystems.TransitionSystemRunner
 
 namespace RunTowerOfHanoiB
 
