@@ -13,6 +13,9 @@ import TransitionSystems.TransitionSystemC
 import TransitionSystems.TwoPhaseCommit.TwoPhaseCommitA
 import TransitionSystems.TwoPhaseCommit.TwoPhaseCommitB
 import TransitionSystems.TwoPhaseCommit.TwoPhaseCommitC
+import TransitionSystems.UnsafeCounter.UnsafeCounterA
+import TransitionSystems.UnsafeCounter.UnsafeCounterB
+import TransitionSystems.UnsafeCounter.UnsafeCounterC
 import TransitionSystems.WaterPouring.WaterPouringA
 import TransitionSystems.WaterPouring.WaterPouringB
 import TransitionSystems.WaterPouring.WaterPouringC

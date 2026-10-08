@@ -6,6 +6,7 @@ defaultTargets = [
   "water-pouring",
   "tower-of-hanoi",
   "check-two-phase-commit",
+  "check-unsafe-counter",
 ]
 
 [[require]]
@@ -27,3 +28,7 @@ root = "TransitionSystems.TowerOfHanoi.RunTowerOfHanoiB"
 [[lean_exe]]
 name = "check-two-phase-commit"
 root = "TransitionSystems.TwoPhaseCommit.CheckTwoPhaseCommitB"
+
+[[lean_exe]]
+name = "check-unsafe-counter"
+root = "TransitionSystems.UnsafeCounter.CheckUnsafeCounterB"

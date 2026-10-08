@@ -70,6 +70,14 @@ Run `lake exe check-two-phase-commit -- --demo-counterexample` to check the
 deliberately false claim that commit is unreachable and print its shortest
 counterexample.
 
+The unsafe counter example models three threads performing an increment as
+separate read and write actions without locking. Its checker finds a completed
+execution where increments are lost:
+
+```sh
+lake exe check-unsafe-counter
+```
+
 ## TLA+ examples
 
 Each model family has its own subdirectory containing the Lean variants, a
@@ -80,6 +88,7 @@ TLA+ specification, and a small TLC configuration:
 - `TowerOfHanoi3/`
 - `TowerOfHanoi/`
 - `TwoPhaseCommit/`
+- `UnsafeCounter/`
 
 The TLA+ modules mirror the transition relations in the corresponding Lean
 examples. `TowerOfHanoi.tla` is parameterized by `DiskCount`, which is set to
@@ -100,4 +109,15 @@ repository's `tla` directory. For example:
 ./tlc.py mc ../lean/TransitionSystems/TowerOfHanoi3/TowerOfHanoi3.tla
 ./tlc.py mc ../lean/TransitionSystems/TowerOfHanoi/TowerOfHanoi.tla
 ./tlc.py mc ../lean/TransitionSystems/TwoPhaseCommit/TwoPhaseCommit.tla
+./tlc.py mc ../lean/TransitionSystems/UnsafeCounter/UnsafeCounter.tla
+```
+
+`UnsafeCounter/UnsafeCounterBug.cfg` additionally checks the deliberately false
+claim that all completed executions preserve every increment. TLC reports a
+counterexample showing the lost update:
+
+```sh
+./tlc.py \
+  --config ../lean/TransitionSystems/UnsafeCounter/UnsafeCounterBug.cfg \
+  mc ../lean/TransitionSystems/UnsafeCounter/UnsafeCounter.tla
 ```
