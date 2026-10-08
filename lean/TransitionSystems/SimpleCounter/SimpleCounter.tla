@@ -1,4 +1,4 @@
----- MODULE Counter ----
+---- MODULE SimpleCounter ----
 EXTENDS Naturals
 
 VARIABLES first, second

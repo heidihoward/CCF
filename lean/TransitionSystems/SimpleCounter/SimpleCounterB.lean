@@ -1,6 +1,6 @@
 import TransitionSystems.TransitionSystemB
 
-namespace CounterB
+namespace SimpleCounterB
 
 structure State where
   first : Nat
@@ -56,4 +56,4 @@ def system : TransitionSystemB where
   initial := initial
   next := next
 
-end CounterB
+end SimpleCounterB

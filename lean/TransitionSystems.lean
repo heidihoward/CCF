@@ -1,6 +1,9 @@
-import TransitionSystems.Counter.CounterA
-import TransitionSystems.Counter.CounterB
-import TransitionSystems.Counter.CounterC
+import TransitionSystems.SimpleCounter.SimpleCounterA
+import TransitionSystems.SimpleCounter.SimpleCounterB
+import TransitionSystems.SimpleCounter.SimpleCounterC
+import TransitionSystems.SafeCounter.SafeCounterA
+import TransitionSystems.SafeCounter.SafeCounterB
+import TransitionSystems.SafeCounter.SafeCounterC
 import TransitionSystems.TowerOfHanoi3.TowerOfHanoi3A
 import TransitionSystems.TowerOfHanoi3.TowerOfHanoi3B
 import TransitionSystems.TowerOfHanoi3.TowerOfHanoi3C

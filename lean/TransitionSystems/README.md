@@ -1,6 +1,11 @@
 # Transition system examples
 
-This directory contains three small transition-system representations.
+This directory contains small transition-system examples in Lean and TLA+.
+The files at the directory root define three reusable Lean transition-system
+representations, an interactive runner, and an exhaustive model checker. Each
+named subdirectory contains one model family, with Lean versions for
+`TransitionSystemA`, `TransitionSystemB`, and `TransitionSystemC`, plus a TLA+
+specification and TLC configuration.
 
 ## `TransitionSystemA`
 
@@ -78,17 +83,18 @@ execution where increments are lost:
 lake exe check-unsafe-counter
 ```
 
+The safe counter holds a lock across each thread's read and write actions. Its
+checker exhausts the reachable state space and verifies that no increments are
+lost:
+
+```sh
+lake exe check-safe-counter
+```
+
 ## TLA+ examples
 
 Each model family has its own subdirectory containing the Lean variants, a
-TLA+ specification, and a small TLC configuration:
-
-- `Counter/`
-- `WaterPouring/`
-- `TowerOfHanoi3/`
-- `TowerOfHanoi/`
-- `TwoPhaseCommit/`
-- `UnsafeCounter/`
+TLA+ specification, and a small TLC configuration.
 
 The TLA+ modules mirror the transition relations in the corresponding Lean
 examples. `TowerOfHanoi.tla` is parameterized by `DiskCount`, which is set to
@@ -104,12 +110,13 @@ After installing the repository's TLA+ dependencies, run TLC from the
 repository's `tla` directory. For example:
 
 ```sh
-./tlc.py mc ../lean/TransitionSystems/Counter/Counter.tla
+./tlc.py mc ../lean/TransitionSystems/SimpleCounter/SimpleCounter.tla
 ./tlc.py mc ../lean/TransitionSystems/WaterPouring/WaterPouring.tla
 ./tlc.py mc ../lean/TransitionSystems/TowerOfHanoi3/TowerOfHanoi3.tla
 ./tlc.py mc ../lean/TransitionSystems/TowerOfHanoi/TowerOfHanoi.tla
 ./tlc.py mc ../lean/TransitionSystems/TwoPhaseCommit/TwoPhaseCommit.tla
 ./tlc.py mc ../lean/TransitionSystems/UnsafeCounter/UnsafeCounter.tla
+./tlc.py mc ../lean/TransitionSystems/SafeCounter/SafeCounter.tla
 ```
 
 `UnsafeCounter/UnsafeCounterBug.cfg` additionally checks the deliberately false

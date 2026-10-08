@@ -7,6 +7,7 @@ defaultTargets = [
   "tower-of-hanoi",
   "check-two-phase-commit",
   "check-unsafe-counter",
+  "check-safe-counter",
 ]
 
 [[require]]
@@ -32,3 +33,7 @@ root = "TransitionSystems.TwoPhaseCommit.CheckTwoPhaseCommitB"
 [[lean_exe]]
 name = "check-unsafe-counter"
 root = "TransitionSystems.UnsafeCounter.CheckUnsafeCounterB"
+
+[[lean_exe]]
+name = "check-safe-counter"
+root = "TransitionSystems.SafeCounter.CheckSafeCounterB"
